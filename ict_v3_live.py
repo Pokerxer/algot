@@ -14,11 +14,14 @@ import json
 import time
 import os
 import random
+import pickle
 from datetime import datetime
 from collections import deque
 
 np.random.seed(42)
 random.seed(42)
+
+Q_TABLE_FILE = "v3_q_table.pkl"
 
 import requests
 
@@ -106,6 +109,28 @@ class QLearningAgent:
         current_q = self.q_table[disc_state][action]
         max_next_q = np.max(self.q_table[disc_next])
         self.q_table[disc_state][action] = current_q + self.alpha * (reward + self.gamma * max_next_q - current_q)
+    
+    def save(self, filename):
+        with open(filename, 'wb') as f:
+            pickle.dump({
+                'q_table': self.q_table,
+                'epsilon': self.epsilon,
+                'alpha': self.alpha,
+                'gamma': self.gamma
+            }, f)
+        print(f"Q-table saved: {len(self.q_table)} states to {filename}")
+    
+    def load(self, filename):
+        if os.path.exists(filename):
+            with open(filename, 'rb') as f:
+                data = pickle.load(f)
+                self.q_table = data['q_table']
+                self.epsilon = data.get('epsilon', 0.01)
+                self.alpha = data.get('alpha', 0.1)
+                self.gamma = data.get('gamma', 0.95)
+            print(f"Q-table loaded: {len(self.q_table)} states from {filename}")
+            return True
+        return False
 
 
 def prepare_data(symbol, lookback=200):
@@ -295,7 +320,7 @@ def get_signal(data, idx):
     return None
 
 
-def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"):
+def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log", train=True):
     api_key = os.getenv("ALPACA_API_KEY")
     secret_key = os.getenv("ALPACA_SECRET_KEY")
     
@@ -316,11 +341,29 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
     positions = {}
     data_cache = {}
     
+    # Try to load existing Q-table
+    if train:
+        combined_agent = QLearningAgent(20, 8)
+        if combined_agent.load(Q_TABLE_FILE):
+            print(f"Loaded pre-trained Q-table - agent will continue learning")
+        else:
+            print(f"No pre-trained Q-table found - starting fresh")
+            print(f"Agent will learn from live trading (may take time to improve)")
+        # Use same agent for all symbols (transfer learning)
+        for symbol in symbols:
+            agents[symbol] = combined_agent
+    else:
+        for symbol in symbols:
+            agents[symbol] = QLearningAgent(20, 8)
+    
     print(f"Starting V3 Live Trading")
     print(f"Symbols: {symbols}")
     print(f"Risk per trade: {risk_pct*100}%")
     print(f"Check interval: {interval} seconds")
+    print(f"Learning: {'Enabled' if train else 'Disabled'}")
     print("-" * 50)
+    
+    trade_count = 0
     
     while True:
         try:
@@ -332,7 +375,10 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
                 idx = len(data['closes']) - 1
                 
                 if symbol not in agents:
-                    agents[symbol] = QLearningAgent(20, 8)
+                    if train:
+                        agents[symbol] = combined_agent
+                    else:
+                        agents[symbol] = QLearningAgent(20, 8)
                 
                 agent = agents[symbol]
                 
@@ -391,6 +437,12 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
                             print(log_msg)
                             with open(log_file, "a") as f:
                                 f.write(log_msg + "\n")
+                            
+                            # Learn from trade and save Q-table
+                            if train:
+                                trade_count += 1
+                                agent.save(Q_TABLE_FILE)
+                                print(f"Q-table saved (total trades: {trade_count})")
                         except:
                             pass
                         
@@ -442,9 +494,11 @@ if __name__ == "__main__":
     parser.add_argument("--symbols", default="NQ=F,GC=F,GBPUSD=X", help="Comma-separated symbols")
     parser.add_argument("--interval", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--risk", type=float, default=0.04, help="Risk per trade")
+    parser.add_argument("--train", action="store_true", default=True, help="Enable RL learning (saves Q-table)")
+    parser.add_argument("--no-train", dest="train", action="store_false", help="Disable RL learning")
     
     args = parser.parse_args()
     
     symbols = [s.strip() for s in args.symbols.split(",")]
     
-    run_live_trading(symbols, args.interval, args.risk)
+    run_live_trading(symbols, args.interval, args.risk, train=args.train)
