@@ -1,15 +1,15 @@
 """
 ICT V4 - RL-Enhanced Live Trading System
 =========================================
-Trade 24/7 with kill zone bonus. Supports BTC and 12 other symbols.
+Trade 24/7 with kill zone bonus. Focus on best performers: SI, GC, BTC, ETH.
 
 Changes from V3:
 - Trade anytime (not just kill zones)
 - Kill zone still gives +15 bonus for better confirmation
-- Added BTC-USD
+- Focus on: SI=F (Silver), GC=F (Gold), BTC-USD, ETH-USD
 
 Usage:
-    python3 ict_v4_live.py --symbols "NQ=F,GC=F,GBPUSD=X,BTC-USD" --interval 30
+    python3 ict_v4_live.py --symbols "SI=F,GC=F,BTC-USD,ETH-USD" --interval 30
 """
 
 import yfinance as yf
@@ -502,7 +502,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="ICT V4 Live Trading")
     parser.add_argument("--mode", default="paper", help="Trading mode (paper/live)")
-    parser.add_argument("--symbols", default="NQ=F,YM=F,EURUSD=X,GBPUSD=X,GBPJPY=X,ES=F,GC=F,ZB=F,ZN=F,ZS=F,ZW=F,SI=F,BTC-USD", help="Comma-separated symbols")
+    parser.add_argument("--symbols", default="SI=F,GC=F,BTC-USD,ETH-USD", help="Comma-separated symbols")
     parser.add_argument("--interval", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--risk", type=float, default=0.04, help="Risk per trade")
     parser.add_argument("--train", action="store_true", default=True, help="Enable RL learning (saves Q-table)")
