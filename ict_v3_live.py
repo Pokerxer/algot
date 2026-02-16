@@ -476,6 +476,12 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
                             else:
                                 current_position['stop_loss'] = current_price * 1.01
             
+            # Heartbeat log every 2 minutes
+            cycle_count = getattr(run_live_trading, 'cycle_count', 0) + 1
+            run_live_trading.cycle_count = cycle_count
+            if cycle_count % 4 == 0:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring {len(symbols)} symbols | Positions: {len(positions)}")
+            
             time.sleep(interval)
             
         except KeyboardInterrupt:
