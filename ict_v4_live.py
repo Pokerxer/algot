@@ -9,8 +9,18 @@ Changes from V3:
 - Focus on: SOL-USD, PL=F, SI=F, ETH-USD, NG=F, BTC-USD
 
 Usage:
-    python3 ict_v4_live.py --symbols "SOL-USD,PL=F,SI=F,ETH-USD,NG=F,BTC-USD" --interval 30
+    python3 ict_v4_live.py --symbols "BTC/USD,ETH/USD,SOL/USD" --interval 30
 """
+
+# Symbol mapping: Yahoo Finance -> Alpaca
+SYMBOL_MAP = {
+    'BTC-USD': 'BTC/USD',
+    'ETH-USD': 'ETH/USD',
+    'SOL-USD': 'SOL/USD',
+    'BTCUSD': 'BTC/USD',
+    'ETHUSD': 'ETH/USD',
+    'SOLUSD': 'SOL/USD',
+}
 
 import yfinance as yf
 import pandas as pd
@@ -47,6 +57,10 @@ class AlpacaPaper:
         return resp.json()
     
     def place_order(self, symbol, qty, side, order_type="market", time_in_force="day"):
+        # Check if crypto (contains /)
+        if "/" in symbol:
+            time_in_force = "ioc"  # Crypto requires IOC
+        
         order = {
             "symbol": symbol,
             "qty": qty,
@@ -58,7 +72,9 @@ class AlpacaPaper:
         return resp.json()
     
     def close_position(self, symbol):
-        resp = requests.delete(f"{self.base_url}/v2/positions/{symbol}", headers=self.headers)
+        # Handle crypto symbol format
+        alpaca_symbol = symbol.replace("-", "/") if "/" not in symbol else symbol
+        resp = requests.delete(f"{self.base_url}/v2/positions/{alpaca_symbol}", headers=self.headers)
         return resp.json()
 
 
@@ -139,7 +155,11 @@ class QLearningAgent:
 
 
 def prepare_data(symbol, lookback=200):
-    df = yf.Ticker(symbol).history(period="10d", interval="1h")
+    # Convert Alpaca symbol to Yahoo Finance format
+    # BTC/USD -> BTC-USD, ETH/USD -> ETH-USD
+    yahoo_symbol = symbol.replace("/", "-")
+    
+    df = yf.Ticker(yahoo_symbol).history(period="10d", interval="1h")
     df = df.dropna()
     df = df[~df.index.duplicated(keep='first')]
     
@@ -505,7 +525,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="ICT V4 Live Trading")
     parser.add_argument("--mode", default="paper", help="Trading mode (paper/live)")
-    parser.add_argument("--symbols", default="SOL-USD,PL=F,SI=F,ETH-USD,NG=F,BTC-USD", help="Comma-separated symbols")
+    parser.add_argument("--symbols", default="BTC/USD,ETH/USD,SOL/USD", help="Comma-separated symbols (Alpaca format)")
     parser.add_argument("--interval", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--risk", type=float, default=0.04, help="Risk per trade")
     parser.add_argument("--train", action="store_true", default=True, help="Enable RL learning (saves Q-table)")
