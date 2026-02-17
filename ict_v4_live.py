@@ -374,7 +374,7 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
         try:
             for symbol in symbols:
                 data = prepare_data(symbol)
-                if data is None or len(data['closes']) < 50:
+                if data is None or len(data.get('closes', [])) < 50:
                     continue
                 
                 idx = len(data['closes']) - 1
@@ -397,9 +397,7 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
                     if signal and action in [Actions.ENTRY_NOW, Actions.ENTRY_PULLBACK, Actions.ENTRY_LIMIT]:
                         entry_price = data['closes'][idx]
                         direction = signal['direction']
-                        
                         qty = 1
-                        
                         side = "buy" if direction == 1 else "sell"
                         
                         try:
@@ -443,7 +441,6 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
                             with open(log_file, "a") as f:
                                 f.write(log_msg + "\n")
                             
-                            # Learn from trade and save Q-table
                             if train:
                                 trade_count += 1
                                 agent.save(Q_TABLE_FILE)
@@ -481,12 +478,18 @@ def run_live_trading(symbols, interval=30, risk_pct=0.04, log_file="v3_live.log"
                             else:
                                 current_position['stop_loss'] = current_price * 1.01
             
-            # Heartbeat log every 2 minutes
             cycle_count = getattr(run_live_trading, 'cycle_count', 0) + 1
             run_live_trading.cycle_count = cycle_count
             if cycle_count % 4 == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitoring {len(symbols)} symbols | Positions: {len(positions)}")
             
+            time.sleep(interval)
+            
+        except KeyboardInterrupt:
+            print("\nStopping V4 Live Trading...")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
             time.sleep(interval)
             
         except KeyboardInterrupt:
