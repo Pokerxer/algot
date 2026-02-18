@@ -24,6 +24,11 @@ import pickle
 from datetime import datetime, timedelta
 from collections import deque
 
+try:
+    import telegram_notify as tn
+except ImportError:
+    tn = None
+
 np.random.seed(42)
 random.seed(42)
 
@@ -729,6 +734,23 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
     print(f"Check interval: {interval}s")
     print("-" * 50)
     
+    # Send startup notification to Telegram
+    if tn:
+        try:
+            message = f"""
+🚀 <b>V5 Trading Bot Started</b>
+━━━━━━━━━━━━━━━━━━━━
+<b>Symbols:</b> {', '.join(symbols)}
+<b>Risk:</b> {risk_pct*100}%
+<b>Interval:</b> {interval}s
+<b>Mode:</b> {'Paper Trading' if port == 7497 else 'Live Trading'}
+━━━━━━━━━━━━━━━━━━━━
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+            tn.send_message(message)
+        except Exception as e:
+            print(f"Error sending startup notification: {e}")
+    
     trade_count = 0
     
     while True:
@@ -744,6 +766,19 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                 # Get signal
                 signal = get_signal(data, idx)
                 
+                # Send Telegram notification for signal
+                if signal and tn:
+                    try:
+                        htf = data['htf_trend'][idx]
+                        ltf = data['ltf_trend'][idx]
+                        kz = data['kill_zone'][idx]
+                        pp = data['price_position'][idx]
+                        tp = current_price + (current_price - data['lows'][idx]) * 2 if signal['direction'] == 1 else current_price - (data['highs'][idx] - current_price) * 2
+                        sl = data['lows'][idx] if signal['direction'] == 1 else data['highs'][idx]
+                        tn.send_signal(symbol, signal['direction'], signal['confluence'], current_price, tp, sl, htf, ltf, kz, pp)
+                    except Exception as e:
+                        print(f"Error sending signal notification: {e}")
+                
                 # Check existing position
                 if symbol in positions:
                     pos = positions[symbol]
@@ -756,6 +791,14 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                                 contract = get_ibkr_contract(symbol)
                                 ib.placeOrder(contract, MarketOrder('SELL', pos['qty']))
                                 print(f"[{symbol}] STOP HIT: {pos['stop']:.2f}")
+                                
+                                # Calculate PnL and send notification
+                                if tn:
+                                    try:
+                                        pnl = (pos['stop'] - pos['entry']) * pos['qty']
+                                        tn.send_trade_exit(symbol, pos['direction'], pnl, 'stop_loss', pos['entry'], pos['stop'], pos.get('bars_held', 0))
+                                    except Exception as e:
+                                        print(f"Error sending exit notification: {e}")
                             except Exception as e:
                                 print(f"Error closing position: {e}")
                             del positions[symbol]
@@ -765,9 +808,54 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                                 contract = get_ibkr_contract(symbol)
                                 ib.placeOrder(contract, MarketOrder('SELL', pos['qty']))
                                 print(f"[{symbol}] TARGET HIT: {pos['target']:.2f}")
+                                
+                                # Calculate PnL and send notification
+                                if tn:
+                                    try:
+                                        pnl = (pos['target'] - pos['entry']) * pos['qty']
+                                        tn.send_trade_exit(symbol, pos['direction'], pnl, 'take_profit', pos['entry'], pos['target'], pos.get('bars_held', 0))
+                                    except Exception as e:
+                                        print(f"Error sending exit notification: {e}")
                             except Exception as e:
                                 print(f"Error closing position: {e}")
                             del positions[symbol]
+                    else:
+                        # Short position - check stop/target
+                        if pos['direction'] == -1:
+                            if data['highs'][idx] >= pos['stop']:
+                                # Stop hit (short)
+                                try:
+                                    contract = get_ibkr_contract(symbol)
+                                    ib.placeOrder(contract, MarketOrder('BUY', pos['qty']))
+                                    print(f"[{symbol}] STOP HIT (SHORT): {pos['stop']:.2f}")
+                                    
+                                    # Calculate PnL and send notification
+                                    if tn:
+                                        try:
+                                            pnl = (pos['entry'] - pos['stop']) * pos['qty']
+                                            tn.send_trade_exit(symbol, pos['direction'], pnl, 'stop_loss', pos['entry'], pos['stop'], pos.get('bars_held', 0))
+                                        except Exception as e:
+                                            print(f"Error sending exit notification: {e}")
+                                except Exception as e:
+                                    print(f"Error closing position: {e}")
+                                del positions[symbol]
+                            elif data['lows'][idx] <= pos['target']:
+                                # Target hit (short)
+                                try:
+                                    contract = get_ibkr_contract(symbol)
+                                    ib.placeOrder(contract, MarketOrder('BUY', pos['qty']))
+                                    print(f"[{symbol}] TARGET HIT (SHORT): {pos['target']:.2f}")
+                                    
+                                    # Calculate PnL and send notification
+                                    if tn:
+                                        try:
+                                            pnl = (pos['entry'] - pos['target']) * pos['qty']
+                                            tn.send_trade_exit(symbol, pos['direction'], pnl, 'take_profit', pos['entry'], pos['target'], pos.get('bars_held', 0))
+                                        except Exception as e:
+                                            print(f"Error sending exit notification: {e}")
+                                except Exception as e:
+                                    print(f"Error closing position: {e}")
+                                del positions[symbol]
                 else:
                     # No position - check for entry
                     if signal:
@@ -800,10 +888,20 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                                         'target': current_price + (current_price - data['lows'][idx]) * 2 if signal['direction'] == 1 else current_price - (data['highs'][idx] - current_price) * 2,
                                         'direction': signal['direction'],
                                         'qty': qty,
+                                        'confluence': signal['confluence'],
                                         'bars_held': 0
                                     }
                                     print(f"[{symbol}] ENTRY: {signal['direction']} @ {current_price:.2f} (conf: {signal['confluence']})")
                                     trade_count += 1
+                                    
+                                    # Send Telegram notification for trade entry
+                                    if tn:
+                                        try:
+                                            tp = positions[symbol]['target']
+                                            sl = positions[symbol]['stop']
+                                            tn.send_trade_entry(symbol, signal['direction'], qty, current_price, signal['confluence'], tp, sl)
+                                        except Exception as e:
+                                            print(f"Error sending entry notification: {e}")
                                 except Exception as e:
                                     print(f"Error placing order: {e}")
                 
