@@ -763,6 +763,27 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                 idx = len(data['closes']) - 1
                 current_price = data['closes'][idx]
                 
+                # Update market data for Telegram commands
+                if tn:
+                    try:
+                        htf = data['htf_trend'][idx]
+                        ltf = data['ltf_trend'][idx]
+                        kz = data['kill_zone'][idx]
+                        pp = data['price_position'][idx]
+                        conf = 0
+                        if signal:
+                            conf = signal.get('confluence', 0)
+                        tn.update_market_data(symbol, {
+                            'price': current_price,
+                            'htf_trend': htf,
+                            'ltf_trend': ltf,
+                            'kill_zone': kz,
+                            'price_position': pp,
+                            'confluence': conf
+                        })
+                    except Exception as e:
+                        pass
+                
                 # Get signal
                 signal = get_signal(data, idx)
                 
