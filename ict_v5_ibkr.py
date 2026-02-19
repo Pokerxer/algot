@@ -1330,41 +1330,49 @@ class LiveTrader:
         print("-" * 50)
         
         for symbol in self.symbols:
+            streaming_works = False
             try:
                 contract = get_ibkr_contract(symbol)
                 
                 # Subscribe to real-time bars (5-second intervals)
                 bars = self.ib.reqRealTimeBars(contract, 5, 'MIDPOINT', False)
                 
-                # Wait a moment to check if subscription succeeded
-                self.ib.sleep(0.5)
+                # Track if we receive any bars
+                bars_received = [False]  # Use list to allow modification in closure
                 
-                # Check if we got an error (no market data permissions)
-                # If bars object exists and no error, assume success
-                if bars:
-                    # Create callback for this symbol
-                    def make_callback(sym):
-                        def callback(bars_list, has_new_bar):
-                            if has_new_bar and bars_list:
-                                latest_bar = bars_list[-1]
-                                self._on_realtime_bar(sym, latest_bar)
-                        return callback
-                    
-                    bars.updateEvent += make_callback(symbol)
+                def make_callback(sym, received_flag):
+                    def callback(bars_list, has_new_bar):
+                        received_flag[0] = True
+                        if has_new_bar and bars_list:
+                            latest_bar = bars_list[-1]
+                            self._on_realtime_bar(sym, latest_bar)
+                    return callback
+                
+                bars.updateEvent += make_callback(symbol, bars_received)
+                
+                # Wait to see if bars are received (indicates successful subscription)
+                self.ib.sleep(2.0)
+                
+                # Check if we received any bars
+                if bars_received[0]:
                     self.bar_handlers[symbol] = bars
                     self.streaming_symbols.add(symbol)
                     print(f"  {symbol}: ✅ Streaming 5-second bars")
+                    streaming_works = True
                 else:
-                    # Subscription failed, use historical
-                    self.historical_symbols.add(symbol)
-                    self.last_poll_time[symbol] = 0
-                    print(f"  {symbol}: 📊 Using hourly bars (no streaming permissions)")
+                    # No bars received - likely no permissions, cancel and use historical
+                    try:
+                        self.ib.cancelRealTimeBars(bars)
+                    except:
+                        pass
+                    raise Exception("No market data permissions")
                 
             except Exception as e:
-                # Subscription failed, use historical polling
+                # Subscription failed or no bars received, use historical polling
                 self.historical_symbols.add(symbol)
                 self.last_poll_time[symbol] = 0
-                print(f"  {symbol}: 📊 Using hourly bars ({str(e)[:50]})")
+                error_msg = str(e)[:50] if not streaming_works else "No market data permissions"
+                print(f"  {symbol}: 📊 Using hourly bars ({error_msg})")
         
         streaming_count = len(self.streaming_symbols)
         historical_count = len(self.historical_symbols)
