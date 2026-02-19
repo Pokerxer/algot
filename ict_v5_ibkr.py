@@ -1135,18 +1135,24 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
 
 
 class LiveTrader:
-    """Live trading with streaming 5-second bars."""
+    """Live trading with hybrid streaming (5s bars) + historical (hourly) data."""
     
-    def __init__(self, ib, symbols, risk_pct=0.02):
+    def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30):
         self.ib = ib
         self.symbols = symbols
         self.risk_pct = risk_pct
+        self.poll_interval = poll_interval
         self.positions = {}
         self.active_orders = {}
         self.bar_handlers = {}
         self.historical_data = {}
         self.account_value = 100000
         self.trade_count = 0
+        
+        # Track which symbols have streaming vs need polling
+        self.streaming_symbols = set()
+        self.historical_symbols = set()
+        self.last_poll_time = {}
         
         # Initialize historical data for indicator calculations
         self._init_historical_data()
@@ -1318,9 +1324,9 @@ class LiveTrader:
             print(f"[{symbol}] Error checking position: {e}")
     
     def start(self):
-        """Start streaming real-time bars."""
+        """Start streaming real-time bars with fallback to historical for restricted symbols."""
         print(f"\nStarting real-time streaming for {len(self.symbols)} symbols...")
-        print("Using 5-second bars for signal detection")
+        print("Using 5-second bars for streaming, hourly bars for restricted symbols")
         print("-" * 50)
         
         for symbol in self.symbols:
@@ -1330,26 +1336,98 @@ class LiveTrader:
                 # Subscribe to real-time bars (5-second intervals)
                 bars = self.ib.reqRealTimeBars(contract, 5, 'MIDPOINT', False)
                 
-                # Create callback for this symbol
-                def make_callback(sym):
-                    def callback(bars_list, has_new_bar):
-                        # bars_list contains all bars, has_new_bar indicates if there's a new completed bar
-                        if has_new_bar and bars_list:
-                            # Get the most recent completed bar
-                            latest_bar = bars_list[-1]
-                            self._on_realtime_bar(sym, latest_bar)
-                    return callback
+                # Wait a moment to check if subscription succeeded
+                self.ib.sleep(0.5)
                 
-                bars.updateEvent += make_callback(symbol)
-                self.bar_handlers[symbol] = bars
-                
-                print(f"  {symbol}: Subscribed to 5-second bars")
+                # Check if we got an error (no market data permissions)
+                # If bars object exists and no error, assume success
+                if bars:
+                    # Create callback for this symbol
+                    def make_callback(sym):
+                        def callback(bars_list, has_new_bar):
+                            if has_new_bar and bars_list:
+                                latest_bar = bars_list[-1]
+                                self._on_realtime_bar(sym, latest_bar)
+                        return callback
+                    
+                    bars.updateEvent += make_callback(symbol)
+                    self.bar_handlers[symbol] = bars
+                    self.streaming_symbols.add(symbol)
+                    print(f"  {symbol}: ✅ Streaming 5-second bars")
+                else:
+                    # Subscription failed, use historical
+                    self.historical_symbols.add(symbol)
+                    self.last_poll_time[symbol] = 0
+                    print(f"  {symbol}: 📊 Using hourly bars (no streaming permissions)")
                 
             except Exception as e:
-                print(f"  {symbol}: Failed to subscribe - {e}")
+                # Subscription failed, use historical polling
+                self.historical_symbols.add(symbol)
+                self.last_poll_time[symbol] = 0
+                print(f"  {symbol}: 📊 Using hourly bars ({str(e)[:50]})")
         
-        print(f"\nStreaming started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        streaming_count = len(self.streaming_symbols)
+        historical_count = len(self.historical_symbols)
+        
+        print(f"\n✅ Streaming: {streaming_count} symbols")
+        print(f"📊 Historical: {historical_count} symbols")
+        print(f"\nTrading started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("Press Ctrl+C to stop\n")
+    
+    def poll_historical_symbols(self):
+        """Poll symbols that don't have streaming permissions."""
+        current_time = time.time()
+        
+        for symbol in self.historical_symbols:
+            # Check if it's time to poll this symbol
+            last_poll = self.last_poll_time.get(symbol, 0)
+            if current_time - last_poll < self.poll_interval:
+                continue
+            
+            self.last_poll_time[symbol] = current_time
+            
+            try:
+                # Get fresh data
+                data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=True)
+                if data is None or len(data.get('closes', [])) < 50:
+                    continue
+                
+                # Update historical data cache
+                self.historical_data[symbol] = data
+                
+                idx = len(data['closes']) - 1
+                current_price = data['closes'][idx]
+                
+                # Update Telegram
+                if tn:
+                    try:
+                        htf = data['htf_trend'][idx]
+                        ltf = data['ltf_trend'][idx]
+                        kz = data['kill_zone'][idx]
+                        pp = data['price_position'][idx]
+                        signal = get_signal(data, idx)
+                        conf = signal.get('confluence', 0) if signal else 0
+                        tn.update_market_data(symbol, {
+                            'price': current_price,
+                            'htf_trend': htf,
+                            'ltf_trend': ltf,
+                            'kill_zone': kz,
+                            'price_position': pp,
+                            'confluence': conf
+                        })
+                    except:
+                        pass
+                
+                # Check position or signal (same logic as streaming)
+                if symbol in self.positions:
+                    self._check_position_exit(symbol, current_price)
+                else:
+                    signal = get_signal(data, idx)
+                    if signal:
+                        self._enter_trade(symbol, signal, current_price)
+                        
+            except Exception as e:
+                print(f"[{symbol}] Error polling: {e}")
     
     def stop(self):
         """Stop streaming."""
@@ -1434,7 +1512,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
             print(f"Error sending startup notification: {e}")
     
     # Create and start trader
-    trader = LiveTrader(ib, symbols, risk_pct)
+    trader = LiveTrader(ib, symbols, risk_pct, poll_interval=interval)
     trader.account_value = account_value
     trader.positions = positions
     
@@ -1442,17 +1520,24 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
         trader.start()
         
         # Run forever (or until interrupted)
+        iteration = 0
         while True:
             ib.sleep(1)
+            iteration += 1
             
-            # Refresh account value periodically
-            try:
-                for av in ib.accountValues():
-                    if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                        trader.account_value = float(av.value)
-                        break
-            except:
-                pass
+            # Poll historical symbols every N seconds (default 30)
+            if iteration % interval == 0:
+                trader.poll_historical_symbols()
+            
+            # Refresh account value periodically (every 60 seconds)
+            if iteration % 60 == 0:
+                try:
+                    for av in ib.accountValues():
+                        if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                            trader.account_value = float(av.value)
+                            break
+                except:
+                    pass
                 
     except KeyboardInterrupt:
         print("\n\nShutdown requested...")
