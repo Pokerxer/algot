@@ -344,51 +344,26 @@ def run_live_simulation_backtest(symbols, days=30, initial_capital=50000, risk_p
 
 # Run the backtest
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='V5 Live Trading Simulation Backtest')
-    parser.add_argument('--symbols', type=str, 
-                       default='SOLUSD,ETHUSD,BTCUSD,LINKUSD,LTCUSD,SI,UNIUSD,NG,NQ,GC,CL,ES',
-                       help='Comma-separated list of symbols to backtest')
-    parser.add_argument('--days', type=int, default=30,
-                       help='Number of days to backtest (default: 30)')
-    parser.add_argument('--capital', type=float, default=50000,
-                       help='Initial capital (default: 50000)')
-    parser.add_argument('--risk', type=float, default=0.02,
-                       help='Risk per trade as decimal (default: 0.02 = 2%%)')
-    parser.add_argument('--yahoo', action='store_true',
-                       help='Use Yahoo Finance instead of IBKR')
-    
-    args = parser.parse_args()
-    
-    # Parse symbols from command line
-    symbols = [s.strip() for s in args.symbols.split(',')]
+    # Full symbol list
+    symbols = ['SOLUSD', 'ETHUSD', 'BTCUSD', 'LINKUSD', 'LTCUSD', 'SI', 'UNIUSD', 'NG', 'NQ', 'GC', 'CL', 'ES']
     
     print("="*80)
     print("ICT V5 - Live Trading Simulation Backtest")
     print("="*80)
-    print(f"Symbols: {', '.join(symbols)}")
-    print(f"Days: {args.days} | Capital: ${args.capital:,.0f} | Risk: {args.risk*100}%")
-    print("="*80)
     
     results = run_live_simulation_backtest(
         symbols=symbols,
-        days=args.days,
-        initial_capital=args.capital,
-        risk_per_trade=args.risk,
-        use_ibkr=not args.yahoo
+        days=30,
+        initial_capital=50000,
+        risk_per_trade=0.02,
+        use_ibkr=True
     )
     
     if results:
         # Save to JSON
-        output_file = 'v5_live_simulation_results.json'
-        try:
-            with open(output_file, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"\nResults saved to: {output_file}")
-        except PermissionError:
-            print(f"\nWarning: Could not save to {output_file} (permission denied)")
-            print("Results displayed above.")
+        output_file = '/Users/mac/Documents/Algot/v5_live_simulation_results.json'
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
         
         # Print summary
         print(f"\n{'='*80}")
