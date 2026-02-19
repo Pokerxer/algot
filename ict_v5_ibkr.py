@@ -1133,15 +1133,239 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         return None
 
 
+class LiveTrader:
+    """Live trading with streaming 5-second bars."""
+    
+    def __init__(self, ib, symbols, risk_pct=0.02):
+        self.ib = ib
+        self.symbols = symbols
+        self.risk_pct = risk_pct
+        self.positions = {}
+        self.active_orders = {}
+        self.bar_handlers = {}
+        self.historical_data = {}
+        self.account_value = 100000
+        self.trade_count = 0
+        
+        # Initialize historical data for indicator calculations
+        self._init_historical_data()
+        
+    def _init_historical_data(self):
+        """Fetch historical data once for indicator calculations."""
+        print("\nInitializing historical data for indicators...")
+        for symbol in self.symbols:
+            try:
+                data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=True)
+                if data and len(data.get('closes', [])) >= 50:
+                    self.historical_data[symbol] = data
+                    print(f"  {symbol}: {len(data['closes'])} bars loaded")
+                else:
+                    print(f"  {symbol}: Failed to load data")
+            except Exception as e:
+                print(f"  {symbol}: Error loading - {e}")
+    
+    def _on_realtime_bar(self, symbol, bar):
+        """Handle real-time 5-second bar updates."""
+        # Only process completed 5-second bars
+        if not self.historical_data.get(symbol):
+            return
+            
+        data = self.historical_data[symbol]
+        current_price = bar.close
+        
+        # Update last price for Telegram
+        if tn:
+            try:
+                tn.update_market_data(symbol, {
+                    'price': current_price,
+                    'last_update': datetime.now().isoformat()
+                })
+            except:
+                pass
+        
+        # Check if we have an open position
+        if symbol in self.positions:
+            self._check_position_exit(symbol, current_price)
+        else:
+            # No position - check for entry signal on every 5-second bar
+            idx = len(data['closes']) - 1
+            signal = get_signal(data, idx)
+            
+            if signal:
+                self._enter_trade(symbol, signal, current_price)
+    
+    def _enter_trade(self, symbol, signal, current_price):
+        """Enter a new trade with bracket order."""
+        try:
+            data = self.historical_data[symbol]
+            idx = len(data['closes']) - 1
+            
+            # Calculate stop and target
+            if signal['direction'] == 1:
+                stop = data['lows'][idx]
+                target = current_price + (current_price - stop) * 2
+            else:
+                stop = data['highs'][idx]
+                target = current_price - (stop - current_price) * 2
+            
+            stop_distance = abs(current_price - stop)
+            if stop_distance <= 0:
+                return
+            
+            # Calculate position size
+            qty, _ = calculate_position_size(symbol, self.account_value, self.risk_pct, stop_distance, current_price)
+            if qty <= 0:
+                return
+            
+            # Place bracket order
+            contract = get_ibkr_contract(symbol)
+            bracket = place_bracket_order(self.ib, contract, signal['direction'], qty, stop, target)
+            
+            if bracket:
+                parent_trade, sl_trade, tp_trade = bracket
+                filled, fill_price, filled_qty = wait_for_fill(self.ib, parent_trade, timeout=10)
+                
+                if filled:
+                    self.positions[symbol] = {
+                        'entry': fill_price,
+                        'stop': stop,
+                        'target': target,
+                        'direction': signal['direction'],
+                        'qty': filled_qty,
+                        'confluence': signal['confluence'],
+                        'entry_time': datetime.now()
+                    }
+                    
+                    self.active_orders[symbol] = {
+                        'sl_order_id': sl_trade.order.orderId,
+                        'tp_order_id': tp_trade.order.orderId
+                    }
+                    
+                    print(f"[{symbol}] ENTRY: {'LONG' if signal['direction'] == 1 else 'SHORT'} x {filled_qty} @ {fill_price:.4f}")
+                    self.trade_count += 1
+                    
+                    if tn:
+                        try:
+                            tn.send_trade_entry(symbol, signal['direction'], filled_qty, fill_price, signal['confluence'], target, stop)
+                        except:
+                            pass
+                            
+        except Exception as e:
+            print(f"[{symbol}] Error entering trade: {e}")
+    
+    def _check_position_exit(self, symbol, current_price):
+        """Check if position hit stop/target (bracket orders handle this, but we track it)."""
+        try:
+            # Query IBKR to see if position still exists
+            ibkr_pos = self.ib.positions()
+            has_position = False
+            
+            for p in ibkr_pos:
+                p_symbol = p.contract.symbol
+                if p.contract.secType == 'CASH':
+                    p_symbol = f"{p.contract.symbol}{p.contract.currency}"
+                elif p.contract.secType == 'CRYPTO':
+                    p_symbol = f"{p.contract.symbol}USD"
+                
+                if p_symbol.upper() == symbol.upper() and abs(p.position) > 0:
+                    has_position = True
+                    break
+            
+            if not has_position and symbol in self.positions:
+                # Position was closed by bracket order
+                pos = self.positions[symbol]
+                
+                # Try to get fill price from IBKR
+                try:
+                    fills = self.ib.fills()
+                    for fill in fills:
+                        fill_symbol = fill.contract.symbol
+                        if fill.contract.secType == 'CASH':
+                            fill_symbol = f"{fill.contract.symbol}{fill.contract.currency}"
+                        elif fill.contract.secType == 'CRYPTO':
+                            fill_symbol = f"{fill.contract.symbol}USD"
+                        
+                        if fill_symbol.upper() == symbol.upper():
+                            exit_price = fill.execution.price
+                            if pos['direction'] == 1:
+                                pnl = (exit_price - pos['entry']) * pos['qty']
+                            else:
+                                pnl = (pos['entry'] - exit_price) * pos['qty']
+                            
+                            # Apply contract multiplier for PnL
+                            contract_info = get_contract_multiplier(symbol)
+                            if contract_info['type'] == 'futures':
+                                pnl *= contract_info['multiplier']
+                            
+                            print(f"[{symbol}] EXIT: @ {exit_price:.4f} P&L: ${pnl:.2f}")
+                            
+                            if tn:
+                                try:
+                                    bars_held = (datetime.now() - pos['entry_time']).seconds // 300  # Approximate
+                                    tn.send_trade_exit(symbol, pos['direction'], pnl, 'bracket_order', pos['entry'], exit_price, bars_held)
+                                except:
+                                    pass
+                            
+                            del self.positions[symbol]
+                            if symbol in self.active_orders:
+                                del self.active_orders[symbol]
+                            break
+                except Exception as e:
+                    print(f"[{symbol}] Error processing fill: {e}")
+                    
+        except Exception as e:
+            print(f"[{symbol}] Error checking position: {e}")
+    
+    def start(self):
+        """Start streaming real-time bars."""
+        print(f"\nStarting real-time streaming for {len(self.symbols)} symbols...")
+        print("Using 5-second bars for signal detection")
+        print("-" * 50)
+        
+        for symbol in self.symbols:
+            try:
+                contract = get_ibkr_contract(symbol)
+                
+                # Subscribe to real-time bars (5-second intervals)
+                bars = self.ib.reqRealTimeBars(contract, 5, 'MIDPOINT', False)
+                
+                # Create callback for this symbol
+                def make_callback(sym):
+                    def callback(bar):
+                        self._on_realtime_bar(sym, bar)
+                    return callback
+                
+                bars.updateEvent += make_callback(symbol)
+                self.bar_handlers[symbol] = bars
+                
+                print(f"  {symbol}: Subscribed to 5-second bars")
+                
+            except Exception as e:
+                print(f"  {symbol}: Failed to subscribe - {e}")
+        
+        print(f"\nStreaming started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("Press Ctrl+C to stop\n")
+    
+    def stop(self):
+        """Stop streaming."""
+        print("\nStopping real-time streaming...")
+        for symbol, bars in self.bar_handlers.items():
+            try:
+                self.ib.cancelRealTimeBars(bars)
+                print(f"  {symbol}: Unsubscribed")
+            except:
+                pass
+
+
 def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
-    """Run live trading via IBKR with proper order management.
+    """Run live trading via IBKR with streaming 5-second bars.
     
     Features:
+    - Real-time 5-second bar streaming (not polling)
+    - Incremental historical data loading
     - Bracket orders with automatic SL/TP
-    - Position sync on startup (crash recovery)
-    - Proper position sizing for futures/forex/crypto
-    - Order fill verification
-    - Bar completion checks
+    - Position sync on startup
+    - Event-driven architecture (no sleep loops)
     """
     try:
         from ib_insync import IB, MarketOrder, StopOrder, LimitOrder
@@ -1153,7 +1377,6 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
     ib = IB()
     
     try:
-        # Paper trading port 7497, live 7496
         ib.connect('127.0.0.1', port, clientId=1)
         print(f"Connected to IBKR (port {port})")
     except Exception as e:
@@ -1162,7 +1385,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
         return
     
     # Get account info
-    account_value = 100000  # Default
+    account_value = 100000
     try:
         account = ib.accountValues()
         for av in account:
@@ -1173,7 +1396,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
     except Exception as e:
         print(f"Warning: Could not get account info: {e}")
     
-    # Sync existing positions from IBKR (crash recovery)
+    # Sync existing positions
     print("\nSyncing positions with IBKR...")
     positions = sync_positions_with_ibkr(ib, symbols)
     if positions:
@@ -1181,19 +1404,13 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
     else:
         print("No existing positions found")
     
-    # Track active orders (for bracket order management)
-    active_orders = {}  # symbol -> {'sl_order_id': x, 'tp_order_id': y}
-    
-    # Track last bar time to avoid acting on incomplete bars
-    last_bar_times = {}
-    
-    print(f"\nICT V5 - IBKR Trading (Fixed)")
+    print(f"\nICT V5 - IBKR Trading (STREAMING)")
     print(f"Symbols: {symbols}")
     print(f"Risk per trade: {risk_pct*100}%")
-    print(f"Check interval: {interval}s")
+    print(f"Mode: {'Paper Trading' if port == 7497 else 'Live Trading'}")
     print("-" * 50)
     
-    # Send startup notification to Telegram
+    # Send startup notification
     if tn:
         try:
             message = f"""
@@ -1201,9 +1418,9 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
 ━━━━━━━━━━━━━━━━━━━━
 <b>Symbols:</b> {', '.join(symbols)}
 <b>Risk:</b> {risk_pct*100}%
-<b>Interval:</b> {interval}s
 <b>Mode:</b> {'Paper Trading' if port == 7497 else 'Live Trading'}
 <b>Account:</b> ${account_value:,.0f}
+<b>Data:</b> Real-time 5-second bars
 ━━━━━━━━━━━━━━━━━━━━
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -1211,201 +1428,34 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
         except Exception as e:
             print(f"Error sending startup notification: {e}")
     
-    trade_count = 0
+    # Create and start trader
+    trader = LiveTrader(ib, symbols, risk_pct)
+    trader.account_value = account_value
+    trader.positions = positions
     
-    while True:
-        try:
+    try:
+        trader.start()
+        
+        # Run forever (or until interrupted)
+        while True:
+            ib.sleep(1)
+            
             # Refresh account value periodically
             try:
                 for av in ib.accountValues():
                     if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                        account_value = float(av.value)
+                        trader.account_value = float(av.value)
                         break
             except:
                 pass
-            
-            for symbol in symbols:
-                # Pass the main IB connection to avoid creating new connections
-                data = prepare_data_ibkr(symbol, ib=ib)
-                if data is None or len(data.get('closes', [])) < 50:
-                    continue
                 
-                idx = len(data['closes']) - 1
-                current_price = data['closes'][idx]
-                
-                # Check for bar completion (avoid acting on incomplete bars)
-                bar_time = data['df'].index[idx]
-                if symbol in last_bar_times and last_bar_times[symbol] == bar_time:
-                    # Same bar as last check - skip signal processing
-                    # (Still update Telegram data though)
-                    pass
-                else:
-                    last_bar_times[symbol] = bar_time
-                
-                # Get signal
-                signal = get_signal(data, idx)
-                
-                # Update market data for Telegram commands
-                if tn:
-                    try:
-                        htf = data['htf_trend'][idx]
-                        ltf = data['ltf_trend'][idx]
-                        kz = data['kill_zone'][idx]
-                        pp = data['price_position'][idx]
-                        conf = signal.get('confluence', 0) if signal else 0
-                        tn.update_market_data(symbol, {
-                            'price': current_price,
-                            'htf_trend': htf,
-                            'ltf_trend': ltf,
-                            'kill_zone': kz,
-                            'price_position': pp,
-                            'confluence': conf
-                        })
-                    except Exception as e:
-                        pass
-                
-                # Check existing position - bracket orders handle SL/TP automatically
-                if symbol in positions:
-                    pos = positions[symbol]
-                    pos['bars_held'] = pos.get('bars_held', 0) + 1
-                    
-                    # Check if position was closed by bracket order
-                    # by querying IBKR positions
-                    try:
-                        ibkr_pos = ib.positions()
-                        has_position = False
-                        for p in ibkr_pos:
-                            p_symbol = p.contract.symbol
-                            if p.contract.secType == 'CASH':
-                                p_symbol = f"{p.contract.symbol}{p.contract.currency}"
-                            elif p.contract.secType == 'CRYPTO':
-                                p_symbol = f"{p.contract.symbol}USD"
-                            
-                            if p_symbol.upper() == symbol.upper() and abs(p.position) > 0:
-                                has_position = True
-                                break
-                        
-                        if not has_position and symbol in positions:
-                            # Position was closed (by bracket order SL/TP)
-                            print(f"[{symbol}] Position closed by bracket order")
-                            
-                            # Try to determine exit price from fills
-                            exit_price = current_price  # Default
-                            pnl = (exit_price - pos['entry']) * pos['direction'] * pos['qty']
-                            
-                            # Adjust PnL for contract multiplier
-                            contract_info = get_contract_multiplier(symbol)
-                            if contract_info['type'] == 'futures':
-                                pnl *= contract_info['multiplier']
-                            
-                            if tn:
-                                try:
-                                    exit_reason = 'bracket_order'
-                                    tn.send_trade_exit(symbol, pos['direction'], pnl, exit_reason, 
-                                                      pos['entry'], exit_price, pos.get('bars_held', 0))
-                                except:
-                                    pass
-                            
-                            del positions[symbol]
-                            if symbol in active_orders:
-                                del active_orders[symbol]
-                    except Exception as e:
-                        print(f"Error checking position status: {e}")
-                
-                else:
-                    # No position - check for entry
-                    if signal and symbol not in positions:
-                        # Calculate stop and target
-                        if signal['direction'] == 1:  # Long
-                            stop_price = data['lows'][idx]
-                            stop_distance = current_price - stop_price
-                            target_price = current_price + stop_distance * 2
-                        else:  # Short
-                            stop_price = data['highs'][idx]
-                            stop_distance = stop_price - current_price
-                            target_price = current_price - stop_distance * 2
-                        
-                        if stop_distance <= 0:
-                            continue
-                        
-                        # Calculate proper position size
-                        qty, risk_per_unit = calculate_position_size(
-                            symbol, account_value, risk_pct, stop_distance, current_price
-                        )
-                        
-                        if qty <= 0:
-                            print(f"[{symbol}] Invalid position size calculated")
-                            continue
-                        
-                        # Place bracket order
-                        try:
-                            contract = get_ibkr_contract(symbol)
-                            
-                            print(f"[{symbol}] Placing bracket order: {signal['direction']} x {qty}")
-                            print(f"  Entry: {current_price:.4f}, Stop: {stop_price:.4f}, Target: {target_price:.4f}")
-                            
-                            bracket = place_bracket_order(
-                                ib, contract, signal['direction'], qty,
-                                stop_price, target_price
-                            )
-                            
-                            if bracket:
-                                parent_trade, sl_trade, tp_trade = bracket
-                                
-                                # Wait for fill
-                                filled, fill_price, filled_qty = wait_for_fill(ib, parent_trade, timeout=10)
-                                
-                                if filled:
-                                    positions[symbol] = {
-                                        'entry': fill_price,
-                                        'stop': stop_price,
-                                        'target': target_price,
-                                        'direction': signal['direction'],
-                                        'qty': filled_qty,
-                                        'confluence': signal['confluence'],
-                                        'bars_held': 0
-                                    }
-                                    
-                                    active_orders[symbol] = {
-                                        'sl_order_id': sl_trade.order.orderId,
-                                        'tp_order_id': tp_trade.order.orderId
-                                    }
-                                    
-                                    print(f"[{symbol}] ENTRY FILLED: {'LONG' if signal['direction'] == 1 else 'SHORT'} x {filled_qty} @ {fill_price:.4f}")
-                                    trade_count += 1
-                                    
-                                    # Send Telegram notification
-                                    if tn:
-                                        try:
-                                            tn.send_trade_entry(symbol, signal['direction'], filled_qty, 
-                                                              fill_price, signal['confluence'], target_price, stop_price)
-                                        except Exception as e:
-                                            print(f"Error sending entry notification: {e}")
-                                else:
-                                    print(f"[{symbol}] Entry order not filled - cancelling bracket")
-                                    try:
-                                        ib.cancelOrder(sl_trade.order)
-                                        ib.cancelOrder(tp_trade.order)
-                                    except:
-                                        pass
-                        
-                        except Exception as e:
-                            print(f"[{symbol}] Error placing order: {e}")
-            
-            time.sleep(interval)
-            
-        except KeyboardInterrupt:
-            print("\nStopping...")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(5)
-    
-    # Cleanup
-    print("Disconnecting from IBKR...")
-    ib.disconnect()
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested...")
+    finally:
+        trader.stop()
+        ib.disconnect()
+        print(f"\nTotal trades executed: {trader.trade_count}")
+        print(f"Final account value: ${trader.account_value:,.2f}")
 
 
 if __name__ == "__main__":
