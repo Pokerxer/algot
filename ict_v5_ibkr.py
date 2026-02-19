@@ -36,23 +36,70 @@ Q_TABLE_FILE = "v5_q_table.pkl"
 
 IBKR_AVAILABLE = False
 
+# Global IB connection for data fetching (reused across calls)
+_data_ib = None
+_data_ib_connected = False
 
-def fetch_ibkr_data(symbol, days=30, interval="1h"):
-    """Fetch historical data from IBKR."""
+
+def get_data_ib_connection():
+    """Get or create a shared IB connection for data fetching."""
+    global _data_ib, _data_ib_connected
+    
     try:
-        from ib_insync import IB, util
+        from ib_insync import IB
+    except ImportError:
+        return None
+    
+    if _data_ib is None:
+        _data_ib = IB()
+    
+    if not _data_ib_connected or not _data_ib.isConnected():
+        try:
+            if _data_ib.isConnected():
+                _data_ib.disconnect()
+            _data_ib.connect('127.0.0.1', 7497, clientId=99)
+            _data_ib_connected = True
+        except Exception as e:
+            print(f"Could not connect data IB: {e}")
+            _data_ib_connected = False
+            return None
+    
+    return _data_ib
+
+
+def disconnect_data_ib():
+    """Disconnect the shared data IB connection."""
+    global _data_ib, _data_ib_connected
+    if _data_ib is not None and _data_ib_connected:
+        try:
+            _data_ib.disconnect()
+        except:
+            pass
+        _data_ib_connected = False
+
+
+def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
+    """Fetch historical data from IBKR.
+    
+    Args:
+        symbol: Symbol to fetch
+        days: Number of days of history
+        interval: Bar interval ("1h" or "1d")
+        ib: Optional existing IB connection to reuse
+    """
+    try:
+        from ib_insync import util
     except ImportError:
         print("ERROR: ib_insync not installed. Run: pip install ib_insync")
         return None
     
-    contract = get_ibkr_contract(symbol)
+    # Use provided connection or get shared one
+    if ib is None:
+        ib = get_data_ib_connection()
+        if ib is None:
+            return None
     
-    ib = IB()
-    try:
-        ib.connect('127.0.0.1', 7497, clientId=99)
-    except Exception as e:
-        print(f"Could not connect to IBKR: {e}")
-        return None
+    contract = get_ibkr_contract(symbol)
     
     duration = f"{days} D"
     bar_size = "1 hour" if interval == "1h" else "1 day"
@@ -69,10 +116,7 @@ def fetch_ibkr_data(symbol, days=30, interval="1h"):
         )
     except Exception as e:
         print(f"Error fetching {symbol}: {e}")
-        ib.disconnect()
         return None
-    
-    ib.disconnect()
     
     if not bars:
         return None
@@ -84,9 +128,15 @@ def fetch_ibkr_data(symbol, days=30, interval="1h"):
     return df
 
 
-def prepare_data_ibkr(symbol, lookback=200):
-    """Prepare data using IBKR as primary source, Yahoo as fallback."""
-    df = fetch_ibkr_data(symbol, days=30, interval="1h")
+def prepare_data_ibkr(symbol, lookback=200, ib=None):
+    """Prepare data using IBKR as primary source, Yahoo as fallback.
+    
+    Args:
+        symbol: Symbol to fetch
+        lookback: Number of bars to look back
+        ib: Optional existing IB connection to reuse (avoids reconnecting)
+    """
+    df = fetch_ibkr_data(symbol, days=30, interval="1h", ib=ib)
     
     if df is None or len(df) < 50:
         print(f"IBKR failed for {symbol}, using Yahoo...")
@@ -1001,7 +1051,8 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
                 pass
             
             for symbol in symbols:
-                data = prepare_data_ibkr(symbol)
+                # Pass the main IB connection to avoid creating new connections
+                data = prepare_data_ibkr(symbol, ib=ib)
                 if data is None or len(data.get('closes', [])) < 50:
                     continue
                 
