@@ -361,9 +361,14 @@ if __name__ == "__main__":
     
     if results:
         # Save to JSON
-        output_file = '/Users/mac/Documents/Algot/v5_live_simulation_results.json'
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
+        output_file = 'v5_live_simulation_results.json'
+        try:
+            with open(output_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"\nResults saved to: {output_file}")
+        except PermissionError:
+            print(f"\nWarning: Could not save to {output_file} (permission denied)")
+            print("Results displayed above.")
         
         # Print summary
         print(f"\n{'='*80}")
