@@ -325,16 +325,20 @@ def run_v7_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
                 pos = positions[symbol]
                 next_bar = data['df'].iloc[idx + 1]
                 
+                # Handle both Yahoo (capitalized) and IBKR (lowercase) column names
+                next_high = next_bar.get('high', next_bar.get('High', 0))
+                next_low = next_bar.get('low', next_bar.get('Low', 0))
+                
                 exit_price = None
                 if pos['direction'] == 1:
-                    if next_bar['low'] <= pos['stop']:
+                    if next_low <= pos['stop']:
                         exit_price = pos['stop']
-                    elif next_bar['high'] >= pos['target']:
+                    elif next_high >= pos['target']:
                         exit_price = pos['target']
                 else:
-                    if next_bar['high'] >= pos['stop']:
+                    if next_high >= pos['stop']:
                         exit_price = pos['stop']
-                    elif next_bar['low'] <= pos['target']:
+                    elif next_low <= pos['target']:
                         exit_price = pos['target']
                 
                 if exit_price:

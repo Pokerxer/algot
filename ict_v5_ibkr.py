@@ -36,43 +36,132 @@ Q_TABLE_FILE = "v5_q_table.pkl"
 
 IBKR_AVAILABLE = False
 
+# Global IB connection for data fetching (reused across calls)
+_data_ib = None
+_data_ib_connected = False
 
-def fetch_ibkr_data(symbol, days=30, interval="1h"):
-    """Fetch historical data from IBKR."""
+
+def get_data_ib_connection():
+    """Get or create a shared IB connection for data fetching."""
+    global _data_ib, _data_ib_connected
+    
     try:
-        from ib_insync import IB, util
+        from ib_insync import IB
+    except ImportError:
+        return None
+    
+    if _data_ib is None:
+        _data_ib = IB()
+    
+    if not _data_ib_connected or not _data_ib.isConnected():
+        try:
+            if _data_ib.isConnected():
+                _data_ib.disconnect()
+            import random
+            _data_ib.connect('127.0.0.1', 7497, clientId=random.randint(100, 999))
+            _data_ib_connected = True
+        except Exception as e:
+            print(f"Could not connect data IB: {e}")
+            _data_ib_connected = False
+            return None
+    
+    return _data_ib
+
+
+def disconnect_data_ib():
+    """Disconnect the shared data IB connection."""
+    global _data_ib, _data_ib_connected
+    if _data_ib is not None and _data_ib_connected:
+        try:
+            _data_ib.disconnect()
+        except:
+            pass
+        _data_ib_connected = False
+
+
+# Cache for historical data (fetch once, update incrementally)
+_data_cache = {}
+
+def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None, use_cache=True):
+    """Fetch historical data from IBKR with caching for live trading.
+    
+    Args:
+        symbol: Symbol to fetch
+        days: Number of days of history
+        interval: Bar interval ("1h" or "1d")
+        ib: Optional existing IB connection to reuse
+        use_cache: If True, returns cached data and only fetches new bars
+    """
+    try:
+        from ib_insync import util
     except ImportError:
         print("ERROR: ib_insync not installed. Run: pip install ib_insync")
         return None
     
-    contract = get_ibkr_contract(symbol)
+    # Use provided connection or get shared one
+    if ib is None:
+        ib = get_data_ib_connection()
+        if ib is None:
+            return None
     
-    ib = IB()
+    cache_key = f"{symbol}_{interval}"
+    
+    # If caching enabled and we have cached data, try to update incrementally
+    if use_cache and cache_key in _data_cache:
+        cached_df = _data_cache[cache_key]
+        last_date = cached_df.index[-1]
+        
+        # Only fetch last 2 days to get new bars (much faster)
+        try:
+            contract = get_ibkr_contract(symbol)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime='',  # Up to now
+                durationStr="2 D",  # Only last 2 days
+                barSizeSetting="1 hour" if interval == "1h" else "1 day",
+                whatToShow='MIDPOINT',
+                useRTH=False,
+                formatDate=2
+            )
+            
+            if bars:
+                new_df = util.df(bars)
+                new_df.set_index('date', inplace=True)
+                new_df.index = pd.to_datetime(new_df.index)
+                
+                # Merge: keep old data, append only new bars
+                new_bars = new_df[new_df.index > last_date]
+                if not new_bars.empty:
+                    updated_df = pd.concat([cached_df, new_bars])
+                    # Keep only last 'days' worth of data
+                    cutoff = updated_df.index[-1] - pd.Timedelta(days=days)
+                    updated_df = updated_df[updated_df.index > cutoff]
+                    _data_cache[cache_key] = updated_df
+                    return updated_df
+                else:
+                    return cached_df
+            else:
+                return cached_df
+                
+        except Exception as e:
+            print(f"Error updating {symbol}: {e}, using cache")
+            return cached_df
+    
+    # Full fetch (first time or cache disabled)
     try:
-        ib.connect('127.0.0.1', 7497, clientId=99)
-    except Exception as e:
-        print(f"Could not connect to IBKR: {e}")
-        return None
-    
-    duration = f"{days} D"
-    bar_size = "1 hour" if interval == "1h" else "1 day"
-    
-    try:
+        contract = get_ibkr_contract(symbol)
         bars = ib.reqHistoricalData(
             contract,
-            endDateTime='',  # Empty for all
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow='MIDPOINT',  # Use MIDPOINT for all
+            endDateTime='',
+            durationStr=f"{days} D",
+            barSizeSetting="1 hour" if interval == "1h" else "1 day",
+            whatToShow='MIDPOINT',
             useRTH=False,
             formatDate=2
         )
     except Exception as e:
         print(f"Error fetching {symbol}: {e}")
-        ib.disconnect()
         return None
-    
-    ib.disconnect()
     
     if not bars:
         return None
@@ -81,12 +170,39 @@ def fetch_ibkr_data(symbol, days=30, interval="1h"):
     df.set_index('date', inplace=True)
     df.index = pd.to_datetime(df.index)
     
+    # Cache the result
+    if use_cache:
+        _data_cache[cache_key] = df
+    
     return df
 
 
-def prepare_data_ibkr(symbol, lookback=200):
-    """Prepare data using IBKR as primary source, Yahoo as fallback."""
-    df = fetch_ibkr_data(symbol, days=30, interval="1h")
+def get_live_price(symbol, ib):
+    """Get current live price using market data subscription."""
+    try:
+        contract = get_ibkr_contract(symbol)
+        ticker = ib.reqMktData(contract, '', False, False)
+        
+        # Wait a bit for price
+        ib.sleep(0.5)
+        
+        price = ticker.last if ticker.last else ticker.close
+        return price
+    except Exception as e:
+        print(f"Error getting live price for {symbol}: {e}")
+        return None
+
+
+def prepare_data_ibkr(symbol, lookback=200, ib=None, use_cache=True):
+    """Prepare data using IBKR as primary source, Yahoo as fallback.
+    
+    Args:
+        symbol: Symbol to fetch
+        lookback: Number of bars to look back
+        ib: Optional existing IB connection to reuse (avoids reconnecting)
+        use_cache: If True, returns cached data and only fetches new bars
+    """
+    df = fetch_ibkr_data(symbol, days=30, interval="1h", ib=ib, use_cache=use_cache)
     
     if df is None or len(df) < 50:
         print(f"IBKR failed for {symbol}, using Yahoo...")
@@ -682,101 +798,211 @@ def run_backtest(symbols, days=180, use_ibkr=True):
     return results
 
 
-def get_contract_multiplier(symbol):
-    """Get the contract multiplier for position sizing."""
-    # Futures multipliers (value per point)
-    multipliers = {
-        'ES': 50,      # E-mini S&P 500: $50 per point
-        'NQ': 20,      # E-mini Nasdaq-100: $20 per point
-        'MNQ': 2,      # Micro Nasdaq: $2 per point
-        'MES': 5,      # Micro E-mini S&P: $5 per point
-        'GC': 100,     # Gold: $100 per point
-        'SI': 5000,    # Silver: $5000 per point
-        'CL': 1000,    # Crude Oil: $1000 per point
-        'NG': 10000,   # Natural Gas: $10000 per point
-        'YM': 5,       # E-mini Dow: $5 per point
-        'RTY': 50,     # E-mini Russell 2000: $50 per point
-    }
+def get_contract_info(symbol):
+    """Get comprehensive contract information for position sizing.
     
-    # Forex pip values (per standard lot)
-    forex_pip_values = {
-        'EURUSD': 10,   # $10 per pip per lot
-        'GBPUSD': 10,
-        'USDJPY': 9.1,  # Varies with exchange rate
-        'AUDUSD': 10,
-        'USDCAD': 7.5,
-        'USDCHF': 10.8,
-        'NZDUSD': 10,
-        'GBPJPY': 9.1,
-        'EURJPY': 9.1,
-    }
-    
-    # Crypto - 1:1 for most
-    crypto = ['BTCUSD', 'ETHUSD', 'LTCUSD', 'SOLUSD']
-    
+    Returns dict with:
+    - type: 'futures', 'forex', 'crypto', or 'stock'
+    - multiplier: $ value per point (for futures/crypto/stock)
+    - pip_value: $ value per pip (for forex)
+    - min_stop: minimum recommended stop distance
+    - tick_size: minimum price increment
+    """
     symbol = symbol.upper()
     
-    if symbol in multipliers:
-        return {'type': 'futures', 'multiplier': multipliers[symbol]}
-    elif symbol in forex_pip_values:
-        return {'type': 'forex', 'pip_value': forex_pip_values[symbol]}
-    elif symbol in crypto:
-        return {'type': 'crypto', 'multiplier': 1}
+    # Futures - with minimum stops and tick sizes
+    futures_info = {
+        'ES': {'multiplier': 50, 'min_stop': 10, 'tick_size': 0.25},      # E-mini S&P
+        'NQ': {'multiplier': 20, 'min_stop': 25, 'tick_size': 0.25},      # E-mini Nasdaq
+        'MNQ': {'multiplier': 2, 'min_stop': 25, 'tick_size': 0.25},      # Micro Nasdaq
+        'MES': {'multiplier': 5, 'min_stop': 10, 'tick_size': 0.25},      # Micro E-mini S&P
+        'GC': {'multiplier': 100, 'min_stop': 10, 'tick_size': 0.10},     # Gold
+        'SI': {'multiplier': 5000, 'min_stop': 0.50, 'tick_size': 0.005}, # Silver
+        'CL': {'multiplier': 1000, 'min_stop': 0.50, 'tick_size': 0.01},  # Crude Oil
+        'NG': {'multiplier': 10000, 'min_stop': 0.03, 'tick_size': 0.001}, # Natural Gas
+        'YM': {'multiplier': 5, 'min_stop': 50, 'tick_size': 1},          # E-mini Dow
+        'RTY': {'multiplier': 50, 'min_stop': 15, 'tick_size': 0.10},     # E-mini Russell
+    }
+    
+    # Forex pip values (per standard lot of 100k units)
+    forex_info = {
+        'EURUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
+        'GBPUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
+        'USDJPY': {'pip_value': 9.1, 'min_stop': 0.50, 'decimal_places': 3},
+        'AUDUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
+        'USDCAD': {'pip_value': 7.5, 'min_stop': 0.0050, 'decimal_places': 5},
+        'USDCHF': {'pip_value': 10.8, 'min_stop': 0.0050, 'decimal_places': 5},
+        'NZDUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
+        'GBPJPY': {'pip_value': 9.1, 'min_stop': 0.50, 'decimal_places': 3},
+        'EURJPY': {'pip_value': 9.1, 'min_stop': 0.50, 'decimal_places': 3},
+    }
+    
+    # Crypto - with minimum stops as percentage of price
+    crypto_info = {
+        'BTCUSD': {'multiplier': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01},
+        'ETHUSD': {'multiplier': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01},
+        'SOLUSD': {'multiplier': 1, 'min_stop_pct': 0.02, 'tick_size': 0.01},
+        'LTCUSD': {'multiplier': 1, 'min_stop_pct': 0.02, 'tick_size': 0.01},
+        'LINKUSD': {'multiplier': 1, 'min_stop_pct': 0.025, 'tick_size': 0.01},
+        'UNIUSD': {'multiplier': 1, 'min_stop_pct': 0.03, 'tick_size': 0.01},
+    }
+    
+    if symbol in futures_info:
+        info = futures_info[symbol].copy()
+        info['type'] = 'futures'
+        return info
+    elif symbol in forex_info:
+        info = forex_info[symbol].copy()
+        info['type'] = 'forex'
+        return info
+    elif symbol in crypto_info:
+        info = crypto_info[symbol].copy()
+        info['type'] = 'crypto'
+        return info
+    else:
+        # Default stock settings
+        return {'type': 'stock', 'multiplier': 1, 'min_stop': 0.02, 'tick_size': 0.01}
+
+
+def get_contract_multiplier(symbol):
+    """Get the contract multiplier for position sizing (backward compatibility)."""
+    info = get_contract_info(symbol)
+    if info['type'] == 'futures':
+        return {'type': 'futures', 'multiplier': info['multiplier']}
+    elif info['type'] == 'forex':
+        return {'type': 'forex', 'pip_value': info['pip_value']}
+    elif info['type'] == 'crypto':
+        return {'type': 'crypto', 'multiplier': info['multiplier']}
     else:
         return {'type': 'stock', 'multiplier': 1}
 
 
 def calculate_position_size(symbol, account_value, risk_pct, stop_distance, current_price):
     """
-    Calculate proper position size accounting for contract multipliers.
+    Calculate proper position size with minimum stop enforcement.
     
-    Returns: (quantity, risk_per_contract)
+    Risk per trade varies by asset type:
+    - Crypto: $2,000 per trade
+    - S&P (ES): $1,000 per trade  
+    - Gold (GC): $2,000 per trade
+    - Other futures: $1,000 per trade
+    
+    Returns: (quantity, actual_risk_per_unit)
     """
-    contract_info = get_contract_multiplier(symbol)
-    risk_amount = account_value * risk_pct
+    contract_info = get_contract_info(symbol)
+    symbol_type = contract_info['type']
     
-    if contract_info['type'] == 'futures':
-        # For futures: risk = stop_distance * multiplier * contracts
+    # Adjust risk amount based on symbol
+    if symbol_type == 'crypto':
+        risk_amount = 2000  # $2,000 for crypto
+    elif symbol.upper() == 'ES':
+        risk_amount = 1000  # $1,000 for S&P
+    elif symbol.upper() == 'GC':
+        risk_amount = 2000  # $2,000 for Gold
+    else:
+        risk_amount = account_value * risk_pct  # Default: 2% of account
+    
+    if symbol_type == 'futures':
         multiplier = contract_info['multiplier']
-        risk_per_contract = stop_distance * multiplier
-        qty = max(1, int(risk_amount / risk_per_contract))
+        min_stop = contract_info['min_stop']
+        tick_size = contract_info['tick_size']
+        
+        # Enforce minimum stop distance to prevent oversized positions
+        effective_stop = max(stop_distance, min_stop)
+        
+        # Round to tick size
+        effective_stop = round(effective_stop / tick_size) * tick_size
+        
+        # Calculate risk per contract
+        risk_per_contract = effective_stop * multiplier
+        
+        # Calculate contracts
+        raw_qty = risk_amount / risk_per_contract if risk_per_contract > 0 else 0
+        qty = max(1, int(raw_qty))
+        
+        # For high-multiplier contracts, check if 1 contract exceeds risk limit
+        if qty == 1 and risk_per_contract > risk_amount * 3.0:
+            # Skip this trade only if even 1 contract is way too risky (>3x)
+            return 0, risk_per_contract
+        
         return qty, risk_per_contract
     
-    elif contract_info['type'] == 'forex':
-        # For forex: convert stop to pips, then calculate lot size
+    elif symbol_type == 'forex':
         pip_value = contract_info['pip_value']
-        # Assume 4 decimal places for most pairs (USDJPY is 2)
-        if 'JPY' in symbol:
-            pips = stop_distance * 100  # 2 decimal places
-        else:
-            pips = stop_distance * 10000  # 4 decimal places
+        min_stop = contract_info['min_stop']
+        decimal_places = contract_info.get('decimal_places', 5)
         
-        # Calculate lot size (1 lot = 100,000 units)
+        # Enforce minimum stop
+        effective_stop = max(stop_distance, min_stop)
+        
+        # Convert to pips
+        if decimal_places == 3:  # JPY pairs
+            pips = effective_stop * 100
+        else:  # Standard pairs
+            pips = effective_stop * 10000
+        
+        # Calculate lot size
         risk_per_lot = pips * pip_value
         lots = risk_amount / risk_per_lot if risk_per_lot > 0 else 0.01
         
-        # Convert to units (IBKR uses units, not lots)
-        qty = max(1000, int(lots * 100000))  # Minimum 1000 units (micro lot)
+        # Convert to units (1 lot = 100,000 units)
+        qty = max(1000, int(lots * 100000))
         
-        # Return risk per UNIT (not per lot) for consistency
+        # Cap at reasonable maximum
+        max_units = 5000000  # 50 lots max
+        qty = min(qty, max_units)
+        
         risk_per_unit = risk_per_lot / 100000
         return qty, risk_per_unit
     
-    elif contract_info['type'] == 'crypto':
-        # For crypto: direct price-based sizing
-        risk_per_unit = stop_distance
+    elif symbol_type == 'crypto':
+        multiplier = contract_info['multiplier']
+        min_stop_pct = contract_info.get('min_stop_pct', 0.02)
+        tick_size = contract_info.get('tick_size', 0.01)
+        
+        # Calculate minimum stop in price terms
+        min_stop = current_price * min_stop_pct
+        
+        # Enforce minimum stop
+        effective_stop = max(stop_distance, min_stop)
+        
+        # Round to tick size
+        effective_stop = round(effective_stop / tick_size) * tick_size
+        
+        # Calculate position size
+        risk_per_unit = effective_stop * multiplier
         qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-        # Round to reasonable precision
+        
+        # Round appropriately
         if current_price > 10000:  # BTC
-            qty = round(qty, 4)
-        else:
+            qty = round(qty, 6)
+        elif current_price > 1000:  # ETH
+            qty = round(qty, 5)
+        else:  # Other crypto
             qty = round(qty, 2)
-        return max(0.0001, qty), risk_per_unit
+        
+        # Enforce minimum and maximum
+        qty = max(0.001, qty)
+        
+        # Cap position value at 10x account (leverage limit)
+        max_qty = (account_value * 10) / current_price
+        qty = min(qty, max_qty)
+        
+        return qty, risk_per_unit
     
-    else:  # Stock
-        risk_per_share = stop_distance
+    else:  # Stock/Other
+        min_stop = contract_info.get('min_stop', 0.02)
+        effective_stop = max(stop_distance, min_stop)
+        
+        risk_per_share = effective_stop
         qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
-        return max(1, qty), risk_per_share
+        
+        # Enforce min/max
+        qty = max(1, qty)
+        max_shares = int(account_value / current_price) if current_price > 0 else 0
+        qty = min(qty, max_shares)
+        
+        return qty, risk_per_share
 
 
 def sync_positions_with_ibkr(ib, symbols):
@@ -909,15 +1135,376 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         return None
 
 
+class LiveTrader:
+    """Live trading with hybrid streaming (5s bars) + historical (hourly) data."""
+    
+    def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30):
+        self.ib = ib
+        self.symbols = symbols
+        self.risk_pct = risk_pct
+        self.poll_interval = poll_interval
+        self.positions = {}
+        self.active_orders = {}
+        self.bar_handlers = {}
+        self.historical_data = {}
+        self.account_value = 100000
+        self.trade_count = 0
+        
+        # Track which symbols have streaming vs need polling
+        self.streaming_symbols = set()
+        self.historical_symbols = set()
+        self.last_poll_time = {}
+        
+        # Initialize historical data for indicator calculations
+        self._init_historical_data()
+        
+    def _init_historical_data(self):
+        """Fetch historical data once for indicator calculations."""
+        print("\nInitializing historical data for indicators...")
+        for symbol in self.symbols:
+            try:
+                data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=True)
+                if data and len(data.get('closes', [])) >= 50:
+                    self.historical_data[symbol] = data
+                    print(f"  {symbol}: {len(data['closes'])} bars loaded")
+                else:
+                    print(f"  {symbol}: Failed to load data")
+            except Exception as e:
+                print(f"  {symbol}: Error loading - {e}")
+    
+    def _calculate_confluence(self, data, idx):
+        """Calculate confluence score for Telegram display."""
+        try:
+            htf = data['htf_trend'][idx] if idx < len(data['htf_trend']) else 0
+            ltf = data['ltf_trend'][idx] if idx < len(data['ltf_trend']) else 0
+            kz = data['kill_zone'][idx] if idx < len(data['kill_zone']) else False
+            pp = data['price_position'][idx] if idx < len(data['price_position']) else 0.5
+            
+            confluence = 0
+            
+            # Kill zone bonus
+            if kz:
+                confluence += 15
+            
+            # Trend alignment
+            if htf == 1 and ltf >= 0:
+                confluence += 25
+            elif htf == -1 and ltf <= 0:
+                confluence += 25
+            
+            # Price position (extremes better)
+            if pp < 0.25 or pp > 0.75:
+                confluence += 20
+            
+            # Check for FVG
+            current_price = data['closes'][idx]
+            near_bull_fvg = next((f for f in reversed(data['bullish_fvgs']) 
+                                  if f['idx'] < idx and f['mid'] < current_price < f['high']), None)
+            near_bear_fvg = next((f for f in reversed(data['bearish_fvgs']) 
+                                  if f['idx'] < idx and f['low'] < current_price < f['mid']), None)
+            
+            if near_bull_fvg and ltf >= 0:
+                confluence += 15
+            if near_bear_fvg and ltf <= 0:
+                confluence += 15
+            
+            return min(confluence, 100)
+        except:
+            return 0
+    
+    def _on_realtime_bar(self, symbol, bar):
+        """Handle real-time 5-second bar updates."""
+        # Only process completed 5-second bars
+        if not self.historical_data.get(symbol):
+            return
+            
+        data = self.historical_data[symbol]
+        current_price = bar.close
+        
+        # Update last price for Telegram with enhanced data
+        if tn:
+            try:
+                idx = len(data['closes']) - 1
+                tn.update_market_data(symbol, {
+                    'price': current_price,
+                    'htf_trend': int(data['htf_trend'][idx]) if idx < len(data['htf_trend']) else 0,
+                    'ltf_trend': int(data['ltf_trend'][idx]) if idx < len(data['ltf_trend']) else 0,
+                    'kill_zone': bool(data['kill_zone'][idx]) if idx < len(data['kill_zone']) else False,
+                    'price_position': float(data['price_position'][idx]) if idx < len(data['price_position']) else 0.5,
+                    'confluence': self._calculate_confluence(data, idx),
+                    'volatility': float(data['volatility'][idx]) if idx < len(data['volatility']) else 0,
+                    'last_update': datetime.now().isoformat()
+                })
+            except Exception as e:
+                pass  # Silently fail to not disrupt trading
+        
+        # Check if we have an open position
+        if symbol in self.positions:
+            self._check_position_exit(symbol, current_price)
+        else:
+            # No position - check for entry signal on every 5-second bar
+            idx = len(data['closes']) - 1
+            signal = get_signal(data, idx)
+            
+            if signal:
+                self._enter_trade(symbol, signal, current_price)
+    
+    def _enter_trade(self, symbol, signal, current_price):
+        """Enter a new trade with bracket order."""
+        try:
+            data = self.historical_data[symbol]
+            idx = len(data['closes']) - 1
+            
+            # Calculate stop and target
+            if signal['direction'] == 1:
+                stop = data['lows'][idx]
+                target = current_price + (current_price - stop) * 2
+            else:
+                stop = data['highs'][idx]
+                target = current_price - (stop - current_price) * 2
+            
+            stop_distance = abs(current_price - stop)
+            if stop_distance <= 0:
+                return
+            
+            # Calculate position size
+            qty, _ = calculate_position_size(symbol, self.account_value, self.risk_pct, stop_distance, current_price)
+            if qty <= 0:
+                return
+            
+            # Place bracket order
+            contract = get_ibkr_contract(symbol)
+            bracket = place_bracket_order(self.ib, contract, signal['direction'], qty, stop, target)
+            
+            if bracket:
+                parent_trade, sl_trade, tp_trade = bracket
+                filled, fill_price, filled_qty = wait_for_fill(self.ib, parent_trade, timeout=10)
+                
+                if filled:
+                    self.positions[symbol] = {
+                        'entry': fill_price,
+                        'stop': stop,
+                        'target': target,
+                        'direction': signal['direction'],
+                        'qty': filled_qty,
+                        'confluence': signal['confluence'],
+                        'entry_time': datetime.now()
+                    }
+                    
+                    self.active_orders[symbol] = {
+                        'sl_order_id': sl_trade.order.orderId,
+                        'tp_order_id': tp_trade.order.orderId
+                    }
+                    
+                    print(f"[{symbol}] ENTRY: {'LONG' if signal['direction'] == 1 else 'SHORT'} x {filled_qty} @ {fill_price:.4f}")
+                    self.trade_count += 1
+                    
+                    if tn:
+                        try:
+                            tn.send_trade_entry(symbol, signal['direction'], filled_qty, fill_price, signal['confluence'], target, stop)
+                        except:
+                            pass
+                            
+        except Exception as e:
+            print(f"[{symbol}] Error entering trade: {e}")
+    
+    def _check_position_exit(self, symbol, current_price):
+        """Check if position hit stop/target (bracket orders handle this, but we track it)."""
+        try:
+            # Query IBKR to see if position still exists
+            ibkr_pos = self.ib.positions()
+            has_position = False
+            
+            for p in ibkr_pos:
+                p_symbol = p.contract.symbol
+                if p.contract.secType == 'CASH':
+                    p_symbol = f"{p.contract.symbol}{p.contract.currency}"
+                elif p.contract.secType == 'CRYPTO':
+                    p_symbol = f"{p.contract.symbol}USD"
+                
+                if p_symbol.upper() == symbol.upper() and abs(p.position) > 0:
+                    has_position = True
+                    break
+            
+            if not has_position and symbol in self.positions:
+                # Position was closed by bracket order
+                pos = self.positions[symbol]
+                
+                # Try to get fill price from IBKR
+                try:
+                    fills = self.ib.fills()
+                    for fill in fills:
+                        fill_symbol = fill.contract.symbol
+                        if fill.contract.secType == 'CASH':
+                            fill_symbol = f"{fill.contract.symbol}{fill.contract.currency}"
+                        elif fill.contract.secType == 'CRYPTO':
+                            fill_symbol = f"{fill.contract.symbol}USD"
+                        
+                        if fill_symbol.upper() == symbol.upper():
+                            exit_price = fill.execution.price
+                            if pos['direction'] == 1:
+                                pnl = (exit_price - pos['entry']) * pos['qty']
+                            else:
+                                pnl = (pos['entry'] - exit_price) * pos['qty']
+                            
+                            # Apply contract multiplier for PnL
+                            contract_info = get_contract_multiplier(symbol)
+                            if contract_info['type'] == 'futures':
+                                pnl *= contract_info['multiplier']
+                            
+                            print(f"[{symbol}] EXIT: @ {exit_price:.4f} P&L: ${pnl:.2f}")
+                            
+                            if tn:
+                                try:
+                                    bars_held = (datetime.now() - pos['entry_time']).seconds // 300  # Approximate
+                                    tn.send_trade_exit(symbol, pos['direction'], pnl, 'bracket_order', pos['entry'], exit_price, bars_held)
+                                except:
+                                    pass
+                            
+                            del self.positions[symbol]
+                            if symbol in self.active_orders:
+                                del self.active_orders[symbol]
+                            break
+                except Exception as e:
+                    print(f"[{symbol}] Error processing fill: {e}")
+                    
+        except Exception as e:
+            print(f"[{symbol}] Error checking position: {e}")
+    
+    def start(self):
+        """Start streaming real-time bars with fallback to historical for restricted symbols."""
+        print(f"\nStarting real-time streaming for {len(self.symbols)} symbols...")
+        print("Using 5-second bars for streaming, hourly bars for restricted symbols")
+        print("-" * 50)
+        
+        for symbol in self.symbols:
+            streaming_works = False
+            try:
+                contract = get_ibkr_contract(symbol)
+                
+                # Subscribe to real-time bars (5-second intervals)
+                bars = self.ib.reqRealTimeBars(contract, 5, 'MIDPOINT', False)
+                
+                # Track if we receive any bars
+                bars_received = [False]  # Use list to allow modification in closure
+                
+                def make_callback(sym, received_flag):
+                    def callback(bars_list, has_new_bar):
+                        received_flag[0] = True
+                        if has_new_bar and bars_list:
+                            latest_bar = bars_list[-1]
+                            self._on_realtime_bar(sym, latest_bar)
+                    return callback
+                
+                bars.updateEvent += make_callback(symbol, bars_received)
+                
+                # Wait to see if bars are received (indicates successful subscription)
+                self.ib.sleep(2.0)
+                
+                # Check if we received any bars
+                if bars_received[0]:
+                    self.bar_handlers[symbol] = bars
+                    self.streaming_symbols.add(symbol)
+                    print(f"  {symbol}: ✅ Streaming 5-second bars")
+                    streaming_works = True
+                else:
+                    # No bars received - likely no permissions, cancel and use historical
+                    try:
+                        self.ib.cancelRealTimeBars(bars)
+                    except:
+                        pass
+                    raise Exception("No market data permissions")
+                
+            except Exception as e:
+                # Subscription failed or no bars received, use historical polling
+                self.historical_symbols.add(symbol)
+                self.last_poll_time[symbol] = 0
+                error_msg = str(e)[:50] if not streaming_works else "No market data permissions"
+                print(f"  {symbol}: 📊 Using hourly bars ({error_msg})")
+        
+        streaming_count = len(self.streaming_symbols)
+        historical_count = len(self.historical_symbols)
+        
+        print(f"\n✅ Streaming: {streaming_count} symbols")
+        print(f"📊 Historical: {historical_count} symbols")
+        print(f"\nTrading started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("Press Ctrl+C to stop\n")
+    
+    def poll_historical_symbols(self):
+        """Poll symbols that don't have streaming permissions."""
+        current_time = time.time()
+        
+        for symbol in self.historical_symbols:
+            # Check if it's time to poll this symbol
+            last_poll = self.last_poll_time.get(symbol, 0)
+            if current_time - last_poll < self.poll_interval:
+                continue
+            
+            self.last_poll_time[symbol] = current_time
+            
+            try:
+                # Get fresh data
+                data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=True)
+                if data is None or len(data.get('closes', [])) < 50:
+                    continue
+                
+                # Update historical data cache
+                self.historical_data[symbol] = data
+                
+                idx = len(data['closes']) - 1
+                current_price = data['closes'][idx]
+                
+                # Update Telegram
+                if tn:
+                    try:
+                        htf = data['htf_trend'][idx]
+                        ltf = data['ltf_trend'][idx]
+                        kz = data['kill_zone'][idx]
+                        pp = data['price_position'][idx]
+                        signal = get_signal(data, idx)
+                        conf = signal.get('confluence', 0) if signal else 0
+                        tn.update_market_data(symbol, {
+                            'price': current_price,
+                            'htf_trend': htf,
+                            'ltf_trend': ltf,
+                            'kill_zone': kz,
+                            'price_position': pp,
+                            'confluence': conf
+                        })
+                    except:
+                        pass
+                
+                # Check position or signal (same logic as streaming)
+                if symbol in self.positions:
+                    self._check_position_exit(symbol, current_price)
+                else:
+                    signal = get_signal(data, idx)
+                    if signal:
+                        self._enter_trade(symbol, signal, current_price)
+                        
+            except Exception as e:
+                print(f"[{symbol}] Error polling: {e}")
+    
+    def stop(self):
+        """Stop streaming."""
+        print("\nStopping real-time streaming...")
+        for symbol, bars in self.bar_handlers.items():
+            try:
+                self.ib.cancelRealTimeBars(bars)
+                print(f"  {symbol}: Unsubscribed")
+            except:
+                pass
+
+
 def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
-    """Run live trading via IBKR with proper order management.
+    """Run live trading via IBKR with streaming 5-second bars.
     
     Features:
+    - Real-time 5-second bar streaming (not polling)
+    - Incremental historical data loading
     - Bracket orders with automatic SL/TP
-    - Position sync on startup (crash recovery)
-    - Proper position sizing for futures/forex/crypto
-    - Order fill verification
-    - Bar completion checks
+    - Position sync on startup
+    - Event-driven architecture (no sleep loops)
     """
     try:
         from ib_insync import IB, MarketOrder, StopOrder, LimitOrder
@@ -929,7 +1516,6 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
     ib = IB()
     
     try:
-        # Paper trading port 7497, live 7496
         ib.connect('127.0.0.1', port, clientId=1)
         print(f"Connected to IBKR (port {port})")
     except Exception as e:
@@ -938,7 +1524,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
         return
     
     # Get account info
-    account_value = 100000  # Default
+    account_value = 100000
     try:
         account = ib.accountValues()
         for av in account:
@@ -949,7 +1535,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
     except Exception as e:
         print(f"Warning: Could not get account info: {e}")
     
-    # Sync existing positions from IBKR (crash recovery)
+    # Sync existing positions
     print("\nSyncing positions with IBKR...")
     positions = sync_positions_with_ibkr(ib, symbols)
     if positions:
@@ -957,19 +1543,13 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
     else:
         print("No existing positions found")
     
-    # Track active orders (for bracket order management)
-    active_orders = {}  # symbol -> {'sl_order_id': x, 'tp_order_id': y}
-    
-    # Track last bar time to avoid acting on incomplete bars
-    last_bar_times = {}
-    
-    print(f"\nICT V5 - IBKR Trading (Fixed)")
+    print(f"\nICT V5 - IBKR Trading (STREAMING)")
     print(f"Symbols: {symbols}")
     print(f"Risk per trade: {risk_pct*100}%")
-    print(f"Check interval: {interval}s")
+    print(f"Mode: {'Paper Trading' if port == 7497 else 'Live Trading'}")
     print("-" * 50)
     
-    # Send startup notification to Telegram
+    # Send startup notification
     if tn:
         try:
             message = f"""
@@ -977,9 +1557,9 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
 ━━━━━━━━━━━━━━━━━━━━
 <b>Symbols:</b> {', '.join(symbols)}
 <b>Risk:</b> {risk_pct*100}%
-<b>Interval:</b> {interval}s
 <b>Mode:</b> {'Paper Trading' if port == 7497 else 'Live Trading'}
 <b>Account:</b> ${account_value:,.0f}
+<b>Data:</b> Real-time 5-second bars
 ━━━━━━━━━━━━━━━━━━━━
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -987,200 +1567,41 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
         except Exception as e:
             print(f"Error sending startup notification: {e}")
     
-    trade_count = 0
+    # Create and start trader
+    trader = LiveTrader(ib, symbols, risk_pct, poll_interval=interval)
+    trader.account_value = account_value
+    trader.positions = positions
     
-    while True:
-        try:
-            # Refresh account value periodically
-            try:
-                for av in ib.accountValues():
-                    if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                        account_value = float(av.value)
-                        break
-            except:
-                pass
+    try:
+        trader.start()
+        
+        # Run forever (or until interrupted)
+        iteration = 0
+        while True:
+            ib.sleep(1)
+            iteration += 1
             
-            for symbol in symbols:
-                data = prepare_data_ibkr(symbol)
-                if data is None or len(data.get('closes', [])) < 50:
-                    continue
-                
-                idx = len(data['closes']) - 1
-                current_price = data['closes'][idx]
-                
-                # Check for bar completion (avoid acting on incomplete bars)
-                bar_time = data['df'].index[idx]
-                if symbol in last_bar_times and last_bar_times[symbol] == bar_time:
-                    # Same bar as last check - skip signal processing
-                    # (Still update Telegram data though)
+            # Poll historical symbols every N seconds (default 30)
+            if iteration % interval == 0:
+                trader.poll_historical_symbols()
+            
+            # Refresh account value periodically (every 60 seconds)
+            if iteration % 60 == 0:
+                try:
+                    for av in ib.accountValues():
+                        if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                            trader.account_value = float(av.value)
+                            break
+                except:
                     pass
-                else:
-                    last_bar_times[symbol] = bar_time
                 
-                # Get signal
-                signal = get_signal(data, idx)
-                
-                # Update market data for Telegram commands
-                if tn:
-                    try:
-                        htf = data['htf_trend'][idx]
-                        ltf = data['ltf_trend'][idx]
-                        kz = data['kill_zone'][idx]
-                        pp = data['price_position'][idx]
-                        conf = signal.get('confluence', 0) if signal else 0
-                        tn.update_market_data(symbol, {
-                            'price': current_price,
-                            'htf_trend': htf,
-                            'ltf_trend': ltf,
-                            'kill_zone': kz,
-                            'price_position': pp,
-                            'confluence': conf
-                        })
-                    except Exception as e:
-                        pass
-                
-                # Check existing position - bracket orders handle SL/TP automatically
-                if symbol in positions:
-                    pos = positions[symbol]
-                    pos['bars_held'] = pos.get('bars_held', 0) + 1
-                    
-                    # Check if position was closed by bracket order
-                    # by querying IBKR positions
-                    try:
-                        ibkr_pos = ib.positions()
-                        has_position = False
-                        for p in ibkr_pos:
-                            p_symbol = p.contract.symbol
-                            if p.contract.secType == 'CASH':
-                                p_symbol = f"{p.contract.symbol}{p.contract.currency}"
-                            elif p.contract.secType == 'CRYPTO':
-                                p_symbol = f"{p.contract.symbol}USD"
-                            
-                            if p_symbol.upper() == symbol.upper() and abs(p.position) > 0:
-                                has_position = True
-                                break
-                        
-                        if not has_position and symbol in positions:
-                            # Position was closed (by bracket order SL/TP)
-                            print(f"[{symbol}] Position closed by bracket order")
-                            
-                            # Try to determine exit price from fills
-                            exit_price = current_price  # Default
-                            pnl = (exit_price - pos['entry']) * pos['direction'] * pos['qty']
-                            
-                            # Adjust PnL for contract multiplier
-                            contract_info = get_contract_multiplier(symbol)
-                            if contract_info['type'] == 'futures':
-                                pnl *= contract_info['multiplier']
-                            
-                            if tn:
-                                try:
-                                    exit_reason = 'bracket_order'
-                                    tn.send_trade_exit(symbol, pos['direction'], pnl, exit_reason, 
-                                                      pos['entry'], exit_price, pos.get('bars_held', 0))
-                                except:
-                                    pass
-                            
-                            del positions[symbol]
-                            if symbol in active_orders:
-                                del active_orders[symbol]
-                    except Exception as e:
-                        print(f"Error checking position status: {e}")
-                
-                else:
-                    # No position - check for entry
-                    if signal and symbol not in positions:
-                        # Calculate stop and target
-                        if signal['direction'] == 1:  # Long
-                            stop_price = data['lows'][idx]
-                            stop_distance = current_price - stop_price
-                            target_price = current_price + stop_distance * 2
-                        else:  # Short
-                            stop_price = data['highs'][idx]
-                            stop_distance = stop_price - current_price
-                            target_price = current_price - stop_distance * 2
-                        
-                        if stop_distance <= 0:
-                            continue
-                        
-                        # Calculate proper position size
-                        qty, risk_per_unit = calculate_position_size(
-                            symbol, account_value, risk_pct, stop_distance, current_price
-                        )
-                        
-                        if qty <= 0:
-                            print(f"[{symbol}] Invalid position size calculated")
-                            continue
-                        
-                        # Place bracket order
-                        try:
-                            contract = get_ibkr_contract(symbol)
-                            
-                            print(f"[{symbol}] Placing bracket order: {signal['direction']} x {qty}")
-                            print(f"  Entry: {current_price:.4f}, Stop: {stop_price:.4f}, Target: {target_price:.4f}")
-                            
-                            bracket = place_bracket_order(
-                                ib, contract, signal['direction'], qty,
-                                stop_price, target_price
-                            )
-                            
-                            if bracket:
-                                parent_trade, sl_trade, tp_trade = bracket
-                                
-                                # Wait for fill
-                                filled, fill_price, filled_qty = wait_for_fill(ib, parent_trade, timeout=10)
-                                
-                                if filled:
-                                    positions[symbol] = {
-                                        'entry': fill_price,
-                                        'stop': stop_price,
-                                        'target': target_price,
-                                        'direction': signal['direction'],
-                                        'qty': filled_qty,
-                                        'confluence': signal['confluence'],
-                                        'bars_held': 0
-                                    }
-                                    
-                                    active_orders[symbol] = {
-                                        'sl_order_id': sl_trade.order.orderId,
-                                        'tp_order_id': tp_trade.order.orderId
-                                    }
-                                    
-                                    print(f"[{symbol}] ENTRY FILLED: {'LONG' if signal['direction'] == 1 else 'SHORT'} x {filled_qty} @ {fill_price:.4f}")
-                                    trade_count += 1
-                                    
-                                    # Send Telegram notification
-                                    if tn:
-                                        try:
-                                            tn.send_trade_entry(symbol, signal['direction'], filled_qty, 
-                                                              fill_price, signal['confluence'], target_price, stop_price)
-                                        except Exception as e:
-                                            print(f"Error sending entry notification: {e}")
-                                else:
-                                    print(f"[{symbol}] Entry order not filled - cancelling bracket")
-                                    try:
-                                        ib.cancelOrder(sl_trade.order)
-                                        ib.cancelOrder(tp_trade.order)
-                                    except:
-                                        pass
-                        
-                        except Exception as e:
-                            print(f"[{symbol}] Error placing order: {e}")
-            
-            time.sleep(interval)
-            
-        except KeyboardInterrupt:
-            print("\nStopping...")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(5)
-    
-    # Cleanup
-    print("Disconnecting from IBKR...")
-    ib.disconnect()
+    except KeyboardInterrupt:
+        print("\n\nShutdown requested...")
+    finally:
+        trader.stop()
+        ib.disconnect()
+        print(f"\nTotal trades executed: {trader.trade_count}")
+        print(f"Final account value: ${trader.account_value:,.2f}")
 
 
 if __name__ == "__main__":
