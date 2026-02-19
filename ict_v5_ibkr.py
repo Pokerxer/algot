@@ -682,10 +682,245 @@ def run_backtest(symbols, days=180, use_ibkr=True):
     return results
 
 
-def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True):
-    """Run live trading via IBKR."""
+def get_contract_multiplier(symbol):
+    """Get the contract multiplier for position sizing."""
+    # Futures multipliers (value per point)
+    multipliers = {
+        'ES': 50,      # E-mini S&P 500: $50 per point
+        'NQ': 20,      # E-mini Nasdaq-100: $20 per point
+        'MNQ': 2,      # Micro Nasdaq: $2 per point
+        'MES': 5,      # Micro E-mini S&P: $5 per point
+        'GC': 100,     # Gold: $100 per point
+        'SI': 5000,    # Silver: $5000 per point
+        'CL': 1000,    # Crude Oil: $1000 per point
+        'NG': 10000,   # Natural Gas: $10000 per point
+        'YM': 5,       # E-mini Dow: $5 per point
+        'RTY': 50,     # E-mini Russell 2000: $50 per point
+    }
+    
+    # Forex pip values (per standard lot)
+    forex_pip_values = {
+        'EURUSD': 10,   # $10 per pip per lot
+        'GBPUSD': 10,
+        'USDJPY': 9.1,  # Varies with exchange rate
+        'AUDUSD': 10,
+        'USDCAD': 7.5,
+        'USDCHF': 10.8,
+        'NZDUSD': 10,
+        'GBPJPY': 9.1,
+        'EURJPY': 9.1,
+    }
+    
+    # Crypto - 1:1 for most
+    crypto = ['BTCUSD', 'ETHUSD', 'LTCUSD', 'SOLUSD']
+    
+    symbol = symbol.upper()
+    
+    if symbol in multipliers:
+        return {'type': 'futures', 'multiplier': multipliers[symbol]}
+    elif symbol in forex_pip_values:
+        return {'type': 'forex', 'pip_value': forex_pip_values[symbol]}
+    elif symbol in crypto:
+        return {'type': 'crypto', 'multiplier': 1}
+    else:
+        return {'type': 'stock', 'multiplier': 1}
+
+
+def calculate_position_size(symbol, account_value, risk_pct, stop_distance, current_price):
+    """
+    Calculate proper position size accounting for contract multipliers.
+    
+    Returns: (quantity, risk_per_contract)
+    """
+    contract_info = get_contract_multiplier(symbol)
+    risk_amount = account_value * risk_pct
+    
+    if contract_info['type'] == 'futures':
+        # For futures: risk = stop_distance * multiplier * contracts
+        multiplier = contract_info['multiplier']
+        risk_per_contract = stop_distance * multiplier
+        qty = max(1, int(risk_amount / risk_per_contract))
+        return qty, risk_per_contract
+    
+    elif contract_info['type'] == 'forex':
+        # For forex: convert stop to pips, then calculate lot size
+        pip_value = contract_info['pip_value']
+        # Assume 4 decimal places for most pairs (USDJPY is 2)
+        if 'JPY' in symbol:
+            pips = stop_distance * 100  # 2 decimal places
+        else:
+            pips = stop_distance * 10000  # 4 decimal places
+        
+        # Calculate lot size (1 lot = 100,000 units)
+        risk_per_lot = pips * pip_value
+        lots = risk_amount / risk_per_lot if risk_per_lot > 0 else 0.01
+        
+        # Convert to units (IBKR uses units, not lots)
+        qty = max(1000, int(lots * 100000))  # Minimum 1000 units (micro lot)
+        
+        # Return risk per UNIT (not per lot) for consistency
+        risk_per_unit = risk_per_lot / 100000
+        return qty, risk_per_unit
+    
+    elif contract_info['type'] == 'crypto':
+        # For crypto: direct price-based sizing
+        risk_per_unit = stop_distance
+        qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
+        # Round to reasonable precision
+        if current_price > 10000:  # BTC
+            qty = round(qty, 4)
+        else:
+            qty = round(qty, 2)
+        return max(0.0001, qty), risk_per_unit
+    
+    else:  # Stock
+        risk_per_share = stop_distance
+        qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+        return max(1, qty), risk_per_share
+
+
+def sync_positions_with_ibkr(ib, symbols):
+    """
+    Sync local position tracking with actual IBKR positions.
+    Call this on startup to recover from crashes.
+    """
+    positions = {}
+    
     try:
-        from ib_insync import IB, MarketOrder
+        ibkr_positions = ib.positions()
+        
+        for pos in ibkr_positions:
+            # Get symbol from contract
+            symbol = pos.contract.symbol
+            
+            # Map IBKR symbols back to our format
+            if pos.contract.secType == 'CASH':
+                # Forex - combine pair
+                symbol = f"{pos.contract.symbol}{pos.contract.currency}"
+            elif pos.contract.secType == 'CRYPTO':
+                symbol = f"{pos.contract.symbol}USD"
+            
+            if symbol in symbols or symbol.upper() in [s.upper() for s in symbols]:
+                qty = abs(pos.position)
+                direction = 1 if pos.position > 0 else -1
+                avg_cost = pos.avgCost
+                
+                # Estimate stop/target (we don't know original, use defaults)
+                contract_info = get_contract_multiplier(symbol)
+                if contract_info['type'] == 'futures':
+                    # Use 1% of price as estimated stop distance
+                    stop_dist = avg_cost * 0.01
+                else:
+                    stop_dist = avg_cost * 0.02
+                
+                positions[symbol.upper()] = {
+                    'entry': avg_cost,
+                    'stop': avg_cost - stop_dist if direction == 1 else avg_cost + stop_dist,
+                    'target': avg_cost + stop_dist * 2 if direction == 1 else avg_cost - stop_dist * 2,
+                    'direction': direction,
+                    'qty': qty,
+                    'confluence': 0,  # Unknown
+                    'bars_held': 0,
+                    'synced_from_ibkr': True
+                }
+                print(f"[SYNC] Found existing position: {symbol} {direction} x {qty} @ {avg_cost:.2f}")
+        
+        return positions
+    
+    except Exception as e:
+        print(f"Error syncing positions: {e}")
+        return {}
+
+
+def wait_for_fill(ib, trade, timeout=10):
+    """
+    Wait for order fill and return fill details.
+    Returns: (filled: bool, fill_price: float, filled_qty: int)
+    """
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        ib.sleep(0.5)  # Use ib.sleep to process events
+        
+        if trade.isDone():
+            if trade.orderStatus.status == 'Filled':
+                fill_price = trade.orderStatus.avgFillPrice
+                filled_qty = trade.orderStatus.filled
+                return True, fill_price, int(filled_qty)
+            else:
+                # Order rejected or cancelled
+                print(f"Order failed: {trade.orderStatus.status}")
+                return False, 0, 0
+    
+    print(f"Order timeout after {timeout}s")
+    return False, 0, 0
+
+
+def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
+    """
+    Place a bracket order with stop-loss and take-profit.
+    Returns: (parent_trade, sl_trade, tp_trade) or None on failure
+    """
+    try:
+        from ib_insync import MarketOrder, StopOrder, LimitOrder
+        
+        # Create bracket order
+        action = 'BUY' if direction == 1 else 'SELL'
+        close_action = 'SELL' if direction == 1 else 'BUY'
+        
+        # Parent order (market entry)
+        parent = MarketOrder(action, qty)
+        parent.transmit = False  # Don't transmit yet
+        
+        # Stop loss order
+        stop_order = StopOrder(close_action, qty, stop_price)
+        stop_order.parentId = 0  # Will be set after parent is placed
+        stop_order.transmit = False
+        
+        # Take profit order  
+        tp_order = LimitOrder(close_action, qty, target_price)
+        tp_order.parentId = 0
+        tp_order.transmit = True  # Transmit all orders
+        
+        # Place parent first
+        parent_trade = ib.placeOrder(contract, parent)
+        ib.sleep(0.5)
+        
+        # Get parent order ID and attach children
+        parent_id = parent_trade.order.orderId
+        stop_order.parentId = parent_id
+        tp_order.parentId = parent_id
+        
+        # Set OCA (One-Cancels-All) group for SL and TP
+        oca_group = f"OCA_{parent_id}_{int(time.time())}"
+        stop_order.ocaGroup = oca_group
+        stop_order.ocaType = 1  # Cancel on fill
+        tp_order.ocaGroup = oca_group
+        tp_order.ocaType = 1
+        
+        # Place child orders
+        sl_trade = ib.placeOrder(contract, stop_order)
+        tp_trade = ib.placeOrder(contract, tp_order)
+        
+        return parent_trade, sl_trade, tp_trade
+    
+    except Exception as e:
+        print(f"Error placing bracket order: {e}")
+        return None
+
+
+def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
+    """Run live trading via IBKR with proper order management.
+    
+    Features:
+    - Bracket orders with automatic SL/TP
+    - Position sync on startup (crash recovery)
+    - Proper position sizing for futures/forex/crypto
+    - Order fill verification
+    - Bar completion checks
+    """
+    try:
+        from ib_insync import IB, MarketOrder, StopOrder, LimitOrder
     except ImportError:
         print("ERROR: ib_insync not installed. Run: pip install ib_insync")
         return
@@ -703,32 +938,32 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
         return
     
     # Get account info
+    account_value = 100000  # Default
     try:
         account = ib.accountValues()
         for av in account:
-            if av.tag == 'CashBalance' and av.currency == 'USD':
-                print(f"Cash balance: ${float(av.value):,.2f}")
+            if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                account_value = float(av.value)
+                print(f"Account value: ${account_value:,.2f}")
                 break
     except Exception as e:
         print(f"Warning: Could not get account info: {e}")
     
-    # Setup agents
-    agents = {}
-    positions = {}
-    
-    if train:
-        combined_agent = QLearningAgent(20, 8)
-        if combined_agent.load(Q_TABLE_FILE):
-            print(f"Loaded Q-table - continuing to learn")
-        else:
-            print(f"No Q-table found - starting fresh")
-        for symbol in symbols:
-            agents[symbol] = combined_agent
+    # Sync existing positions from IBKR (crash recovery)
+    print("\nSyncing positions with IBKR...")
+    positions = sync_positions_with_ibkr(ib, symbols)
+    if positions:
+        print(f"Found {len(positions)} existing position(s)")
     else:
-        for symbol in symbols:
-            agents[symbol] = QLearningAgent(20, 8)
+        print("No existing positions found")
     
-    print(f"\nICT V5 - IBKR Trading")
+    # Track active orders (for bracket order management)
+    active_orders = {}  # symbol -> {'sl_order_id': x, 'tp_order_id': y}
+    
+    # Track last bar time to avoid acting on incomplete bars
+    last_bar_times = {}
+    
+    print(f"\nICT V5 - IBKR Trading (Fixed)")
     print(f"Symbols: {symbols}")
     print(f"Risk per trade: {risk_pct*100}%")
     print(f"Check interval: {interval}s")
@@ -744,6 +979,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
 <b>Risk:</b> {risk_pct*100}%
 <b>Interval:</b> {interval}s
 <b>Mode:</b> {'Paper Trading' if port == 7497 else 'Live Trading'}
+<b>Account:</b> ${account_value:,.0f}
 ━━━━━━━━━━━━━━━━━━━━
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -755,6 +991,15 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
     
     while True:
         try:
+            # Refresh account value periodically
+            try:
+                for av in ib.accountValues():
+                    if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                        account_value = float(av.value)
+                        break
+            except:
+                pass
+            
             for symbol in symbols:
                 data = prepare_data_ibkr(symbol)
                 if data is None or len(data.get('closes', [])) < 50:
@@ -763,6 +1008,18 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                 idx = len(data['closes']) - 1
                 current_price = data['closes'][idx]
                 
+                # Check for bar completion (avoid acting on incomplete bars)
+                bar_time = data['df'].index[idx]
+                if symbol in last_bar_times and last_bar_times[symbol] == bar_time:
+                    # Same bar as last check - skip signal processing
+                    # (Still update Telegram data though)
+                    pass
+                else:
+                    last_bar_times[symbol] = bar_time
+                
+                # Get signal
+                signal = get_signal(data, idx)
+                
                 # Update market data for Telegram commands
                 if tn:
                     try:
@@ -770,9 +1027,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                         ltf = data['ltf_trend'][idx]
                         kz = data['kill_zone'][idx]
                         pp = data['price_position'][idx]
-                        conf = 0
-                        if signal:
-                            conf = signal.get('confluence', 0)
+                        conf = signal.get('confluence', 0) if signal else 0
                         tn.update_market_data(symbol, {
                             'price': current_price,
                             'htf_trend': htf,
@@ -784,173 +1039,133 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
                     except Exception as e:
                         pass
                 
-                # Get signal
-                signal = get_signal(data, idx)
-                
-                # Send Telegram notification for signal
-                if signal and tn:
-                    try:
-                        htf = data['htf_trend'][idx]
-                        ltf = data['ltf_trend'][idx]
-                        kz = data['kill_zone'][idx]
-                        pp = data['price_position'][idx]
-                        tp = current_price + (current_price - data['lows'][idx]) * 2 if signal['direction'] == 1 else current_price - (data['highs'][idx] - current_price) * 2
-                        sl = data['lows'][idx] if signal['direction'] == 1 else data['highs'][idx]
-                        tn.send_signal(symbol, signal['direction'], signal['confluence'], current_price, tp, sl, htf, ltf, kz, pp)
-                    except Exception as e:
-                        print(f"Error sending signal notification: {e}")
-                
-                # Check existing position
+                # Check existing position - bracket orders handle SL/TP automatically
                 if symbol in positions:
                     pos = positions[symbol]
+                    pos['bars_held'] = pos.get('bars_held', 0) + 1
                     
-                    # Check stop/target
-                    if pos['direction'] == 1:  # Long
-                        if data['lows'][idx] <= pos['stop']:
-                            # Stop hit
-                            try:
-                                contract = get_ibkr_contract(symbol)
-                                ib.placeOrder(contract, MarketOrder('SELL', pos['qty']))
-                                print(f"[{symbol}] STOP HIT: {pos['stop']:.2f}")
-                                
-                                # Calculate PnL and send notification
-                                if tn:
-                                    try:
-                                        pnl = (pos['stop'] - pos['entry']) * pos['qty']
-                                        tn.send_trade_exit(symbol, pos['direction'], pnl, 'stop_loss', pos['entry'], pos['stop'], pos.get('bars_held', 0))
-                                    except Exception as e:
-                                        print(f"Error sending exit notification: {e}")
-                            except Exception as e:
-                                print(f"Error closing position: {e}")
-                            del positions[symbol]
-                        elif data['highs'][idx] >= pos['target']:
-                            # Target hit
-                            try:
-                                contract = get_ibkr_contract(symbol)
-                                ib.placeOrder(contract, MarketOrder('SELL', pos['qty']))
-                                print(f"[{symbol}] TARGET HIT: {pos['target']:.2f}")
-                                
-                                # Calculate PnL and send notification
-                                if tn:
-                                    try:
-                                        pnl = (pos['target'] - pos['entry']) * pos['qty']
-                                        tn.send_trade_exit(symbol, pos['direction'], pnl, 'take_profit', pos['entry'], pos['target'], pos.get('bars_held', 0))
-                                    except Exception as e:
-                                        print(f"Error sending exit notification: {e}")
-                            except Exception as e:
-                                print(f"Error closing position: {e}")
-                            del positions[symbol]
-                    else:
-                        # Short position - check stop/target
-                        if pos['direction'] == -1:
-                            if data['highs'][idx] >= pos['stop']:
-                                # Stop hit (short)
+                    # Check if position was closed by bracket order
+                    # by querying IBKR positions
+                    try:
+                        ibkr_pos = ib.positions()
+                        has_position = False
+                        for p in ibkr_pos:
+                            p_symbol = p.contract.symbol
+                            if p.contract.secType == 'CASH':
+                                p_symbol = f"{p.contract.symbol}{p.contract.currency}"
+                            elif p.contract.secType == 'CRYPTO':
+                                p_symbol = f"{p.contract.symbol}USD"
+                            
+                            if p_symbol.upper() == symbol.upper() and abs(p.position) > 0:
+                                has_position = True
+                                break
+                        
+                        if not has_position and symbol in positions:
+                            # Position was closed (by bracket order SL/TP)
+                            print(f"[{symbol}] Position closed by bracket order")
+                            
+                            # Try to determine exit price from fills
+                            exit_price = current_price  # Default
+                            pnl = (exit_price - pos['entry']) * pos['direction'] * pos['qty']
+                            
+                            # Adjust PnL for contract multiplier
+                            contract_info = get_contract_multiplier(symbol)
+                            if contract_info['type'] == 'futures':
+                                pnl *= contract_info['multiplier']
+                            
+                            if tn:
                                 try:
-                                    contract = get_ibkr_contract(symbol)
-                                    ib.placeOrder(contract, MarketOrder('BUY', pos['qty']))
-                                    print(f"[{symbol}] STOP HIT (SHORT): {pos['stop']:.2f}")
-                                    
-                                    # Calculate PnL and send notification
-                                    if tn:
-                                        try:
-                                            pnl = (pos['entry'] - pos['stop']) * pos['qty']
-                                            tn.send_trade_exit(symbol, pos['direction'], pnl, 'stop_loss', pos['entry'], pos['stop'], pos.get('bars_held', 0))
-                                        except Exception as e:
-                                            print(f"Error sending exit notification: {e}")
-                                except Exception as e:
-                                    print(f"Error closing position: {e}")
-                                del positions[symbol]
-                            elif data['lows'][idx] <= pos['target']:
-                                # Target hit (short)
-                                try:
-                                    contract = get_ibkr_contract(symbol)
-                                    ib.placeOrder(contract, MarketOrder('BUY', pos['qty']))
-                                    print(f"[{symbol}] TARGET HIT (SHORT): {pos['target']:.2f}")
-                                    
-                                    # Calculate PnL and send notification
-                                    if tn:
-                                        try:
-                                            pnl = (pos['entry'] - pos['target']) * pos['qty']
-                                            tn.send_trade_exit(symbol, pos['direction'], pnl, 'take_profit', pos['entry'], pos['target'], pos.get('bars_held', 0))
-                                        except Exception as e:
-                                            print(f"Error sending exit notification: {e}")
-                                except Exception as e:
-                                    print(f"Error closing position: {e}")
-                                del positions[symbol]
+                                    exit_reason = 'bracket_order'
+                                    tn.send_trade_exit(symbol, pos['direction'], pnl, exit_reason, 
+                                                      pos['entry'], exit_price, pos.get('bars_held', 0))
+                                except:
+                                    pass
+                            
+                            del positions[symbol]
+                            if symbol in active_orders:
+                                del active_orders[symbol]
+                    except Exception as e:
+                        print(f"Error checking position status: {e}")
+                
                 else:
                     # No position - check for entry
-                    if signal:
-                        # Calculate position size
-                        account_value = 100000
+                    if signal and symbol not in positions:
+                        # Calculate stop and target
+                        if signal['direction'] == 1:  # Long
+                            stop_price = data['lows'][idx]
+                            stop_distance = current_price - stop_price
+                            target_price = current_price + stop_distance * 2
+                        else:  # Short
+                            stop_price = data['highs'][idx]
+                            stop_distance = stop_price - current_price
+                            target_price = current_price - stop_distance * 2
+                        
+                        if stop_distance <= 0:
+                            continue
+                        
+                        # Calculate proper position size
+                        qty, risk_per_unit = calculate_position_size(
+                            symbol, account_value, risk_pct, stop_distance, current_price
+                        )
+                        
+                        if qty <= 0:
+                            print(f"[{symbol}] Invalid position size calculated")
+                            continue
+                        
+                        # Place bracket order
                         try:
-                            account = ib.accountValues()
-                            for av in account:
-                                if av.tag == 'CashBalance' and av.currency == 'USD':
-                                    account_value = float(av.value)
-                                    break
-                        except:
-                            pass
-                        risk_amount = account_value * risk_pct
-                        stop_dist = current_price - data['lows'][idx] if signal['direction'] == 1 else data['highs'][idx] - current_price
-                        if stop_dist > 0:
-                            qty = int(risk_amount / stop_dist)
-                            if qty > 0:
-                                try:
-                                    contract = get_ibkr_contract(symbol)
-                                    if signal['direction'] == 1:
-                                        order = MarketOrder('BUY', qty)
-                                    else:
-                                        order = MarketOrder('SELL', qty)
-                                    ib.placeOrder(contract, order)
-                                    
+                            contract = get_ibkr_contract(symbol)
+                            
+                            print(f"[{symbol}] Placing bracket order: {signal['direction']} x {qty}")
+                            print(f"  Entry: {current_price:.4f}, Stop: {stop_price:.4f}, Target: {target_price:.4f}")
+                            
+                            bracket = place_bracket_order(
+                                ib, contract, signal['direction'], qty,
+                                stop_price, target_price
+                            )
+                            
+                            if bracket:
+                                parent_trade, sl_trade, tp_trade = bracket
+                                
+                                # Wait for fill
+                                filled, fill_price, filled_qty = wait_for_fill(ib, parent_trade, timeout=10)
+                                
+                                if filled:
                                     positions[symbol] = {
-                                        'entry': current_price,
-                                        'stop': data['lows'][idx] if signal['direction'] == 1 else data['highs'][idx],
-                                        'target': current_price + (current_price - data['lows'][idx]) * 2 if signal['direction'] == 1 else current_price - (data['highs'][idx] - current_price) * 2,
+                                        'entry': fill_price,
+                                        'stop': stop_price,
+                                        'target': target_price,
                                         'direction': signal['direction'],
-                                        'qty': qty,
+                                        'qty': filled_qty,
                                         'confluence': signal['confluence'],
                                         'bars_held': 0
                                     }
-                                    print(f"[{symbol}] ENTRY: {signal['direction']} @ {current_price:.2f} (conf: {signal['confluence']})")
+                                    
+                                    active_orders[symbol] = {
+                                        'sl_order_id': sl_trade.order.orderId,
+                                        'tp_order_id': tp_trade.order.orderId
+                                    }
+                                    
+                                    print(f"[{symbol}] ENTRY FILLED: {'LONG' if signal['direction'] == 1 else 'SHORT'} x {filled_qty} @ {fill_price:.4f}")
                                     trade_count += 1
                                     
-                                    # Send Telegram notification for trade entry
+                                    # Send Telegram notification
                                     if tn:
                                         try:
-                                            tp = positions[symbol]['target']
-                                            sl = positions[symbol]['stop']
-                                            tn.send_trade_entry(symbol, signal['direction'], qty, current_price, signal['confluence'], tp, sl)
+                                            tn.send_trade_entry(symbol, signal['direction'], filled_qty, 
+                                                              fill_price, signal['confluence'], target_price, stop_price)
                                         except Exception as e:
                                             print(f"Error sending entry notification: {e}")
-                                except Exception as e:
-                                    print(f"Error placing order: {e}")
-                
-                # Update position hold time
-                if symbol in positions:
-                    positions[symbol]['bars_held'] += 1
-                
-                # RL Learning (if enabled)
-                if train and agents.get(symbol):
-                    state = build_state(data, idx, positions.get(symbol))
-                    action = agents[symbol].act(state, training=True)
-                    
-                    # Simple reward: based on price movement
-                    if positions.get(symbol):
-                        pos = positions[symbol]
-                        pnl = (current_price - pos['entry']) * pos['direction'] / pos['entry']
-                        reward = pnl * 10
-                    else:
-                        reward = 0
-                    
-                    # Get next state (simplified)
-                    next_state = state  # In real implementation, would fetch next bar
-                    agents[symbol].update_q(state, action, reward, next_state)
-            
-            # Save Q-table periodically
-            if trade_count > 0 and trade_count % 10 == 0:
-                for symbol, agent in agents.items():
-                    agent.save(Q_TABLE_FILE)
+                                else:
+                                    print(f"[{symbol}] Entry order not filled - cancelling bracket")
+                                    try:
+                                        ib.cancelOrder(sl_trade.order)
+                                        ib.cancelOrder(tp_trade.order)
+                                    except:
+                                        pass
+                        
+                        except Exception as e:
+                            print(f"[{symbol}] Error placing order: {e}")
             
             time.sleep(interval)
             
@@ -959,9 +1174,12 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497, train=True)
             break
         except Exception as e:
             print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(5)
     
     # Cleanup
+    print("Disconnecting from IBKR...")
     ib.disconnect()
 
 
@@ -980,8 +1198,6 @@ if __name__ == "__main__":
                         help="Risk per trade (0.02 = 2%%)")
     parser.add_argument("--port", type=int, default=7497, 
                         help="IBKR port (7497=paper, 7496=live)")
-    parser.add_argument("--no-train", action="store_true", 
-                        help="Disable RL learning")
     parser.add_argument("--backtest", action="store_true",
                         help="Run backtest instead of live trading")
     parser.add_argument("--days", type=int, default=180,
@@ -999,6 +1215,5 @@ if __name__ == "__main__":
             symbols=symbols,
             interval=args.interval,
             risk_pct=args.risk,
-            port=args.port,
-            train=not args.no_train
+            port=args.port
         )

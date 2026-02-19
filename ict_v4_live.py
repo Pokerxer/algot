@@ -1,7 +1,7 @@
 """
 ICT V4 - RL-Enhanced Live Trading System
 =========================================
-Trade 24/7 with kill zone bonus. Focus on best performers: SOL, PL, SI, ETH, NG, BTC.
+Trade 24/7 with kill zone bonus. Focus on crypto: BTC, ETH, SOL.
 
 Changes from V3:
 - Trade anytime (not just kill zones)
@@ -9,17 +9,17 @@ Changes from V3:
 - Focus on: SOL-USD, PL=F, SI=F, ETH-USD, NG=F, BTC-USD
 
 Usage:
-    python3 ict_v4_live.py --symbols "BTC/USD,ETH/USD,SOL/USD" --interval 30
+    python3 ict_v4_live.py --symbols "BTCUSD,ETHUSD,SOLUSD" --interval 30
 """
 
 # Symbol mapping: Yahoo Finance -> Alpaca
 SYMBOL_MAP = {
-    'BTC-USD': 'BTC/USD',
-    'ETH-USD': 'ETH/USD',
-    'SOL-USD': 'SOL/USD',
-    'BTCUSD': 'BTC/USD',
-    'ETHUSD': 'ETH/USD',
-    'SOLUSD': 'SOL/USD',
+    'BTC-USD': 'BTCUSD',
+    'ETH-USD': 'ETHUSD',
+    'SOL-USD': 'SOLUSD',
+    'BTCUSD': 'BTCUSD',
+    'ETHUSD': 'ETHUSD',
+    'SOLUSD': 'SOLUSD',
 }
 
 import yfinance as yf
@@ -156,8 +156,12 @@ class QLearningAgent:
 
 def prepare_data(symbol, lookback=200):
     # Convert Alpaca symbol to Yahoo Finance format
-    # BTC/USD -> BTC-USD, ETH/USD -> ETH-USD
-    yahoo_symbol = symbol.replace("/", "-")
+    # BTC/USD -> BTC-USD, BTCUSD -> BTC-USD
+    if "/" in symbol:
+        yahoo_symbol = symbol.replace("/", "-")
+    else:
+        # BTCUSD -> BTC-USD, ETHUSD -> ETH-USD
+        yahoo_symbol = symbol.replace("USD", "-USD")
     
     df = yf.Ticker(yahoo_symbol).history(period="10d", interval="1h")
     df = df.dropna()
@@ -179,7 +183,7 @@ def prepare_data(symbol, lookback=200):
         if highs[i] < lows[i-2]:
             bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
     
-    df_daily = yf.Ticker(symbol).history(period="30d", interval="1d")
+    df_daily = yf.Ticker(yahoo_symbol).history(period="30d", interval="1d")
     if len(df_daily) < 5:
         htf_trend = np.zeros(len(df))
     else:
@@ -525,7 +529,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="ICT V4 Live Trading")
     parser.add_argument("--mode", default="paper", help="Trading mode (paper/live)")
-    parser.add_argument("--symbols", default="BTC/USD,ETH/USD,SOL/USD", help="Comma-separated symbols (Alpaca format)")
+    parser.add_argument("--symbols", default="BTCUSD,ETHUSD,SOLUSD", help="Comma-separated symbols (Alpaca format)")
     parser.add_argument("--interval", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--risk", type=float, default=0.04, help="Risk per trade")
     parser.add_argument("--train", action="store_true", default=True, help="Enable RL learning (saves Q-table)")
