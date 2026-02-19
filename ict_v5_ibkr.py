@@ -1171,6 +1171,46 @@ class LiveTrader:
             except Exception as e:
                 print(f"  {symbol}: Error loading - {e}")
     
+    def _calculate_confluence(self, data, idx):
+        """Calculate confluence score for Telegram display."""
+        try:
+            htf = data['htf_trend'][idx] if idx < len(data['htf_trend']) else 0
+            ltf = data['ltf_trend'][idx] if idx < len(data['ltf_trend']) else 0
+            kz = data['kill_zone'][idx] if idx < len(data['kill_zone']) else False
+            pp = data['price_position'][idx] if idx < len(data['price_position']) else 0.5
+            
+            confluence = 0
+            
+            # Kill zone bonus
+            if kz:
+                confluence += 15
+            
+            # Trend alignment
+            if htf == 1 and ltf >= 0:
+                confluence += 25
+            elif htf == -1 and ltf <= 0:
+                confluence += 25
+            
+            # Price position (extremes better)
+            if pp < 0.25 or pp > 0.75:
+                confluence += 20
+            
+            # Check for FVG
+            current_price = data['closes'][idx]
+            near_bull_fvg = next((f for f in reversed(data['bullish_fvgs']) 
+                                  if f['idx'] < idx and f['mid'] < current_price < f['high']), None)
+            near_bear_fvg = next((f for f in reversed(data['bearish_fvgs']) 
+                                  if f['idx'] < idx and f['low'] < current_price < f['mid']), None)
+            
+            if near_bull_fvg and ltf >= 0:
+                confluence += 15
+            if near_bear_fvg and ltf <= 0:
+                confluence += 15
+            
+            return min(confluence, 100)
+        except:
+            return 0
+    
     def _on_realtime_bar(self, symbol, bar):
         """Handle real-time 5-second bar updates."""
         # Only process completed 5-second bars
@@ -1180,15 +1220,22 @@ class LiveTrader:
         data = self.historical_data[symbol]
         current_price = bar.close
         
-        # Update last price for Telegram
+        # Update last price for Telegram with enhanced data
         if tn:
             try:
+                idx = len(data['closes']) - 1
                 tn.update_market_data(symbol, {
                     'price': current_price,
+                    'htf_trend': int(data['htf_trend'][idx]) if idx < len(data['htf_trend']) else 0,
+                    'ltf_trend': int(data['ltf_trend'][idx]) if idx < len(data['ltf_trend']) else 0,
+                    'kill_zone': bool(data['kill_zone'][idx]) if idx < len(data['kill_zone']) else False,
+                    'price_position': float(data['price_position'][idx]) if idx < len(data['price_position']) else 0.5,
+                    'confluence': self._calculate_confluence(data, idx),
+                    'volatility': float(data['volatility'][idx]) if idx < len(data['volatility']) else 0,
                     'last_update': datetime.now().isoformat()
                 })
-            except:
-                pass
+            except Exception as e:
+                pass  # Silently fail to not disrupt trading
         
         # Check if we have an open position
         if symbol in self.positions:
