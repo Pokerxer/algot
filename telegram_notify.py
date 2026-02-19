@@ -201,6 +201,12 @@ class TelegramNotifier:
             self.app.add_handler(CommandHandler("alerts", self._alerts_command))
             self.app.add_handler(CommandHandler("chart", self._chart_command))
             self.app.add_handler(CommandHandler("price", self._price_command))
+            self.app.add_handler(CommandHandler("performance", self._performance_command))
+            self.app.add_handler(CommandHandler("risk", self._risk_command))
+            self.app.add_handler(CommandHandler("export", self._export_command))
+            self.app.add_handler(CommandHandler("summary", self._summary_command))
+            self.app.add_handler(CommandHandler("compare", self._compare_command))
+            self.app.add_handler(CommandHandler("alert", self._alert_command))
             self.app.add_handler(CommandHandler("help", self._help_command))
             self.app.add_handler(CallbackQueryHandler(self._button_callback))
             
@@ -264,22 +270,26 @@ class TelegramNotifier:
         keyboard = [
             [
                 InlineKeyboardButton("📊 Status", callback_data="status"),
-                InlineKeyboardButton("📈 Positions", callback_data="positions")
+                InlineKeyboardButton("📈 Positions", callback_data="positions"),
+                InlineKeyboardButton("📜 Trades", callback_data="trades")
             ],
             [
-                InlineKeyboardButton("📜 Trades", callback_data="trades"),
-                InlineKeyboardButton("💰 P&L", callback_data="pnl")
+                InlineKeyboardButton("💰 P&L", callback_data="pnl"),
+                InlineKeyboardButton("⚠️ Risk", callback_data="risk"),
+                InlineKeyboardButton("📈 Performance", callback_data="performance")
             ],
             [
+                InlineKeyboardButton("⚡ Prices", callback_data="price"),
                 InlineKeyboardButton("🔮 Bias", callback_data="bias"),
-                InlineKeyboardButton("⚡ Confluence", callback_data="confluence")
+                InlineKeyboardButton("🏆 Compare", callback_data="compare")
             ],
             [
-                InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-                InlineKeyboardButton("🔔 Alerts", callback_data="alerts")
+                InlineKeyboardButton("📊 Summary", callback_data="summary"),
+                InlineKeyboardButton("📤 Export", callback_data="export"),
+                InlineKeyboardButton("⚙️ Settings", callback_data="settings")
             ],
             [
-                InlineKeyboardButton("📉 Charts", callback_data="chart"),
+                InlineKeyboardButton("🔔 Alerts", callback_data="alerts"),
                 InlineKeyboardButton("❓ Help", callback_data="help")
             ]
         ]
@@ -875,6 +885,365 @@ Prices from IBKR (real-time)
 """
         await message_obj.reply_text(message, parse_mode='HTML')
     
+    async def _performance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /performance command - detailed performance analytics"""
+        message_obj = update.message or update.callback_query.message
+        
+        if not TRADE_HISTORY:
+            await message_obj.reply_text("📭 No trades recorded yet. Start trading first!")
+            return
+        
+        # Calculate detailed statistics
+        total_trades = len(TRADE_HISTORY)
+        wins = len([t for t in TRADE_HISTORY if t.get('pnl', 0) > 0])
+        losses = total_trades - wins
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        
+        # Profit factor
+        gross_profit = sum(t['pnl'] for t in TRADE_HISTORY if t.get('pnl', 0) > 0)
+        gross_loss = abs(sum(t['pnl'] for t in TRADE_HISTORY if t.get('pnl', 0) < 0))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        
+        # Best and worst trades
+        best_trade = max(TRADE_HISTORY, key=lambda x: x.get('pnl', 0))
+        worst_trade = min(TRADE_HISTORY, key=lambda x: x.get('pnl', 0))
+        
+        # Average trade
+        avg_trade = sum(t['pnl'] for t in TRADE_HISTORY) / total_trades
+        
+        # Win rate by symbol
+        symbol_stats = {}
+        for trade in TRADE_HISTORY:
+            sym = trade.get('symbol', 'Unknown')
+            if sym not in symbol_stats:
+                symbol_stats[sym] = {'trades': 0, 'wins': 0, 'pnl': 0}
+            symbol_stats[sym]['trades'] += 1
+            symbol_stats[sym]['pnl'] += trade.get('pnl', 0)
+            if trade.get('pnl', 0) > 0:
+                symbol_stats[sym]['wins'] += 1
+        
+        # Sort by win rate
+        symbol_performance = sorted(
+            [(sym, stats['wins']/stats['trades']*100, stats['trades'], stats['pnl']) 
+             for sym, stats in symbol_stats.items()],
+            key=lambda x: x[1], 
+            reverse=True
+        )[:5]  # Top 5
+        
+        symbol_lines = []
+        for sym, wr, trades, pnl in symbol_performance:
+            emoji = "🟢" if wr >= 50 else "🔴"
+            symbol_lines.append(f"  {emoji} {sym}: {wr:.1f}% ({trades} trades, ${pnl:,.0f})")
+        
+        message = f"""
+╔══════════════════════════════════════╗
+║      📊 <b>PERFORMANCE ANALYTICS</b>       ║
+╚══════════════════════════════════════╝
+
+<b>Overall Statistics:</b>
+┌─────────────────────────────────────┐
+│  Total Trades:    {total_trades:>10}           │
+│  Win Rate:        {win_rate:>10.1f}%          │
+│  Profit Factor:   {profit_factor:>10.2f}           │
+│  Avg Trade:       ${avg_trade:>9,.2f}        │
+└─────────────────────────────────────┘
+
+<b>💰 P&L Breakdown:</b>
+  🟢 Gross Profit: ${gross_profit:,.2f}
+  🔴 Gross Loss:   ${gross_loss:,.2f}
+  📊 Net P&L:      ${DAILY_STATS['pnl']:,.2f}
+
+<b>🏆 Best/Worst Trades:</b>
+  ⬆️ Best:  {best_trade.get('symbol', 'N/A')} +${best_trade.get('pnl', 0):,.2f}
+  ⬇️ Worst: {worst_trade.get('symbol', 'N/A')} ${worst_trade.get('pnl', 0):,.2f}
+
+<b>Top Performing Symbols:</b>
+{chr(10).join(symbol_lines) if symbol_lines else '  No data'}
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _risk_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /risk command - show risk exposure and limits"""
+        message_obj = update.message or update.callback_query.message
+        
+        # Calculate risk exposure
+        total_exposure = 0
+        symbol_risk = {}
+        
+        for symbol, pos in CURRENT_POSITIONS.items():
+            entry = pos.get('entry', 0)
+            stop = pos.get('stop', 0)
+            qty = pos.get('qty', 0)
+            direction = pos.get('direction', 1)
+            
+            # Risk amount
+            risk_per_unit = abs(entry - stop)
+            total_risk = risk_per_unit * qty
+            
+            symbol_risk[symbol] = {
+                'qty': qty,
+                'risk': total_risk,
+                'direction': 'LONG' if direction == 1 else 'SHORT',
+                'entry': entry,
+                'stop': stop
+            }
+            total_exposure += total_risk
+        
+        # Calculate daily stats
+        daily_risk = sum(t.get('pnl', 0) for t in TRADE_HISTORY if t.get('pnl', 0) < 0) if TRADE_HISTORY else 0
+        max_consecutive_losses = 0
+        current_losses = 0
+        
+        for trade in TRADE_HISTORY:
+            if trade.get('pnl', 0) < 0:
+                current_losses += 1
+                max_consecutive_losses = max(max_consecutive_losses, current_losses)
+            else:
+                current_losses = 0
+        
+        position_lines = []
+        for symbol, data in symbol_risk.items():
+            position_lines.append(
+                f"  {symbol}: {data['direction']} x{data['qty']} | "
+                f"Risk: ${data['risk']:,.2f} | Stop: ${data['stop']:,.2f}"
+            )
+        
+        message = f"""
+╔══════════════════════════════════════╗
+║        ⚠️ <b>RISK DASHBOARD</b>            ║
+╚══════════════════════════════════════╝
+
+<b>📊 Current Exposure:</b>
+┌─────────────────────────────────────┐
+│  Open Positions:  {len(CURRENT_POSITIONS):>10}           │
+│  Total Risk:      ${total_exposure:>10,.2f}       │
+│  Daily Loss:      ${daily_risk:>10,.2f}       │
+│  Max Consec Loss: {max_consecutive_losses:>10}           │
+└─────────────────────────────────────┘
+
+<b>📈 Open Positions Risk:</b>
+{chr(10).join(position_lines) if position_lines else '  No open positions'}
+
+<b>⚡ Risk Limits:</b>
+  • Per Trade: $1,000-$2,000
+  • Max Positions: Unlimited (manage manually)
+  • Kill Zone Priority: Higher probability
+
+<b>💡 Risk Tips:</b>
+  • Monitor max consecutive losses
+  • Reduce size after 3+ losses
+  • Check correlation between positions
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _export_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /export command - export trades to CSV format"""
+        message_obj = update.message or update.callback_query.message
+        
+        if not TRADE_HISTORY:
+            await message_obj.reply_text("📭 No trades to export yet!")
+            return
+        
+        # Build CSV content
+        lines = ["Date,Symbol,Direction,Entry,Exit,Qty,PnL,ExitReason"]
+        
+        for trade in TRADE_HISTORY:
+            lines.append(
+                f"{trade.get('timestamp', '')[:10]},"
+                f"{trade.get('symbol', '')},"
+                f"{trade.get('direction', '')},"
+                f"{trade.get('entry', 0):.4f},"
+                f"{trade.get('exit', 0):.4f},"
+                f"{trade.get('qty', 0)},"
+                f"{trade.get('pnl', 0):.2f},"
+                f"{trade.get('exit_reason', '')}"
+            )
+        
+        csv_content = "\n".join(lines)
+        
+        # Send as file
+        try:
+            from telegram import InputFile
+            import io
+            
+            file_obj = io.BytesIO(csv_content.encode())
+            file_obj.name = f"trades_{datetime.now().strftime('%Y%m%d')}.csv"
+            
+            await message_obj.reply_document(
+                document=InputFile(file_obj),
+                caption=f"📊 Trade Export - {len(TRADE_HISTORY)} trades"
+            )
+        except Exception as e:
+            # Fallback: send as text
+            await message_obj.reply_text(
+                f"📊 <b>Trade Export</b> ({len(TRADE_HISTORY)} trades)\n\n"
+                f"<pre>{csv_content[:3000]}...</pre>" if len(csv_content) > 3000 else f"<pre>{csv_content}</pre>",
+                parse_mode='HTML'
+            )
+    
+    async def _summary_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /summary command - detailed daily summary"""
+        message_obj = update.message or update.callback_query.message
+        
+        # Get current positions value
+        open_pnl = 0
+        for symbol, pos in CURRENT_POSITIONS.items():
+            current_price = LAST_MARKET_DATA.get(symbol, {}).get('price', pos['entry'])
+            if pos['direction'] == 1:
+                pnl = (current_price - pos['entry']) * pos['qty']
+            else:
+                pnl = (pos['entry'] - current_price) * pos['qty']
+            open_pnl += pnl
+        
+        # Today's stats
+        total_pnl = DAILY_STATS['pnl'] + open_pnl
+        
+        # Time since start
+        try:
+            start_time = datetime.fromisoformat(DAILY_STATS['start_time'])
+            elapsed = datetime.now() - start_time
+            hours = elapsed.total_seconds() / 3600
+        except:
+            hours = 0
+        
+        message = f"""
+╔══════════════════════════════════════╗
+║      📅 <b>DAILY TRADING SUMMARY</b>      ║
+╚══════════════════════════════════════╝
+
+<b>Session Info:</b>
+  Started: {DAILY_STATS['start_time'][:16] if DAILY_STATS['start_time'] else 'N/A'}
+  Duration: {hours:.1f} hours
+
+<b>📊 Trading Activity:</b>
+┌─────────────────────────────────────┐
+│  Total Trades:    {DAILY_STATS['trades']:>10}           │
+│  Wins:            {DAILY_STATS['wins']:>10} ✅          │
+│  Losses:          {DAILY_STATS['losses']:>10} ❌          │
+│  Win Rate:        {(DAILY_STATS['wins']/max(DAILY_STATS['trades'],1)*100):>10.1f}%          │
+└─────────────────────────────────────┘
+
+<b>💰 P&L Summary:</b>
+  Closed Trades: ${DAILY_STATS['pnl']:>12,.2f}
+  Open Positions: ${open_pnl:>12,.2f}
+  ─────────────────────────
+  <b>Total P&L:     ${total_pnl:>12,.2f}</b>
+
+<b>📈 Open Positions:</b>
+  Count: {len(CURRENT_POSITIONS)}
+  Unrealized: ${open_pnl:,.2f}
+
+<b>⚡ Key Metrics:</b>
+  Profit Factor: {sum(t['pnl'] for t in TRADE_HISTORY if t.get('pnl',0)>0)/abs(sum(t['pnl'] for t in TRADE_HISTORY if t.get('pnl',0)<0)) if TRADE_HISTORY and any(t.get('pnl',0)<0 for t in TRADE_HISTORY) else 'N/A':.2f}
+  Avg Trade: ${DAILY_STATS['pnl']/max(DAILY_STATS['trades'],1):,.2f}
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _compare_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /compare command - compare symbol performance"""
+        message_obj = update.message or update.callback_query.message
+        
+        if not TRADE_HISTORY:
+            await message_obj.reply_text("📭 No trades to compare. Start trading first!")
+            return
+        
+        # Calculate stats per symbol
+        symbol_stats = {}
+        for trade in TRADE_HISTORY:
+            sym = trade.get('symbol', 'Unknown')
+            if sym not in symbol_stats:
+                symbol_stats[sym] = {
+                    'trades': 0, 'wins': 0, 'losses': 0,
+                    'pnl': 0, 'avg_win': 0, 'avg_loss': 0
+                }
+            
+            symbol_stats[sym]['trades'] += 1
+            symbol_stats[sym]['pnl'] += trade.get('pnl', 0)
+            
+            if trade.get('pnl', 0) > 0:
+                symbol_stats[sym]['wins'] += 1
+            else:
+                symbol_stats[sym]['losses'] += 1
+        
+        # Sort by P&L
+        sorted_symbols = sorted(symbol_stats.items(), key=lambda x: x[1]['pnl'], reverse=True)
+        
+        lines = []
+        for sym, stats in sorted_symbols:
+            win_rate = (stats['wins'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
+            emoji = "🥇" if stats['pnl'] > 0 else "🥉"
+            lines.append(
+                f"{emoji} <b>{sym}</b>\n"
+                f"   P&L: ${stats['pnl']:>10,.2f} | Win%: {win_rate:>5.1f}% | "
+                f"W:{stats['wins']} L:{stats['losses']}"
+            )
+        
+        message = f"""
+╔══════════════════════════════════════╗
+║      🏆 <b>SYMBOL PERFORMANCE</b>         ║
+╚══════════════════════════════════════╝
+
+<b>Symbols Ranked by P&L:</b>
+
+{chr(10).join(lines)}
+
+<b>📊 Summary:</b>
+  Best: {sorted_symbols[0][0] if sorted_symbols else 'N/A'}
+  Worst: {sorted_symbols[-1][0] if sorted_symbols else 'N/A'}
+  Total Symbols: {len(symbol_stats)}
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _alert_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /alert command - set price alerts"""
+        message_obj = update.message or update.callback_query.message
+        
+        # Get arguments
+        args = context.args if context.args else []
+        
+        if len(args) < 2:
+            await message_obj.reply_text(
+                "⚠️ <b>Usage:</b> /alert SYMBOL PRICE\n\n"
+                "Examples:\n"
+                "  /alert BTCUSD 70000\n"
+                "  /alert ES 6000\n\n"
+                "Current alerts will be shown here once implemented.",
+                parse_mode='HTML'
+            )
+            return
+        
+        symbol = args[0].upper()
+        try:
+            price = float(args[1])
+        except ValueError:
+            await message_obj.reply_text("❌ Invalid price. Please enter a number.")
+            return
+        
+        # Store alert (in-memory for now)
+        if 'price_alerts' not in BOT_SETTINGS:
+            BOT_SETTINGS['price_alerts'] = {}
+        
+        BOT_SETTINGS['price_alerts'][symbol] = {
+            'price': price,
+            'set_at': datetime.now().isoformat()
+        }
+        
+        await message_obj.reply_text(
+            f"✅ <b>Price Alert Set</b>\n\n"
+            f"Symbol: {symbol}\n"
+            f"Target: ${price:,.2f}\n\n"
+            f"You'll be notified when price reaches this level.",
+            parse_mode='HTML'
+        )
+    
     async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
         message_obj = update.message or update.callback_query.message
@@ -891,11 +1260,20 @@ Prices from IBKR (real-time)
 /trades - Recent trade history
 /pnl - P&L breakdown by symbol
 
-<b>🔮 Analysis Commands:</b>
+<b>📈 Analysis Commands:</b>
 /price - Live prices from IBKR
-/bias - Market bias for all symbols (with live prices)
+/bias - Market bias with live prices
 /confluence - Signal strength levels
-/chart - Price overview (or /chart SYMBOL)
+/chart SYMBOL - Detailed symbol info
+/performance - Detailed performance stats
+/compare - Compare symbol performance
+
+<b>💰 Trading Commands:</b>
+/pnl - P&L breakdown by symbol
+/risk - Risk exposure dashboard
+/summary - Detailed daily summary
+/export - Export trades to CSV
+/alert SYMBOL PRICE - Set price alerts
 
 <b>⚙️ Settings:</b>
 /settings - View bot configuration
@@ -946,6 +1324,12 @@ V5 ICT Trading Bot
             "positions": self._positions_command,
             "trades": self._trades_command,
             "pnl": self._pnl_command,
+            "risk": self._risk_command,
+            "performance": self._performance_command,
+            "summary": self._summary_command,
+            "compare": self._compare_command,
+            "export": self._export_command,
+            "price": self._price_command,
             "bias": self._bias_command,
             "confluence": self._confluence_command,
             "settings": self._settings_command,
