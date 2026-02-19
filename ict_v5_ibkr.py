@@ -192,15 +192,16 @@ def get_live_price(symbol, ib):
         return None
 
 
-def prepare_data_ibkr(symbol, lookback=200, ib=None):
+def prepare_data_ibkr(symbol, lookback=200, ib=None, use_cache=True):
     """Prepare data using IBKR as primary source, Yahoo as fallback.
     
     Args:
         symbol: Symbol to fetch
         lookback: Number of bars to look back
         ib: Optional existing IB connection to reuse (avoids reconnecting)
+        use_cache: If True, returns cached data and only fetches new bars
     """
-    df = fetch_ibkr_data(symbol, days=30, interval="1h", ib=ib)
+    df = fetch_ibkr_data(symbol, days=30, interval="1h", ib=ib, use_cache=use_cache)
     
     if df is None or len(df) < 50:
         print(f"IBKR failed for {symbol}, using Yahoo...")
