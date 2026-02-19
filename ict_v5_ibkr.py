@@ -815,14 +815,26 @@ def calculate_position_size(symbol, account_value, risk_pct, stop_distance, curr
     """
     Calculate proper position size with minimum stop enforcement.
     
-    For futures, ensures stop distance is reasonable for the contract multiplier.
-    For crypto, enforces minimum stop as percentage of price.
+    Risk per trade varies by asset type:
+    - Crypto: $2,000 per trade
+    - S&P (ES): $1,000 per trade  
+    - Gold (GC): $2,000 per trade
+    - Other futures: $1,000 per trade
     
     Returns: (quantity, actual_risk_per_unit)
     """
     contract_info = get_contract_info(symbol)
-    risk_amount = account_value * risk_pct
     symbol_type = contract_info['type']
+    
+    # Adjust risk amount based on symbol
+    if symbol_type == 'crypto':
+        risk_amount = 2000  # $2,000 for crypto
+    elif symbol.upper() == 'ES':
+        risk_amount = 1000  # $1,000 for S&P
+    elif symbol.upper() == 'GC':
+        risk_amount = 2000  # $2,000 for Gold
+    else:
+        risk_amount = account_value * risk_pct  # Default: 2% of account
     
     if symbol_type == 'futures':
         multiplier = contract_info['multiplier']
