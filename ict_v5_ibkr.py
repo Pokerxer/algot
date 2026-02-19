@@ -1331,8 +1331,12 @@ class LiveTrader:
                 
                 # Create callback for this symbol
                 def make_callback(sym):
-                    def callback(bar):
-                        self._on_realtime_bar(sym, bar)
+                    def callback(bars_list, has_new_bar):
+                        # bars_list contains all bars, has_new_bar indicates if there's a new completed bar
+                        if has_new_bar and bars_list:
+                            # Get the most recent completed bar
+                            latest_bar = bars_list[-1]
+                            self._on_realtime_bar(sym, latest_bar)
                     return callback
                 
                 bars.updateEvent += make_callback(symbol)
