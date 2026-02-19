@@ -78,14 +78,18 @@ def disconnect_data_ib():
         _data_ib_connected = False
 
 
-def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
-    """Fetch historical data from IBKR.
+# Cache for historical data (fetch once, update incrementally)
+_data_cache = {}
+
+def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None, use_cache=True):
+    """Fetch historical data from IBKR with caching for live trading.
     
     Args:
         symbol: Symbol to fetch
         days: Number of days of history
         interval: Bar interval ("1h" or "1d")
         ib: Optional existing IB connection to reuse
+        use_cache: If True, returns cached data and only fetches new bars
     """
     try:
         from ib_insync import util
@@ -99,18 +103,58 @@ def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
         if ib is None:
             return None
     
-    contract = get_ibkr_contract(symbol)
+    cache_key = f"{symbol}_{interval}"
     
-    duration = f"{days} D"
-    bar_size = "1 hour" if interval == "1h" else "1 day"
+    # If caching enabled and we have cached data, try to update incrementally
+    if use_cache and cache_key in _data_cache:
+        cached_df = _data_cache[cache_key]
+        last_date = cached_df.index[-1]
+        
+        # Only fetch last 2 days to get new bars (much faster)
+        try:
+            contract = get_ibkr_contract(symbol)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime='',  # Up to now
+                durationStr="2 D",  # Only last 2 days
+                barSizeSetting="1 hour" if interval == "1h" else "1 day",
+                whatToShow='MIDPOINT',
+                useRTH=False,
+                formatDate=2
+            )
+            
+            if bars:
+                new_df = util.df(bars)
+                new_df.set_index('date', inplace=True)
+                new_df.index = pd.to_datetime(new_df.index)
+                
+                # Merge: keep old data, append only new bars
+                new_bars = new_df[new_df.index > last_date]
+                if not new_bars.empty:
+                    updated_df = pd.concat([cached_df, new_bars])
+                    # Keep only last 'days' worth of data
+                    cutoff = updated_df.index[-1] - pd.Timedelta(days=days)
+                    updated_df = updated_df[updated_df.index > cutoff]
+                    _data_cache[cache_key] = updated_df
+                    return updated_df
+                else:
+                    return cached_df
+            else:
+                return cached_df
+                
+        except Exception as e:
+            print(f"Error updating {symbol}: {e}, using cache")
+            return cached_df
     
+    # Full fetch (first time or cache disabled)
     try:
+        contract = get_ibkr_contract(symbol)
         bars = ib.reqHistoricalData(
             contract,
-            endDateTime='',  # Empty for all
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow='MIDPOINT',  # Use MIDPOINT for all
+            endDateTime='',
+            durationStr=f"{days} D",
+            barSizeSetting="1 hour" if interval == "1h" else "1 day",
+            whatToShow='MIDPOINT',
             useRTH=False,
             formatDate=2
         )
@@ -125,7 +169,27 @@ def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
     df.set_index('date', inplace=True)
     df.index = pd.to_datetime(df.index)
     
+    # Cache the result
+    if use_cache:
+        _data_cache[cache_key] = df
+    
     return df
+
+
+def get_live_price(symbol, ib):
+    """Get current live price using market data subscription."""
+    try:
+        contract = get_ibkr_contract(symbol)
+        ticker = ib.reqMktData(contract, '', False, False)
+        
+        # Wait a bit for price
+        ib.sleep(0.5)
+        
+        price = ticker.last if ticker.last else ticker.close
+        return price
+    except Exception as e:
+        print(f"Error getting live price for {symbol}: {e}")
+        return None
 
 
 def prepare_data_ibkr(symbol, lookback=200, ib=None):
