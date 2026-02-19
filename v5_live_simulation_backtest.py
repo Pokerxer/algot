@@ -344,19 +344,39 @@ def run_live_simulation_backtest(symbols, days=30, initial_capital=50000, risk_p
 
 # Run the backtest
 if __name__ == "__main__":
-    # Full symbol list
-    symbols = ['SOLUSD', 'ETHUSD', 'BTCUSD', 'LINKUSD', 'LTCUSD', 'SI', 'UNIUSD', 'NG', 'NQ', 'GC', 'CL', 'ES']
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='V5 Live Trading Simulation Backtest')
+    parser.add_argument('--symbols', type=str, 
+                       default='SOLUSD,ETHUSD,BTCUSD,LINKUSD,LTCUSD,SI,UNIUSD,NG,NQ,GC,CL,ES',
+                       help='Comma-separated list of symbols to backtest')
+    parser.add_argument('--days', type=int, default=30,
+                       help='Number of days to backtest (default: 30)')
+    parser.add_argument('--capital', type=float, default=50000,
+                       help='Initial capital (default: 50000)')
+    parser.add_argument('--risk', type=float, default=0.02,
+                       help='Risk per trade as decimal (default: 0.02 = 2%%)')
+    parser.add_argument('--yahoo', action='store_true',
+                       help='Use Yahoo Finance instead of IBKR')
+    
+    args = parser.parse_args()
+    
+    # Parse symbols from command line
+    symbols = [s.strip() for s in args.symbols.split(',')]
     
     print("="*80)
     print("ICT V5 - Live Trading Simulation Backtest")
     print("="*80)
+    print(f"Symbols: {', '.join(symbols)}")
+    print(f"Days: {args.days} | Capital: ${args.capital:,.0f} | Risk: {args.risk*100}%")
+    print("="*80)
     
     results = run_live_simulation_backtest(
         symbols=symbols,
-        days=30,
-        initial_capital=50000,
-        risk_per_trade=0.02,
-        use_ibkr=True
+        days=args.days,
+        initial_capital=args.capital,
+        risk_per_trade=args.risk,
+        use_ibkr=not args.yahoo
     )
     
     if results:
