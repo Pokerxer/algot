@@ -60,6 +60,116 @@ app = None
 _bot_thread = None
 _event_loop = None
 
+# IBKR connection for Telegram commands to fetch live data
+_ibkr_connection = None
+
+def get_ibkr_connection():
+    """Get or create IBKR connection for Telegram commands."""
+    global _ibkr_connection
+    try:
+        from ib_insync import IB
+        if _ibkr_connection is None or not _ibkr_connection.isConnected():
+            _ibkr_connection = IB()
+            try:
+                _ibkr_connection.connect('127.0.0.1', 7497, clientId=88)
+                logger.info("Telegram IBKR connection established")
+            except Exception as e:
+                logger.error(f"Could not connect to IBKR for Telegram: {e}")
+                return None
+        return _ibkr_connection
+    except ImportError:
+        logger.error("ib_insync not available")
+        return None
+
+
+def fetch_live_price(symbol):
+    """Fetch live price from IBKR for a symbol."""
+    try:
+        ib = get_ibkr_connection()
+        if not ib:
+            return None
+        
+        # Get contract - need to map symbol to proper format
+        contract = _get_ibkr_contract(symbol)
+        if not contract:
+            return None
+        
+        # Request market data
+        ticker = ib.reqMktData(contract, '', False, False)
+        ib.sleep(0.5)  # Wait for data
+        
+        price = ticker.last if ticker.last else ticker.close
+        if price and price > 0:
+            return price
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching live price for {symbol}: {e}")
+        return None
+
+
+def fetch_live_data_for_symbols(symbols):
+    """Fetch live data for multiple symbols from IBKR."""
+    live_data = {}
+    
+    for symbol in symbols:
+        try:
+            price = fetch_live_price(symbol)
+            if price:
+                # Get cached data for trend info if available
+                cached = LAST_MARKET_DATA.get(symbol, {})
+                live_data[symbol] = {
+                    'price': price,
+                    'htf_trend': cached.get('htf_trend', 0),
+                    'ltf_trend': cached.get('ltf_trend', 0),
+                    'kill_zone': cached.get('kill_zone', False),
+                    'price_position': cached.get('price_position', 0.5),
+                    'confluence': cached.get('confluence', 0),
+                    'live': True,
+                    'updated_at': datetime.now().isoformat()
+                }
+        except Exception as e:
+            logger.error(f"Error fetching data for {symbol}: {e}")
+    
+    return live_data
+
+
+def _get_ibkr_contract(symbol):
+    """Create IBKR contract for a symbol."""
+    try:
+        from ib_insync import Future, Crypto, Forex, Contract
+        
+        symbol = symbol.upper()
+        
+        # Futures mapping
+        futures_map = {
+            'ES': ('ES', 'GLOBEX', 'USD', 50),
+            'NQ': ('NQ', 'GLOBEX', 'USD', 20),
+            'GC': ('GC', 'NYMEX', 'USD', 100),
+            'CL': ('CL', 'NYMEX', 'USD', 1000),
+            'SI': ('SI', 'NYMEX', 'USD', 5000),
+            'NG': ('NG', 'NYMEX', 'USD', 10000),
+        }
+        
+        if symbol in futures_map:
+            sym, exchange, currency, multiplier = futures_map[symbol]
+            contract = Future(symbol=sym, exchange=exchange, currency=currency)
+            contract.multiplier = str(multiplier)
+            return contract
+        
+        # Crypto mapping
+        if symbol in ['BTCUSD', 'ETHUSD', 'SOLUSD', 'LTCUSD', 'LINKUSD', 'UNIUSD']:
+            base = symbol.replace('USD', '')
+            return Crypto(symbol=base, exchange='PAXOS', currency='USD')
+        
+        # Forex
+        if len(symbol) == 6:
+            return Forex(symbol[:3] + '.' + symbol[3:])
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error creating contract for {symbol}: {e}")
+        return None
+
 
 class TelegramNotifier:
     """Thread-safe Telegram notifier class"""
@@ -90,6 +200,7 @@ class TelegramNotifier:
             self.app.add_handler(CommandHandler("settings", self._settings_command))
             self.app.add_handler(CommandHandler("alerts", self._alerts_command))
             self.app.add_handler(CommandHandler("chart", self._chart_command))
+            self.app.add_handler(CommandHandler("price", self._price_command))
             self.app.add_handler(CommandHandler("help", self._help_command))
             self.app.add_handler(CallbackQueryHandler(self._button_callback))
             
@@ -407,35 +518,60 @@ Use the buttons below or type commands:
         await message_obj.reply_text(message, parse_mode='HTML')
     
     async def _bias_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /bias command"""
+        """Handle /bias command - fetches live prices from IBKR"""
         message_obj = update.message or update.callback_query.message
         
-        if not LAST_MARKET_DATA:
-            await message_obj.reply_text("📭 No market data available. Start the trading bot first!")
+        # Try to fetch live prices
+        symbols = list(LAST_MARKET_DATA.keys()) if LAST_MARKET_DATA else BOT_SETTINGS.get('symbols', [])
+        
+        if not symbols:
+            await message_obj.reply_text("📭 No symbols configured. Add symbols to see bias.")
+            return
+        
+        # Fetch live data
+        await message_obj.reply_text("🔄 Fetching live prices...", parse_mode='HTML')
+        live_data = fetch_live_data_for_symbols(symbols)
+        
+        # Merge with cached data for trend info
+        display_data = {}
+        for symbol in symbols:
+            if symbol in live_data:
+                display_data[symbol] = live_data[symbol]
+            elif symbol in LAST_MARKET_DATA:
+                display_data[symbol] = LAST_MARKET_DATA[symbol]
+        
+        if not display_data:
+            await message_obj.reply_text("❌ Could not fetch price data. Make sure IBKR is running.")
             return
         
         bullish = []
         bearish = []
         neutral = []
         
-        for symbol, data in LAST_MARKET_DATA.items():
+        for symbol, data in display_data.items():
             htf = data.get('htf_trend', 0)
             ltf = data.get('ltf_trend', 0)
             price = data.get('price', 0)
             kz = data.get('kill_zone', False)
+            is_live = data.get('live', False)
             
             kz_icon = "🌙" if kz else "☀️"
+            live_icon = "⚡" if is_live else "📊"
             
             if htf == 1 and ltf >= 0:
-                bullish.append(f"  {kz_icon} <b>{symbol}</b>: ${price:,.2f}")
+                bullish.append(f"  {live_icon} {kz_icon} <b>{symbol}</b>: ${price:,.2f}")
             elif htf == -1 and ltf <= 0:
-                bearish.append(f"  {kz_icon} <b>{symbol}</b>: ${price:,.2f}")
+                bearish.append(f"  {live_icon} {kz_icon} <b>{symbol}</b>: ${price:,.2f}")
             else:
-                neutral.append(f"  {kz_icon} <b>{symbol}</b>: ${price:,.2f}")
+                neutral.append(f"  {live_icon} {kz_icon} <b>{symbol}</b>: ${price:,.2f}")
+        
+        live_count = sum(1 for d in display_data.values() if d.get('live', False))
         
         message = f"""
 ╔══════════════════════════════════════╗
 ║       🔮 <b>MARKET BIAS</b>                ║
+╠══════════════════════════════════════╣
+║  Live prices: {live_count}/{len(display_data)} symbols          ║
 ╚══════════════════════════════════════╝
 
 🟢 <b>BULLISH ({len(bullish)}):</b>
@@ -448,6 +584,7 @@ Use the buttons below or type commands:
 {chr(10).join(neutral) if neutral else '  None'}
 
 ━━━━━━━━━━━━━━━━━━━━
+⚡ = Live price | 📊 = Cached
 🌙 = In Kill Zone | ☀️ = Outside Kill Zone
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -580,7 +717,7 @@ Tap buttons below to toggle:
         await message_obj.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
     
     async def _chart_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /chart command"""
+        """Handle /chart command - fetches live price from IBKR"""
         message_obj = update.message or update.callback_query.message
         
         # Check if symbol argument provided
@@ -588,21 +725,51 @@ Tap buttons below to toggle:
         
         if args:
             symbol = args[0].upper()
+            
+            # Try to fetch live price first
+            await message_obj.reply_text(f"🔄 Fetching live price for {symbol}...", parse_mode='HTML')
+            live_price = fetch_live_price(symbol)
+            
+            # Get cached data for other info
             if symbol in LAST_MARKET_DATA:
-                data = LAST_MARKET_DATA[symbol]
-                price = data.get('price', 0)
-                htf = data.get('htf_trend', 0)
-                ltf = data.get('ltf_trend', 0)
-                kz = data.get('kill_zone', False)
-                pp = data.get('price_position', 0.5)
-                conf = data.get('confluence', 0)
-                
-                htf_text = "BULLISH ⬆️" if htf == 1 else "BEARISH ⬇️" if htf == -1 else "NEUTRAL ➡️"
-                ltf_text = "BULLISH ⬆️" if ltf >= 0 else "BEARISH ⬇️"
-                
-                message = f"""
+                data = LAST_MARKET_DATA[symbol].copy()
+                if live_price:
+                    data['price'] = live_price
+                    data['live'] = True
+                    data['updated_at'] = datetime.now().isoformat()
+            else:
+                # No cached data, create minimal entry
+                if live_price:
+                    data = {
+                        'price': live_price,
+                        'htf_trend': 0,
+                        'ltf_trend': 0,
+                        'kill_zone': False,
+                        'price_position': 0.5,
+                        'confluence': 0,
+                        'live': True
+                    }
+                else:
+                    await message_obj.reply_text(f"❌ Could not fetch price for '{symbol}'.\nMake sure IBKR is running and symbol is valid.")
+                    return
+            
+            price = data.get('price', 0)
+            htf = data.get('htf_trend', 0)
+            ltf = data.get('ltf_trend', 0)
+            kz = data.get('kill_zone', False)
+            pp = data.get('price_position', 0.5)
+            conf = data.get('confluence', 0)
+            is_live = data.get('live', False)
+            
+            htf_text = "BULLISH ⬆️" if htf == 1 else "BEARISH ⬇️" if htf == -1 else "NEUTRAL ➡️"
+            ltf_text = "BULLISH ⬆️" if ltf >= 0 else "BEARISH ⬇️"
+            live_icon = "⚡ LIVE" if is_live else "📊 CACHED"
+            
+            message = f"""
 ╔══════════════════════════════════════╗
 ║       📉 <b>{symbol}</b>                    ║
+╠══════════════════════════════════════╣
+║  {live_icon:>34}          ║
 ╚══════════════════════════════════════╝
 
 <b>💵 Price:</b> ${price:,.4f}
@@ -617,14 +784,7 @@ Tap buttons below to toggle:
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-                await message_obj.reply_text(message, parse_mode='HTML')
-            else:
-                available = ", ".join(LAST_MARKET_DATA.keys()) or "None"
-                await message_obj.reply_text(
-                    f"❌ Symbol '{symbol}' not found.\n\n"
-                    f"<b>Available symbols:</b>\n{available}",
-                    parse_mode='HTML'
-                )
+            await message_obj.reply_text(message, parse_mode='HTML')
         else:
             # Show all symbols summary
             if not LAST_MARKET_DATA:
@@ -653,6 +813,68 @@ Example: /chart BTCUSD
 """
             await message_obj.reply_text(message, parse_mode='HTML')
     
+    async def _price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /price command - fetches live prices for all symbols from IBKR"""
+        message_obj = update.message or update.callback_query.message
+        
+        symbols = list(LAST_MARKET_DATA.keys()) if LAST_MARKET_DATA else BOT_SETTINGS.get('symbols', [])
+        
+        if not symbols:
+            await message_obj.reply_text("📭 No symbols configured. Add symbols to fetch prices.")
+            return
+        
+        await message_obj.reply_text(f"🔄 Fetching live prices for {len(symbols)} symbols...", parse_mode='HTML')
+        
+        # Fetch live prices
+        live_data = {}
+        failed_symbols = []
+        
+        for symbol in symbols:
+            try:
+                price = fetch_live_price(symbol)
+                if price:
+                    live_data[symbol] = price
+                else:
+                    failed_symbols.append(symbol)
+            except Exception as e:
+                logger.error(f"Error fetching {symbol}: {e}")
+                failed_symbols.append(symbol)
+        
+        if not live_data:
+            await message_obj.reply_text("❌ Could not fetch any prices. Make sure IBKR is running.")
+            return
+        
+        # Build price list
+        lines = []
+        for symbol in sorted(live_data.keys()):
+            price = live_data[symbol]
+            # Get cached price for comparison
+            cached_price = LAST_MARKET_DATA.get(symbol, {}).get('price', price)
+            change = price - cached_price if cached_price else 0
+            change_pct = (change / cached_price * 100) if cached_price and cached_price > 0 else 0
+            
+            change_emoji = "🟢" if change >= 0 else "🔴"
+            lines.append(f"  {symbol:8}: ${price:>12,.4f} {change_emoji} {change_pct:+.2f}%")
+        
+        failed_text = f"\n⚠️ Failed: {', '.join(failed_symbols)}" if failed_symbols else ""
+        
+        message = f"""
+╔══════════════════════════════════════╗
+║       ⚡ <b>LIVE PRICES</b>                 ║
+╠══════════════════════════════════════╣
+║  Fetched: {len(live_data)}/{len(symbols)} symbols              ║
+╚══════════════════════════════════════╝
+
+{chr(10).join(lines)}
+{failed_text}
+
+━━━━━━━━━━━━━━━━━━━━
+Prices from IBKR (real-time)
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
     async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
         message_obj = update.message or update.callback_query.message
@@ -670,7 +892,8 @@ Example: /chart BTCUSD
 /pnl - P&L breakdown by symbol
 
 <b>🔮 Analysis Commands:</b>
-/bias - Market bias for all symbols
+/price - Live prices from IBKR
+/bias - Market bias for all symbols (with live prices)
 /confluence - Signal strength levels
 /chart - Price overview (or /chart SYMBOL)
 
