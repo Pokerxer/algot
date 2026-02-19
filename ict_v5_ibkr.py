@@ -36,70 +36,23 @@ Q_TABLE_FILE = "v5_q_table.pkl"
 
 IBKR_AVAILABLE = False
 
-# Global IB connection for data fetching (reused across calls)
-_data_ib = None
-_data_ib_connected = False
 
-
-def get_data_ib_connection():
-    """Get or create a shared IB connection for data fetching."""
-    global _data_ib, _data_ib_connected
-    
+def fetch_ibkr_data(symbol, days=30, interval="1h"):
+    """Fetch historical data from IBKR."""
     try:
-        from ib_insync import IB
-    except ImportError:
-        return None
-    
-    if _data_ib is None:
-        _data_ib = IB()
-    
-    if not _data_ib_connected or not _data_ib.isConnected():
-        try:
-            if _data_ib.isConnected():
-                _data_ib.disconnect()
-            _data_ib.connect('127.0.0.1', 7497, clientId=99)
-            _data_ib_connected = True
-        except Exception as e:
-            print(f"Could not connect data IB: {e}")
-            _data_ib_connected = False
-            return None
-    
-    return _data_ib
-
-
-def disconnect_data_ib():
-    """Disconnect the shared data IB connection."""
-    global _data_ib, _data_ib_connected
-    if _data_ib is not None and _data_ib_connected:
-        try:
-            _data_ib.disconnect()
-        except:
-            pass
-        _data_ib_connected = False
-
-
-def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
-    """Fetch historical data from IBKR.
-    
-    Args:
-        symbol: Symbol to fetch
-        days: Number of days of history
-        interval: Bar interval ("1h" or "1d")
-        ib: Optional existing IB connection to reuse
-    """
-    try:
-        from ib_insync import util
+        from ib_insync import IB, util
     except ImportError:
         print("ERROR: ib_insync not installed. Run: pip install ib_insync")
         return None
     
-    # Use provided connection or get shared one
-    if ib is None:
-        ib = get_data_ib_connection()
-        if ib is None:
-            return None
-    
     contract = get_ibkr_contract(symbol)
+    
+    ib = IB()
+    try:
+        ib.connect('127.0.0.1', 7497, clientId=99)
+    except Exception as e:
+        print(f"Could not connect to IBKR: {e}")
+        return None
     
     duration = f"{days} D"
     bar_size = "1 hour" if interval == "1h" else "1 day"
@@ -116,7 +69,10 @@ def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
         )
     except Exception as e:
         print(f"Error fetching {symbol}: {e}")
+        ib.disconnect()
         return None
+    
+    ib.disconnect()
     
     if not bars:
         return None
@@ -128,15 +84,9 @@ def fetch_ibkr_data(symbol, days=30, interval="1h", ib=None):
     return df
 
 
-def prepare_data_ibkr(symbol, lookback=200, ib=None):
-    """Prepare data using IBKR as primary source, Yahoo as fallback.
-    
-    Args:
-        symbol: Symbol to fetch
-        lookback: Number of bars to look back
-        ib: Optional existing IB connection to reuse (avoids reconnecting)
-    """
-    df = fetch_ibkr_data(symbol, days=30, interval="1h", ib=ib)
+def prepare_data_ibkr(symbol, lookback=200):
+    """Prepare data using IBKR as primary source, Yahoo as fallback."""
+    df = fetch_ibkr_data(symbol, days=30, interval="1h")
     
     if df is None or len(df) < 50:
         print(f"IBKR failed for {symbol}, using Yahoo...")
@@ -732,199 +682,101 @@ def run_backtest(symbols, days=180, use_ibkr=True):
     return results
 
 
-def get_contract_info(symbol):
-    """Get comprehensive contract information for position sizing.
+def get_contract_multiplier(symbol):
+    """Get the contract multiplier for position sizing."""
+    # Futures multipliers (value per point)
+    multipliers = {
+        'ES': 50,      # E-mini S&P 500: $50 per point
+        'NQ': 20,      # E-mini Nasdaq-100: $20 per point
+        'MNQ': 2,      # Micro Nasdaq: $2 per point
+        'MES': 5,      # Micro E-mini S&P: $5 per point
+        'GC': 100,     # Gold: $100 per point
+        'SI': 5000,    # Silver: $5000 per point
+        'CL': 1000,    # Crude Oil: $1000 per point
+        'NG': 10000,   # Natural Gas: $10000 per point
+        'YM': 5,       # E-mini Dow: $5 per point
+        'RTY': 50,     # E-mini Russell 2000: $50 per point
+    }
     
-    Returns dict with:
-    - type: 'futures', 'forex', 'crypto', or 'stock'
-    - multiplier: $ value per point (for futures/crypto/stock)
-    - pip_value: $ value per pip (for forex)
-    - min_stop: minimum recommended stop distance
-    - tick_size: minimum price increment
-    """
+    # Forex pip values (per standard lot)
+    forex_pip_values = {
+        'EURUSD': 10,   # $10 per pip per lot
+        'GBPUSD': 10,
+        'USDJPY': 9.1,  # Varies with exchange rate
+        'AUDUSD': 10,
+        'USDCAD': 7.5,
+        'USDCHF': 10.8,
+        'NZDUSD': 10,
+        'GBPJPY': 9.1,
+        'EURJPY': 9.1,
+    }
+    
+    # Crypto - 1:1 for most
+    crypto = ['BTCUSD', 'ETHUSD', 'LTCUSD', 'SOLUSD']
+    
     symbol = symbol.upper()
     
-    # Futures - with minimum stops and tick sizes
-    futures_info = {
-        'ES': {'multiplier': 50, 'min_stop': 10, 'tick_size': 0.25},      # E-mini S&P
-        'NQ': {'multiplier': 20, 'min_stop': 25, 'tick_size': 0.25},      # E-mini Nasdaq
-        'MNQ': {'multiplier': 2, 'min_stop': 25, 'tick_size': 0.25},      # Micro Nasdaq
-        'MES': {'multiplier': 5, 'min_stop': 10, 'tick_size': 0.25},      # Micro E-mini S&P
-        'GC': {'multiplier': 100, 'min_stop': 10, 'tick_size': 0.10},     # Gold
-        'SI': {'multiplier': 5000, 'min_stop': 0.50, 'tick_size': 0.005}, # Silver
-        'CL': {'multiplier': 1000, 'min_stop': 0.50, 'tick_size': 0.01},  # Crude Oil
-        'NG': {'multiplier': 10000, 'min_stop': 0.03, 'tick_size': 0.001}, # Natural Gas
-        'YM': {'multiplier': 5, 'min_stop': 50, 'tick_size': 1},          # E-mini Dow
-        'RTY': {'multiplier': 50, 'min_stop': 15, 'tick_size': 0.10},     # E-mini Russell
-    }
-    
-    # Forex pip values (per standard lot of 100k units)
-    forex_info = {
-        'EURUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
-        'GBPUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
-        'USDJPY': {'pip_value': 9.1, 'min_stop': 0.50, 'decimal_places': 3},
-        'AUDUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
-        'USDCAD': {'pip_value': 7.5, 'min_stop': 0.0050, 'decimal_places': 5},
-        'USDCHF': {'pip_value': 10.8, 'min_stop': 0.0050, 'decimal_places': 5},
-        'NZDUSD': {'pip_value': 10, 'min_stop': 0.0050, 'decimal_places': 5},
-        'GBPJPY': {'pip_value': 9.1, 'min_stop': 0.50, 'decimal_places': 3},
-        'EURJPY': {'pip_value': 9.1, 'min_stop': 0.50, 'decimal_places': 3},
-    }
-    
-    # Crypto - with minimum stops as percentage of price
-    crypto_info = {
-        'BTCUSD': {'multiplier': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01},
-        'ETHUSD': {'multiplier': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01},
-        'SOLUSD': {'multiplier': 1, 'min_stop_pct': 0.02, 'tick_size': 0.01},
-        'LTCUSD': {'multiplier': 1, 'min_stop_pct': 0.02, 'tick_size': 0.01},
-        'LINKUSD': {'multiplier': 1, 'min_stop_pct': 0.025, 'tick_size': 0.01},
-        'UNIUSD': {'multiplier': 1, 'min_stop_pct': 0.03, 'tick_size': 0.01},
-    }
-    
-    if symbol in futures_info:
-        info = futures_info[symbol].copy()
-        info['type'] = 'futures'
-        return info
-    elif symbol in forex_info:
-        info = forex_info[symbol].copy()
-        info['type'] = 'forex'
-        return info
-    elif symbol in crypto_info:
-        info = crypto_info[symbol].copy()
-        info['type'] = 'crypto'
-        return info
-    else:
-        # Default stock settings
-        return {'type': 'stock', 'multiplier': 1, 'min_stop': 0.02, 'tick_size': 0.01}
-
-
-def get_contract_multiplier(symbol):
-    """Get the contract multiplier for position sizing (backward compatibility)."""
-    info = get_contract_info(symbol)
-    if info['type'] == 'futures':
-        return {'type': 'futures', 'multiplier': info['multiplier']}
-    elif info['type'] == 'forex':
-        return {'type': 'forex', 'pip_value': info['pip_value']}
-    elif info['type'] == 'crypto':
-        return {'type': 'crypto', 'multiplier': info['multiplier']}
+    if symbol in multipliers:
+        return {'type': 'futures', 'multiplier': multipliers[symbol]}
+    elif symbol in forex_pip_values:
+        return {'type': 'forex', 'pip_value': forex_pip_values[symbol]}
+    elif symbol in crypto:
+        return {'type': 'crypto', 'multiplier': 1}
     else:
         return {'type': 'stock', 'multiplier': 1}
 
 
 def calculate_position_size(symbol, account_value, risk_pct, stop_distance, current_price):
     """
-    Calculate proper position size with minimum stop enforcement.
+    Calculate proper position size accounting for contract multipliers.
     
-    For futures, ensures stop distance is reasonable for the contract multiplier.
-    For crypto, enforces minimum stop as percentage of price.
-    
-    Returns: (quantity, actual_risk_per_unit)
+    Returns: (quantity, risk_per_contract)
     """
-    contract_info = get_contract_info(symbol)
+    contract_info = get_contract_multiplier(symbol)
     risk_amount = account_value * risk_pct
-    symbol_type = contract_info['type']
     
-    if symbol_type == 'futures':
+    if contract_info['type'] == 'futures':
+        # For futures: risk = stop_distance * multiplier * contracts
         multiplier = contract_info['multiplier']
-        min_stop = contract_info['min_stop']
-        tick_size = contract_info['tick_size']
-        
-        # Enforce minimum stop distance to prevent oversized positions
-        effective_stop = max(stop_distance, min_stop)
-        
-        # Round to tick size
-        effective_stop = round(effective_stop / tick_size) * tick_size
-        
-        # Calculate risk per contract
-        risk_per_contract = effective_stop * multiplier
-        
-        # Calculate contracts
-        raw_qty = risk_amount / risk_per_contract if risk_per_contract > 0 else 0
-        qty = max(1, int(raw_qty))
-        
-        # For high-multiplier contracts, check if 1 contract exceeds risk limit
-        if qty == 1 and risk_per_contract > risk_amount * 3.0:
-            # Skip this trade only if even 1 contract is way too risky (>3x)
-            return 0, risk_per_contract
-        
+        risk_per_contract = stop_distance * multiplier
+        qty = max(1, int(risk_amount / risk_per_contract))
         return qty, risk_per_contract
     
-    elif symbol_type == 'forex':
+    elif contract_info['type'] == 'forex':
+        # For forex: convert stop to pips, then calculate lot size
         pip_value = contract_info['pip_value']
-        min_stop = contract_info['min_stop']
-        decimal_places = contract_info.get('decimal_places', 5)
+        # Assume 4 decimal places for most pairs (USDJPY is 2)
+        if 'JPY' in symbol:
+            pips = stop_distance * 100  # 2 decimal places
+        else:
+            pips = stop_distance * 10000  # 4 decimal places
         
-        # Enforce minimum stop
-        effective_stop = max(stop_distance, min_stop)
-        
-        # Convert to pips
-        if decimal_places == 3:  # JPY pairs
-            pips = effective_stop * 100
-        else:  # Standard pairs
-            pips = effective_stop * 10000
-        
-        # Calculate lot size
+        # Calculate lot size (1 lot = 100,000 units)
         risk_per_lot = pips * pip_value
         lots = risk_amount / risk_per_lot if risk_per_lot > 0 else 0.01
         
-        # Convert to units (1 lot = 100,000 units)
-        qty = max(1000, int(lots * 100000))
+        # Convert to units (IBKR uses units, not lots)
+        qty = max(1000, int(lots * 100000))  # Minimum 1000 units (micro lot)
         
-        # Cap at reasonable maximum
-        max_units = 5000000  # 50 lots max
-        qty = min(qty, max_units)
-        
+        # Return risk per UNIT (not per lot) for consistency
         risk_per_unit = risk_per_lot / 100000
         return qty, risk_per_unit
     
-    elif symbol_type == 'crypto':
-        multiplier = contract_info['multiplier']
-        min_stop_pct = contract_info.get('min_stop_pct', 0.02)
-        tick_size = contract_info.get('tick_size', 0.01)
-        
-        # Calculate minimum stop in price terms
-        min_stop = current_price * min_stop_pct
-        
-        # Enforce minimum stop
-        effective_stop = max(stop_distance, min_stop)
-        
-        # Round to tick size
-        effective_stop = round(effective_stop / tick_size) * tick_size
-        
-        # Calculate position size
-        risk_per_unit = effective_stop * multiplier
+    elif contract_info['type'] == 'crypto':
+        # For crypto: direct price-based sizing
+        risk_per_unit = stop_distance
         qty = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-        
-        # Round appropriately
+        # Round to reasonable precision
         if current_price > 10000:  # BTC
-            qty = round(qty, 6)
-        elif current_price > 1000:  # ETH
-            qty = round(qty, 5)
-        else:  # Other crypto
+            qty = round(qty, 4)
+        else:
             qty = round(qty, 2)
-        
-        # Enforce minimum and maximum
-        qty = max(0.001, qty)
-        
-        # Cap position value at 10x account (leverage limit)
-        max_qty = (account_value * 10) / current_price
-        qty = min(qty, max_qty)
-        
-        return qty, risk_per_unit
+        return max(0.0001, qty), risk_per_unit
     
-    else:  # Stock/Other
-        min_stop = contract_info.get('min_stop', 0.02)
-        effective_stop = max(stop_distance, min_stop)
-        
-        risk_per_share = effective_stop
+    else:  # Stock
+        risk_per_share = stop_distance
         qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
-        
-        # Enforce min/max
-        qty = max(1, qty)
-        max_shares = int(account_value / current_price) if current_price > 0 else 0
-        qty = min(qty, max_shares)
-        
-        return qty, risk_per_share
+        return max(1, qty), risk_per_share
 
 
 def sync_positions_with_ibkr(ib, symbols):
@@ -1149,8 +1001,7 @@ def run_ibkr_trading(symbols, interval=30, risk_pct=0.02, port=7497):
                 pass
             
             for symbol in symbols:
-                # Pass the main IB connection to avoid creating new connections
-                data = prepare_data_ibkr(symbol, ib=ib)
+                data = prepare_data_ibkr(symbol)
                 if data is None or len(data.get('closes', [])) < 50:
                     continue
                 
