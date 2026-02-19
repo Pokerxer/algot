@@ -8,10 +8,17 @@ import asyncio
 asyncio.set_event_loop(asyncio.new_event_loop())
 
 import sys
-sys.path.insert(0, '/Users/mac/Documents/Algot')
+import os
 
-# Import V5 components
-exec(open('/Users/mac/Documents/Algot/ict_v5_ibkr.py').read().split('if __name__')[0])
+# Get the directory where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+
+# Import V5 components using relative path
+v5_path = os.path.join(SCRIPT_DIR, 'ict_v5_ibkr.py')
+with open(v5_path, 'r') as f:
+    v5_code = f.read().split('if __name__')[0]
+    exec(v5_code)
 
 # Import FVG and Gap handlers
 from fvg_handler import FVGHandler, FairValueGap, FVGStatus

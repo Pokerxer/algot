@@ -8,7 +8,7 @@ import asyncio
 asyncio.set_event_loop(asyncio.new_event_loop())
 
 import sys
-sys.path.insert(0, '/Users/mac/Documents/Algot')
+sys.path.insert(0, '.')
 
 import json
 import pandas as pd
@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 import importlib.util
 
 # Import V5 base
-spec = importlib.util.spec_from_file_location("ict_v5", "/Users/mac/Documents/Algot/ict_v5_ibkr.py")
+spec = importlib.util.spec_from_file_location("ict_v5", "./ict_v5_ibkr.py")
 ict_v5 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ict_v5)
 
@@ -450,7 +450,7 @@ def run_v7_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
 
 
 if __name__ == "__main__":
-    symbols = ['BTCUSD', 'ETHUSD', 'ES', 'NQ', 'GC']
+    symbols = ['BTCUSD', 'ETHUSD', 'ES', 'NQ', 'GC', 'SOLUSD', 'LINKUSD', 'LTCUSD', 'SI', 'UNIUSD', 'NG', 'CL']
     
     results = run_v7_backtest(
         symbols=symbols,
