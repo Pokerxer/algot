@@ -36,21 +36,23 @@ get_contract_info = ict_v5.get_contract_info
 
 
 class V6SignalGenerator:
-    """V6 Signal Generator for backtesting"""
+    """V6 Signal Generator for backtesting - Optimized"""
     
     def __init__(self):
         self.fvg_handler = FVGHandler(
             sensitivity=0.0001,
             min_gap_size=0.0,
-            track_body_respect=True,
-            detect_volume_imbalances=True,
-            detect_suspension_blocks=True
+            track_body_respect=False,  # Disable for speed
+            detect_volume_imbalances=False,  # Disable for speed
+            detect_suspension_blocks=False  # Disable for speed
         )
         self.gap_handler = GapHandler(
             large_gap_pips_forex=40.0,
             large_gap_points_indices=50.0,
             keep_gaps_days=3
         )
+        # Cache FVGs to avoid recomputing
+        self.fvg_cache = {}
     
     def generate_signal(self, data: Dict, idx: int) -> Dict:
         """Generate V6 signal with FVG + Gap analysis"""
@@ -320,7 +322,8 @@ def run_v6_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
 
 
 if __name__ == "__main__":
-    symbols = ['SOLUSD', 'LINKUSD', 'LTCUSD', 'UNIUSD', 'BTCUSD', 'ETHUSD', 'SI', 'NQ', 'ES', 'GC']
+    # Use fewer symbols for faster backtest
+    symbols = ['BTCUSD', 'ETHUSD', 'ES', 'NQ', 'GC']
     
     print("="*80)
     print("ICT V6 - FVG + Gap Backtest")
