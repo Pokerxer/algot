@@ -981,6 +981,31 @@ def run_v8_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='V8 Backtest with RL Agent')
+    parser.add_argument('--symbols', type=str, 
+                       default='BTCUSD,ETHUSD,ES,NQ,GC,SI,NG,CL',
+                       help='Comma-separated symbols')
+    parser.add_argument('--no-rl', action='store_true',
+                       help='Disable RL agent (use V7-like signals only)')
+    parser.add_argument('--rl-model', type=str, default=None,
+                       help='Path to pre-trained RL model')
+    parser.add_argument('--rr', type=float, default=4.0,
+                       help='Risk:Reward ratio (default: 4)')
+    parser.add_argument('--confluence', type=int, default=60,
+                       help='Minimum confluence threshold (default: 60)')
+    parser.add_argument('--train-episodes', type=int, default=3000,
+                       help='Training episodes (default: 3000)')
+    parser.add_argument('--months', type=int, default=6,
+                       help='Total months of data to fetch (default: 6)')
+    parser.add_argument('--train-ratio', type=float, default=0.75,
+                       help='Train/test split ratio (default: 0.75)')
+    
+    args = parser.parse_args()
+    
+    # Update symbols list
+    symbols = [s.strip() for s in args.symbols.split(',')]
     # Import yfinance directly for longer historical data
     import yfinance as yf
     
@@ -1105,7 +1130,9 @@ if __name__ == "__main__":
     print("V8 RL TRAINING & TESTING - TRAIN/TEST SPLIT")
     print("="*80)
     print("Training Period: 9 months")
-    print("Testing Period: 3 months")
+    print(f"RL Agent: {'Disabled' if args.no_rl else 'Enabled'}")
+    print(f"Risk:Reward: 1:{args.rr}")
+    print(f"Confluence threshold: {args.confluence}")
     print("="*80 + "\n")
     
     # Load extended data (6 months)
@@ -1130,7 +1157,7 @@ if __name__ == "__main__":
     print(f"Date range: {all_timestamps[0]} to {all_timestamps[-1]}")
     
     # Split: first ~67% for training (4 months), last ~33% for testing (2 months)
-    split_idx = int(len(all_timestamps) * 0.75)
+    split_idx = int(len(all_timestamps) * args.train_ratio)
     train_timestamps = all_timestamps[:split_idx]
     test_timestamps = all_timestamps[split_idx:]
     
@@ -1155,31 +1182,51 @@ if __name__ == "__main__":
         buffer_size=20000
     )
     
-    agent = ICTReinforcementLearningAgent(config)
-    reward_calc = RewardCalculator(reward_scale=1.0, penalty_scale=1.0)
+    # Handle RL: either load pre-trained model or create new agent
+    agent = None
+    if args.rl_model and os.path.exists(args.rl_model):
+        print(f"\nLoading pre-trained RL model from {args.rl_model}...")
+        try:
+            with open(args.rl_model, 'rb') as f:
+                model_data = pickle.load(f)
+            agent = model_data.get('agent')
+            if agent:
+                print("RL model loaded successfully!")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            agent = None
     
-    # Training loop using actual historical data with ACTUAL TRADE OUTCOMES
-    training_episodes = 3000
-    print(f"\nTraining on {len(train_timestamps)} timestamps with {training_episodes} episodes...")
-    print("Using actual trade outcome rewards...")
+    if agent is None and not args.no_rl:
+        agent = ICTReinforcementLearningAgent(config)
+        reward_calc = RewardCalculator(reward_scale=1.0, penalty_scale=1.0)
+    else:
+        reward_calc = None
+    
+    if args.no_rl:
+        print("\nRL Agent disabled - running without RL")
+    else:
+        print(f"\nTraining on {len(train_timestamps)} timestamps with {training_episodes} episodes...")
+        print("Using actual trade outcome rewards...")
     
     episode_rewards = []
     winning_trades = 0
     losing_trades = 0
     
-    for episode in range(training_episodes):
-        # Randomly sample from training period
-        ts = np.random.choice(train_timestamps[:-50])  # Leave room for forward look
-        
-        for symbol, data in extended_data.items():
-            if ts not in data['df'].index:
-                continue
+    # Only train if RL is enabled and we have an agent
+    if agent is not None and not args.no_rl:
+        for episode in range(training_episodes):
+            # Randomly sample from training period
+            ts = np.random.choice(train_timestamps[:-50])  # Leave room for forward look
             
-            idx = data['df'].index.get_loc(ts)
-            if idx < 50 or idx >= len(data['closes']) - 20:
-                continue
-            
-            current_price = data['closes'][idx]
+            for symbol, data in extended_data.items():
+                if ts not in data['df'].index:
+                    continue
+                
+                idx = data['df'].index.get_loc(ts)
+                if idx < 50 or idx >= len(data['closes']) - 20:
+                    continue
+                
+                current_price = data['closes'][idx]
             
             # Calculate features
             if idx >= 5:
@@ -1390,12 +1437,13 @@ if __name__ == "__main__":
             print(f"  Episode {episode}/{training_episodes} | Avg Reward: {recent_avg:.3f} | ε: {agent.entry_agent.epsilon:.3f} | SimWR: {sim_wr:.1f}%")
     
     # Final training pass
-    print("\nFinal training pass...")
-    for _ in range(100):
-        if len(agent.entry_agent.replay_buffer) >= config.batch_size:
-            agent.entry_agent.train_step()
-    
-    print(f"Training complete! Final ε: {agent.entry_agent.epsilon:.3f}")
+    if agent is not None and not args.no_rl:
+        print("\nFinal training pass...")
+        for _ in range(100):
+            if len(agent.entry_agent.replay_buffer) >= config.batch_size:
+                agent.entry_agent.train_step()
+        
+        print(f"Training complete! Final ε: {agent.entry_agent.epsilon:.3f}")
     
     # Now test on test period
     print("\n" + "="*80)
@@ -1403,8 +1451,9 @@ if __name__ == "__main__":
     print("="*80)
     
     # Run backtest using only test timestamps
-    signal_gen = V8SignalGenerator(use_rl=True)
-    signal_gen.rl_agent = agent
+    signal_gen = V8SignalGenerator(use_rl=not args.no_rl)
+    if agent is not None:
+        signal_gen.rl_agent = agent
     
     balance = initial_capital = 50000
     positions = {}
