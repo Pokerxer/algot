@@ -2533,8 +2533,8 @@ def send_signal(symbol, direction, confluence, price, tp, sl, htf, ltf, kz, pp):
     get_notifier().send_message_async(message)
 
 
-def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl):
-    """Send trade entry notification with modern design"""
+def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl, pd_zone=None, rl_action=None, risk_amount=None):
+    """Send trade entry notification with V8 details"""
     if not BOT_SETTINGS.get('trade_alerts', True):
         return
     
@@ -2552,6 +2552,36 @@ def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl):
         reward = entry_price - tp
     rr = reward / risk if risk > 0 else 0
     
+    # Format PD Zone
+    pd_zone_text = ""
+    if pd_zone:
+        pd_icons = {
+            'discount': '📥 DISCOUNT',
+            'equilibrium': '⚖️ EQUILIBRIUM',
+            'premium': '📤 PREMIUM',
+            'equilibrium_below': '⚖️ EQ BELOW',
+            'equilibrium_above': '⚖️ EQ ABOVE',
+            'extreme_discount': '📥📥 EXTREME DISCOUNT',
+            'extreme_premium': '📤📤 EXTREME PREMIUM'
+        }
+        pd_zone_text = pd_icons.get(pd_zone, pd_zone)
+    
+    # Format RL Action
+    rl_text = ""
+    if rl_action:
+        rl_icons = {
+            'ENTER_NOW': '⚡ ENTER NOW',
+            'ENTER_PULLBACK': '↩️ ENTER PULLBACK',
+            'WAIT_CONFIRMATION': '⏳ WAIT CONFIRMATION',
+            'PASS': '⛔ PASS'
+        }
+        rl_text = f"\n🤖 RL Decision: {rl_icons.get(rl_action, rl_action)}"
+    
+    # Risk amount
+    risk_text = ""
+    if risk_amount:
+        risk_text = f"\n💰 Risk: ${risk_amount:,.2f}"
+    
     # Update position tracking
     update_position(symbol, {
         'direction': direction,
@@ -2560,6 +2590,8 @@ def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl):
         'stop': sl,
         'target': tp,
         'confluence': confluence,
+        'pd_zone': pd_zone,
+        'rl_action': rl_action,
         'entry_time': datetime.now().isoformat()
     })
     
@@ -2568,7 +2600,7 @@ def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl):
     session_icon, session_name = ds.get_session_icon()
     
     message = f"""
-{ds.ICON_ROCKET} <b>TRADE ENTERED</b>
+{ds.ICON_ROCKET} <b>🚢 V8 TRADE ENTERED</b>
 {ds.SEP_THICK}
 
 {dir_icon} <b>{direction_text}</b> {symbol}
@@ -2587,6 +2619,9 @@ def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl):
 
 {ds.SEP_THIN}
 {session_icon} <i>{session_name}</i>
+{pd_zone_text}
+{rl_text}
+{risk_text}
 
 {ds.STATUS_SUCCESS} <b>Trade Active</b>
 

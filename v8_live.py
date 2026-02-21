@@ -303,13 +303,13 @@ class V8LiveTrader:
                 self._log_shadow_trade(symbol, signal, current_price, stop, target, qty)
             else:
                 # Paper or Live mode - execute
-                self._execute_entry(symbol, signal, current_price, stop, target, qty)
+                self._execute_entry(symbol, signal, current_price, stop, target, qty, risk_amount)
         
         except Exception as e:
             print(f"[{symbol}] Error checking entry: {e}")
     
     def _execute_entry(self, symbol: str, signal: Dict, entry_price: float,
-                       stop: float, target: float, qty: float):
+                       stop: float, target: float, qty: float, risk_amount: float = 0):
         """Execute entry order via IBKR."""
         try:
             contract = get_ibkr_contract(symbol)
@@ -339,6 +339,7 @@ class V8LiveTrader:
                     'confluence': signal['confluence'],
                     'pd_zone': signal.get('pd_zone'),
                     'rl_action': signal.get('rl_entry_action'),
+                    'risk_amount': risk_amount,
                     'entry_time': datetime.now(),
                     'bars_held': 0
                 }
@@ -354,15 +355,18 @@ class V8LiveTrader:
                 
                 self.trade_count += 1
                 
-                # Telegram notification
+                # Telegram notification with V8 details
                 if tn:
                     try:
                         tn.send_trade_entry(
                             symbol, signal['direction'], filled_qty,
-                            fill_price, signal['confluence'], target, stop
+                            fill_price, signal['confluence'], target, stop,
+                            pd_zone=signal.get('pd_zone'),
+                            rl_action=signal.get('rl_entry_action'),
+                            risk_amount=risk_amount
                         )
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"[{symbol}] Telegram error: {e}")
             else:
                 print(f"[{symbol}] Order not filled within timeout")
                 
