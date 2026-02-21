@@ -50,8 +50,16 @@ from reinforcement_learning_agent import (
 # Telegram notifications
 try:
     import telegram_notify as tn
+    # Initialize Telegram bot
+    if tn and hasattr(tn, 'init_bot'):
+        try:
+            tn.init_bot()
+            print("Telegram bot initialized")
+        except Exception as e:
+            print(f"Telegram bot initialization failed: {e}")
 except ImportError:
     tn = None
+    print("WARNING: telegram_notify not installed")
 
 # IBKR connection
 try:
