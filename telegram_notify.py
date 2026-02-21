@@ -561,7 +561,7 @@ class TelegramNotifier:
             return loop
     
     def send_message(self, message: str, reply_markup=None):
-        """Send a message to Telegram (thread-safe)"""
+        """Send a message to Telegram (thread-safe, uses HTTP directly)"""
         if not self._initialized:
             if not self.init():
                 return False
@@ -570,18 +570,22 @@ class TelegramNotifier:
             return True
             
         try:
-            loop = self._get_or_create_loop()
+            import requests
             
-            async def _send():
-                await self.app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode='HTML',
-                    reply_markup=reply_markup
-                )
+            # Use direct HTTP request (works regardless of event loop state)
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
             
-            loop.run_until_complete(_send())
-            return True
+            if reply_markup:
+                import json
+                payload['reply_markup'] = json.dumps(reply_markup.to_dict()) if hasattr(reply_markup, 'to_dict') else str(reply_markup)
+            
+            response = requests.post(url, json=payload, timeout=10)
+            return response.status_code == 200
             
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
@@ -597,6 +601,7 @@ class TelegramNotifier:
     
     async def _start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command with compact submenu UI"""
+        logger.info(f"START command received from {update.effective_user.username if update.effective_user else 'unknown'}")
         ds = DesignSystem
         session_icon, session_name = ds.get_session_icon()
         
@@ -2953,9 +2958,17 @@ def get_notifier() -> TelegramNotifier:
 
 # === Public API Functions ===
 
-def init_bot():
-    """Initialize the Telegram bot"""
-    return get_notifier().init()
+def init_bot(start_polling: bool = True):
+    """Initialize the Telegram bot and optionally start polling for commands.
+    
+    Args:
+        start_polling: If True, starts background polling thread to receive commands.
+                      Set to False if only sending notifications.
+    """
+    result = get_notifier().init()
+    if result and start_polling:
+        start_polling_background()
+    return result
 
 
 def send_message(message: str):
@@ -3632,6 +3645,75 @@ def run_polling():
     if notifier.app:
         print("Starting Telegram bot polling...")
         notifier.app.run_polling()
+
+
+def start_polling_background():
+    """Start the bot polling in a background thread (non-blocking)"""
+    global _bot_thread, _event_loop
+    
+    def _run_polling_thread():
+        """Run polling in a dedicated thread with its own event loop"""
+        global _event_loop
+        import asyncio
+        
+        # Create new event loop for this thread
+        _event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_event_loop)
+        
+        notifier = get_notifier()
+        if not notifier._initialized:
+            notifier.init()
+        
+        if notifier.app:
+            logger.info("Starting Telegram bot polling in background thread...")
+            try:
+                # Use the application's updater directly with async
+                async def run_polling():
+                    await notifier.app.initialize()
+                    await notifier.app.start()
+                    await notifier.app.updater.start_polling(drop_pending_updates=False)
+                    
+                    # Keep running until stopped
+                    while True:
+                        await asyncio.sleep(1)
+                
+                _event_loop.run_until_complete(run_polling())
+            except asyncio.CancelledError:
+                logger.info("Polling cancelled")
+            except Exception as e:
+                logger.error(f"Polling error: {e}")
+            finally:
+                try:
+                    _event_loop.run_until_complete(notifier.app.updater.stop())
+                    _event_loop.run_until_complete(notifier.app.stop())
+                    _event_loop.run_until_complete(notifier.app.shutdown())
+                except:
+                    pass
+    
+    if _bot_thread is None or not _bot_thread.is_alive():
+        _bot_thread = threading.Thread(target=_run_polling_thread, daemon=True)
+        _bot_thread.start()
+        logger.info("Telegram bot background thread started")
+        return True
+    else:
+        logger.info("Telegram bot already running")
+        return False
+
+
+def stop_polling():
+    """Stop the background polling"""
+    global _bot_thread, _event_loop
+    
+    if _event_loop:
+        try:
+            # Cancel all tasks
+            for task in asyncio.all_tasks(_event_loop):
+                task.cancel()
+        except:
+            pass
+    
+    _bot_thread = None
+    _event_loop = None
 
 
 # ============================================================================
