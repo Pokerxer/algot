@@ -281,6 +281,20 @@ class V8LiveTrader:
             print(f"[{symbol}] V8 Signal: {direction_str} | Confluence: {signal['confluence']} | "
                   f"PD Zone: {signal['pd_zone']} | RL: {rl_action}")
             
+            # Send signal alert to Telegram
+            if tn:
+                try:
+                    tn.send_signal_alert(
+                        symbol=symbol,
+                        direction=signal['direction'],
+                        confluence=signal['confluence'],
+                        pd_zone=signal.get('pd_zone', ''),
+                        current_price=current_price,
+                        rl_action=rl_action
+                    )
+                except Exception as e:
+                    print(f"[{symbol}] Signal alert error: {e}")
+            
             # Calculate stop and target with configurable RR
             if signal['direction'] == 1:
                 stop = data['lows'][idx]
@@ -564,6 +578,18 @@ class V8LiveTrader:
         print(f"Account Value: ${self.account_value:,.2f}")
         print(f"{'='*60}\n")
         
+        # Send startup notification to Telegram
+        if tn:
+            try:
+                tn.send_startup(
+                    symbols=self.symbols,
+                    risk_pct=self.risk_pct,
+                    interval=60,  # hourly
+                    mode=f"V8 {self.mode.upper()}"
+                )
+            except Exception as e:
+                print(f"Telegram startup notification failed: {e}")
+        
         # Track last signal time to prevent duplicate trades
         self.last_signal_time = {}
         self.last_hourly_refresh = {}
@@ -635,11 +661,22 @@ class V8LiveTrader:
                                 self._poll_symbol(symbol)
                                 self.last_poll_time[symbol] = current_time
                 
+                    # Send hourly position update (every hour)
+                    if iteration % 3600 == 0 and self.positions:
+                        self._send_position_update()
+                
                 except (ConnectionError, OSError, Exception) as e:
                     error_msg = str(e)
                     if 'connection' in error_msg.lower() or 'disconnect' in error_msg.lower() or not self.ib.isConnected():
                         reconnect_attempts += 1
                         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Connection lost: {e}")
+                        
+                        # Send disconnection alert
+                        if tn:
+                            try:
+                                tn.send_reconnection_alert(success=False, attempt=reconnect_attempts)
+                            except:
+                                pass
                         
                         if reconnect_attempts > max_reconnect_attempts:
                             print(f"Max reconnect attempts ({max_reconnect_attempts}) reached. Stopping.")
@@ -660,6 +697,12 @@ class V8LiveTrader:
                         # Attempt reconnection
                         if self._reconnect():
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] Reconnected successfully!")
+                            # Send reconnection success alert
+                            if tn:
+                                try:
+                                    tn.send_reconnection_alert(success=True, attempt=reconnect_attempts)
+                                except:
+                                    pass
                             # Re-sync positions after reconnect
                             self._sync_positions()
                             # Re-initialize streaming
@@ -670,6 +713,11 @@ class V8LiveTrader:
                     else:
                         # Non-connection error, log and continue
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {e}")
+                        if tn:
+                            try:
+                                tn.send_error_alert("Trading Error", str(e))
+                            except:
+                                pass
                 
         except KeyboardInterrupt:
             print("\nStopping trader...")
@@ -748,6 +796,38 @@ class V8LiveTrader:
                 self._on_realtime_bar(symbol, FakeBar(current_price))
         except Exception as e:
             print(f"[{symbol}] Poll error: {e}")
+    
+    def _send_position_update(self):
+        """Send hourly position update to Telegram."""
+        if not self.positions or not tn:
+            return
+        
+        try:
+            total_pnl = 0.0
+            positions_data = {}
+            
+            for symbol, pos in self.positions.items():
+                # Get current price
+                current_price = pos.get('entry', 0)
+                if symbol in self.historical_data:
+                    current_price = self.historical_data[symbol]['closes'][-1]
+                
+                positions_data[symbol] = {
+                    **pos,
+                    'current_price': current_price
+                }
+                
+                # Calculate P&L
+                if pos['direction'] == 1:
+                    pnl = (current_price - pos['entry']) * pos.get('qty', 0)
+                else:
+                    pnl = (pos['entry'] - current_price) * pos.get('qty', 0)
+                total_pnl += pnl
+            
+            tn.send_position_update(positions_data, total_pnl)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent hourly position update")
+        except Exception as e:
+            print(f"Error sending position update: {e}")
     
     def stop(self):
         """Stop trading and cleanup."""

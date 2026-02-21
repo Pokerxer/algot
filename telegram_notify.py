@@ -2924,5 +2924,289 @@ def run_polling():
         notifier.app.run_polling()
 
 
+# ============================================================================
+# NEW V8 NOTIFICATIONS
+# ============================================================================
+
+def send_signal_alert(symbol: str, direction: int, confluence: int, pd_zone: str, 
+                      current_price: float, rl_action: str = None):
+    """Send alert when a signal is detected (before entry)"""
+    ds = DesignSystem
+    
+    dir_icon = ds.ICON_BULL if direction == 1 else ds.ICON_BEAR
+    dir_text = "BULLISH" if direction == 1 else "BEARISH"
+    
+    # PD Zone formatting
+    pd_icons = {
+        'discount': '📥 DISCOUNT',
+        'premium': '📤 PREMIUM',
+        'equilibrium': '⚖️ EQUILIBRIUM',
+        'extreme_discount': '📥📥 EXTREME DISCOUNT',
+        'extreme_premium': '📤📤 EXTREME PREMIUM'
+    }
+    pd_text = pd_icons.get(pd_zone, pd_zone.upper() if pd_zone else 'N/A')
+    
+    # RL recommendation
+    rl_text = ""
+    if rl_action:
+        rl_icons = {
+            'ENTER_NOW': '⚡ ENTER IMMEDIATELY',
+            'ENTER_PULLBACK': '↩️ WAIT FOR PULLBACK',
+            'WAIT_CONFIRMATION': '⏳ WAIT FOR CONFIRMATION',
+            'PASS': '⛔ SKIP THIS SIGNAL'
+        }
+        rl_text = f"\n🤖 <b>RL Recommends:</b> {rl_icons.get(rl_action, rl_action)}"
+    
+    conf_meter = ds.confidence_meter(confluence, 100)
+    
+    message = f"""
+{ds.ICON_BELL} <b>SIGNAL DETECTED</b>
+{ds.SEP_THICK}
+
+{dir_icon} <b>{dir_text}</b> {symbol}
+
+{ds.SEP_THIN}
+<code>
+ Price      : {ds.format_price(current_price)}
+ Confluence : {confluence}/100
+ PD Zone    : {pd_text}
+</code>
+
+{conf_meter}
+{rl_text}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    send_notification(message)
+
+
+def send_position_update(positions: Dict, total_pnl: float):
+    """Send hourly position update with P&L"""
+    if not positions:
+        return
+    
+    ds = DesignSystem
+    
+    lines = []
+    for symbol, pos in positions.items():
+        direction = pos.get('direction', 0)
+        entry = pos.get('entry', 0)
+        current = pos.get('current_price', entry)
+        
+        if direction == 1:
+            pnl = (current - entry) * pos.get('qty', 0)
+            pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        else:
+            pnl = (entry - current) * pos.get('qty', 0)
+            pnl_pct = ((entry - current) / entry * 100) if entry > 0 else 0
+        
+        dir_icon = ds.ICON_BULL if direction == 1 else ds.ICON_BEAR
+        pnl_icon = ds.STATUS_SUCCESS if pnl >= 0 else ds.STATUS_ERROR
+        
+        lines.append(f"{dir_icon} <b>{symbol}</b>: {pnl_icon} ${pnl:+,.2f} ({pnl_pct:+.2f}%)")
+    
+    pnl_icon = ds.STATUS_SUCCESS if total_pnl >= 0 else ds.STATUS_ERROR
+    
+    message = f"""
+{ds.ICON_CHART} <b>POSITION UPDATE</b>
+{ds.SEP_THICK}
+
+{chr(10).join(lines)}
+
+{ds.SEP_THIN}
+{pnl_icon} <b>Total Unrealized: ${total_pnl:+,.2f}</b>
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    send_notification(message)
+
+
+def send_drawdown_alert(current_drawdown: float, max_allowed: float, daily_pnl: float):
+    """Send alert when drawdown exceeds threshold"""
+    ds = DesignSystem
+    
+    pct = (current_drawdown / max_allowed * 100) if max_allowed > 0 else 0
+    
+    if pct >= 100:
+        severity = f"{ds.STATUS_ERROR} CRITICAL"
+        action = "Trading should be halted!"
+    elif pct >= 75:
+        severity = f"{ds.STATUS_WARNING} HIGH"
+        action = "Consider reducing position sizes"
+    else:
+        severity = f"{ds.STATUS_WARNING} WARNING"
+        action = "Monitor closely"
+    
+    message = f"""
+{ds.ICON_SHIELD} <b>DRAWDOWN ALERT</b>
+{ds.SEP_THICK}
+
+{severity}
+
+<code>
+ Current DD  : ${abs(current_drawdown):,.2f}
+ Max Allowed : ${max_allowed:,.2f}
+ DD Level    : {pct:.1f}%
+ Daily P&L   : ${daily_pnl:+,.2f}
+</code>
+
+{ds.SEP_THIN}
+{ds.ICON_ZAP} <b>{action}</b>
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    send_notification(message)
+
+
+def send_streak_alert(streak: int, streak_pnl: float):
+    """Send alert for win/loss streaks"""
+    ds = DesignSystem
+    
+    if streak >= 3:
+        # Win streak
+        if streak >= 5:
+            icon = ds.ICON_CROWN
+            text = "LEGENDARY"
+        elif streak >= 4:
+            icon = ds.ICON_FIRE
+            text = "ON FIRE"
+        else:
+            icon = ds.ICON_ROCKET
+            text = "HOT STREAK"
+        
+        message = f"""
+{icon} <b>{streak} WIN STREAK!</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_SUCCESS} {text}
+
+<code>
+ Consecutive Wins : {streak}
+ Streak P&L       : +${streak_pnl:,.2f}
+</code>
+
+{ds.SEP_THIN}
+Keep it going! {ds.ICON_DIAMOND}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    elif streak <= -3:
+        # Loss streak
+        loss_count = abs(streak)
+        
+        message = f"""
+{ds.STATUS_WARNING} <b>{loss_count} LOSS STREAK</b>
+{ds.SEP_THICK}
+
+<code>
+ Consecutive Losses : {loss_count}
+ Streak Loss        : ${streak_pnl:,.2f}
+</code>
+
+{ds.SEP_THIN}
+{ds.ICON_SHIELD} Consider taking a break or reducing size.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    else:
+        return  # No significant streak
+    
+    send_notification(message)
+
+
+def send_market_open(session: str, symbols: List[str]):
+    """Send notification when a trading session opens"""
+    ds = DesignSystem
+    
+    session_icons = {
+        'london': (ds.SESSION_LONDON, 'LONDON SESSION'),
+        'nyc': (ds.SESSION_NYC, 'NEW YORK SESSION'),
+        'asia': (ds.SESSION_ASIA, 'ASIA SESSION'),
+    }
+    
+    icon, name = session_icons.get(session.lower(), (ds.ICON_CHART, session.upper()))
+    
+    symbols_str = ", ".join(symbols[:5])
+    if len(symbols) > 5:
+        symbols_str += f" +{len(symbols) - 5} more"
+    
+    message = f"""
+{icon} <b>{name} OPEN</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_SUCCESS} Trading session active!
+
+<b>Watching:</b>
+{symbols_str}
+
+{ds.SEP_THIN}
+Good luck today! {ds.ICON_ROCKET}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    send_notification(message)
+
+
+def send_reconnection_alert(success: bool, attempt: int = 1):
+    """Send alert when connection is lost/restored"""
+    ds = DesignSystem
+    
+    if success:
+        message = f"""
+{ds.STATUS_SUCCESS} <b>CONNECTION RESTORED</b>
+{ds.SEP_THICK}
+
+IBKR connection re-established!
+Trading resumed normally.
+
+{ds.SEP_THIN}
+Attempt: {attempt}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    else:
+        message = f"""
+{ds.STATUS_ERROR} <b>CONNECTION LOST</b>
+{ds.SEP_THICK}
+
+IBKR connection dropped!
+Attempting to reconnect...
+
+{ds.SEP_THIN}
+Attempt: {attempt}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    send_notification(message)
+
+
+def send_error_alert(error_type: str, error_msg: str, symbol: str = None):
+    """Send alert for trading errors"""
+    ds = DesignSystem
+    
+    symbol_text = f" ({symbol})" if symbol else ""
+    
+    message = f"""
+{ds.STATUS_ERROR} <b>ERROR{symbol_text}</b>
+{ds.SEP_THICK}
+
+<b>Type:</b> {error_type}
+
+<code>{error_msg[:200]}</code>
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    send_notification(message)
+
+
 if __name__ == "__main__":
     test_connection()
