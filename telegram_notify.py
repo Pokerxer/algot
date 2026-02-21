@@ -2958,12 +2958,13 @@ def get_notifier() -> TelegramNotifier:
 
 # === Public API Functions ===
 
-def init_bot(start_polling: bool = True):
+def init_bot(start_polling: bool = False):
     """Initialize the Telegram bot and optionally start polling for commands.
     
     Args:
         start_polling: If True, starts background polling thread to receive commands.
-                      Set to False if only sending notifications.
+                      NOTE: Set to False (default) when using with IBKR to avoid
+                      event loop conflicts. Commands won't work but notifications will.
     """
     result = get_notifier().init()
     if result and start_polling:
@@ -3648,72 +3649,534 @@ def run_polling():
 
 
 def start_polling_background():
-    """Start the bot polling in a background thread (non-blocking)"""
-    global _bot_thread, _event_loop
+    """Start simple HTTP-based polling in a background thread (no asyncio conflicts)"""
+    global _bot_thread
     
-    def _run_polling_thread():
-        """Run polling in a dedicated thread with its own event loop"""
-        global _event_loop
-        import asyncio
+    def _simple_polling_thread():
+        """Poll for updates using simple HTTP requests (no asyncio)"""
+        import requests
+        import time
         
-        # Create new event loop for this thread
-        _event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_event_loop)
+        logger.info("Starting simple HTTP polling for Telegram commands...")
         
-        notifier = get_notifier()
-        if not notifier._initialized:
-            notifier.init()
+        offset = None
         
-        if notifier.app:
-            logger.info("Starting Telegram bot polling in background thread...")
+        while True:
             try:
-                # Use the application's updater directly with async
-                async def run_polling():
-                    await notifier.app.initialize()
-                    await notifier.app.start()
-                    await notifier.app.updater.start_polling(drop_pending_updates=False)
-                    
-                    # Keep running until stopped
-                    while True:
-                        await asyncio.sleep(1)
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+                params = {'timeout': 30}
+                if offset:
+                    params['offset'] = offset
                 
-                _event_loop.run_until_complete(run_polling())
-            except asyncio.CancelledError:
-                logger.info("Polling cancelled")
+                response = requests.get(url, params=params, timeout=35)
+                data = response.json()
+                
+                if data.get('ok') and data.get('result'):
+                    for update in data['result']:
+                        offset = update['update_id'] + 1
+                        _handle_update(update)
+                        
+            except requests.exceptions.Timeout:
+                continue  # Normal long-polling timeout
             except Exception as e:
                 logger.error(f"Polling error: {e}")
-            finally:
-                try:
-                    _event_loop.run_until_complete(notifier.app.updater.stop())
-                    _event_loop.run_until_complete(notifier.app.stop())
-                    _event_loop.run_until_complete(notifier.app.shutdown())
-                except:
-                    pass
+                time.sleep(5)  # Wait before retry
     
     if _bot_thread is None or not _bot_thread.is_alive():
-        _bot_thread = threading.Thread(target=_run_polling_thread, daemon=True)
+        _bot_thread = threading.Thread(target=_simple_polling_thread, daemon=True)
         _bot_thread.start()
-        logger.info("Telegram bot background thread started")
+        logger.info("Telegram simple polling thread started")
         return True
     else:
-        logger.info("Telegram bot already running")
+        logger.info("Telegram polling already running")
         return False
+
+
+def _handle_update(update: dict):
+    """Handle incoming Telegram update (command or callback)"""
+    import requests
+    
+    try:
+        # Handle message/command
+        message = update.get('message', {})
+        callback = update.get('callback_query', {})
+        
+        chat_id = None
+        text = None
+        callback_data = None
+        message_id = None
+        
+        if message:
+            chat_id = message.get('chat', {}).get('id')
+            text = message.get('text', '')
+            logger.info(f"Received message: {text} from chat {chat_id}")
+        
+        if callback:
+            chat_id = callback.get('message', {}).get('chat', {}).get('id')
+            callback_data = callback.get('data', '')
+            message_id = callback.get('message', {}).get('message_id')
+            logger.info(f"Received callback: {callback_data} from chat {chat_id}")
+            
+            # Answer callback query
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                json={'callback_query_id': callback.get('id')}
+            )
+        
+        if not chat_id:
+            return
+        
+        # Route to handlers
+        response_text = None
+        reply_markup = None
+        
+        if text and text.startswith('/'):
+            cmd = text.split()[0].lower().replace('/', '').split('@')[0]
+            args = text.split()[1:] if len(text.split()) > 1 else []
+            response_text, reply_markup = _handle_command(cmd, args, chat_id)
+        
+        if callback_data:
+            response_text, reply_markup = _handle_callback(callback_data, chat_id, message_id)
+        
+        # Send response
+        if response_text:
+            payload = {
+                'chat_id': chat_id,
+                'text': response_text,
+                'parse_mode': 'HTML'
+            }
+            if reply_markup:
+                payload['reply_markup'] = reply_markup
+            
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json=payload
+            )
+            
+    except Exception as e:
+        logger.error(f"Error handling update: {e}")
+
+
+def _handle_command(cmd: str, args: list, chat_id: int) -> tuple:
+    """Handle a command and return (response_text, reply_markup)"""
+    global _price_alerts
+    ds = DesignSystem
+    
+    if cmd == 'start':
+        return _build_start_menu()
+    
+    elif cmd == 'help':
+        return _build_help_menu()
+    
+    elif cmd == 'pause':
+        set_trading_paused(True)
+        return (f"{ds.STATUS_WARNING} <b>TRADING PAUSED</b>\n\nNo new positions will be opened.\nUse /resume to continue.", None)
+    
+    elif cmd == 'resume':
+        set_trading_paused(False)
+        return (f"{ds.STATUS_SUCCESS} <b>TRADING RESUMED</b>\n\nBot will process signals normally.", None)
+    
+    elif cmd == 'stats':
+        return _build_stats_response()
+    
+    elif cmd == 'rl':
+        return _build_rl_response()
+    
+    elif cmd == 'setalert':
+        if len(args) >= 2:
+            try:
+                symbol = args[0].upper()
+                price = float(args[1])
+                if symbol not in _price_alerts:
+                    _price_alerts[symbol] = []
+                _price_alerts[symbol].append({'price': price, 'triggered': False})
+                return (f"{ds.ICON_BELL} Alert set for {symbol} at ${price:,.2f}", None)
+            except:
+                pass
+        return (f"{ds.STATUS_WARNING} Usage: /setalert SYMBOL PRICE\nExample: /setalert BTCUSD 100000", None)
+    
+    elif cmd == 'alerts':
+        return _build_alerts_response()
+    
+    elif cmd == 'clearalerts':
+        count = sum(len(a) for a in _price_alerts.values())
+        _price_alerts.clear()
+        return (f"{ds.STATUS_SUCCESS} Cleared {count} alert(s)", None)
+    
+    elif cmd == 'status':
+        return _build_status_response()
+    
+    elif cmd == 'positions':
+        return _build_positions_response()
+    
+    return (f"Unknown command: /{cmd}\nUse /help for available commands.", None)
+
+
+def _handle_callback(data: str, chat_id: int, message_id: int = None) -> tuple:
+    """Handle a callback button press"""
+    
+    if data == 'start':
+        return _build_start_menu()
+    elif data == 'menu_trading':
+        return _build_trading_menu()
+    elif data == 'menu_analysis':
+        return _build_analysis_menu()
+    elif data == 'menu_performance':
+        return _build_performance_menu()
+    elif data == 'menu_settings':
+        return _build_settings_menu()
+    elif data == 'toggle_pause':
+        global _trading_paused
+        _trading_paused = not _trading_paused
+        return _build_start_menu()
+    elif data == 'status':
+        return _build_status_response()
+    elif data == 'positions':
+        return _build_positions_response()
+    elif data == 'stats':
+        return _build_stats_response()
+    elif data == 'rl':
+        return _build_rl_response()
+    elif data == 'help':
+        return _build_help_menu()
+    elif data == 'alerts':
+        return _build_alerts_response()
+    
+    return (f"Action: {data}", None)
+
+
+def _build_start_menu() -> tuple:
+    """Build the start menu response"""
+    ds = DesignSystem
+    session_icon, session_name = ds.get_session_icon()
+    
+    pos_count = len(CURRENT_POSITIONS)
+    daily_pnl = DAILY_STATS['pnl']
+    daily_trades = DAILY_STATS['trades']
+    win_rate = (DAILY_STATS['wins'] / max(daily_trades, 1)) * 100
+    
+    pnl_indicator = ds.STATUS_SUCCESS if daily_pnl >= 0 else ds.STATUS_ERROR
+    paused_status = "⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"
+    
+    trader = get_live_trader()
+    rl_status = "🟢" if (trader and hasattr(trader, 'use_rl') and trader.use_rl) else "⚪"
+    
+    text = f"""
+{ds.ICON_ROCKET} <b>V8 ICT TRADING BOT</b>
+{ds.SEP_THICK}
+
+{session_icon} <i>{session_name}</i> | {rl_status} RL | {paused_status}
+
+<b>Quick Stats</b>
+{ds.SEP_THIN}
+{ds.ICON_CHART} Positions: <b>{pos_count}</b> active
+{pnl_indicator} Today: <b>${daily_pnl:+,.2f}</b>
+{ds.ICON_TARGET} Trades: {daily_trades} ({win_rate:.0f}% win)
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    
+    keyboard = {
+        'inline_keyboard': [
+            [
+                {'text': '📊 Dashboard', 'callback_data': 'status'},
+                {'text': '📈 Positions', 'callback_data': 'positions'},
+            ],
+            [
+                {'text': '💼 Trading', 'callback_data': 'menu_trading'},
+                {'text': '📉 Analysis', 'callback_data': 'menu_analysis'},
+            ],
+            [
+                {'text': '💰 Performance', 'callback_data': 'menu_performance'},
+                {'text': '⚙️ Settings', 'callback_data': 'menu_settings'},
+            ],
+            [
+                {'text': '🤖 RL Agent', 'callback_data': 'rl'},
+                {'text': paused_status, 'callback_data': 'toggle_pause'},
+            ],
+        ]
+    }
+    
+    return (text, keyboard)
+
+
+def _build_help_menu() -> tuple:
+    """Build help menu"""
+    ds = DesignSystem
+    
+    text = f"""
+{ds.STATUS_INFO} <b>V8 HELP & COMMANDS</b>
+{ds.SEP_THICK}
+
+<b>Trading Control</b>
+<code>/pause</code> - Pause trading
+<code>/resume</code> - Resume trading
+<code>/status</code> - Dashboard
+<code>/positions</code> - Open positions
+
+<b>Alerts</b>
+<code>/setalert SYMBOL PRICE</code>
+<code>/alerts</code> - View alerts
+<code>/clearalerts</code> - Clear all
+
+<b>Performance</b>
+<code>/stats</code> - Full statistics
+<code>/rl</code> - RL agent status
+
+{ds.SEP_DOT}
+V8 ICT Trading Bot + RL
+"""
+    
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': '🏠 Home', 'callback_data': 'start'}]
+        ]
+    }
+    
+    return (text, keyboard)
+
+
+def _build_trading_menu() -> tuple:
+    """Build trading submenu"""
+    ds = DesignSystem
+    paused_btn = "▶️ Resume" if _trading_paused else "⏸️ Pause"
+    
+    text = f"""
+{ds.ICON_CHART} <b>TRADING MENU</b>
+{ds.SEP_THICK}
+
+Status: {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+Positions: {len(CURRENT_POSITIONS)} open
+"""
+    
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': paused_btn + ' Trading', 'callback_data': 'toggle_pause'}],
+            [{'text': '📈 Positions', 'callback_data': 'positions'}],
+            [{'text': '🏠 Back', 'callback_data': 'start'}],
+        ]
+    }
+    
+    return (text, keyboard)
+
+
+def _build_analysis_menu() -> tuple:
+    """Build analysis submenu"""
+    ds = DesignSystem
+    alert_count = sum(len(a) for a in _price_alerts.values())
+    
+    text = f"""
+{ds.ICON_ZAP} <b>ANALYSIS MENU</b>
+{ds.SEP_THICK}
+
+Active Alerts: {alert_count}
+
+Use <code>/setalert SYMBOL PRICE</code> to set alerts
+"""
+    
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': '🔔 View Alerts', 'callback_data': 'alerts'}],
+            [{'text': '🏠 Back', 'callback_data': 'start'}],
+        ]
+    }
+    
+    return (text, keyboard)
+
+
+def _build_performance_menu() -> tuple:
+    """Build performance submenu"""
+    ds = DesignSystem
+    
+    text = f"""
+{ds.ICON_CHART} <b>PERFORMANCE MENU</b>
+{ds.SEP_THICK}
+
+Today: ${DAILY_STATS['pnl']:+,.2f}
+Trades: {DAILY_STATS['trades']}
+"""
+    
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': '📈 Full Stats', 'callback_data': 'stats'}],
+            [{'text': '🏠 Back', 'callback_data': 'start'}],
+        ]
+    }
+    
+    return (text, keyboard)
+
+
+def _build_settings_menu() -> tuple:
+    """Build settings submenu"""
+    ds = DesignSystem
+    
+    trader = get_live_trader()
+    rl_enabled = trader and hasattr(trader, 'use_rl') and trader.use_rl
+    
+    text = f"""
+{ds.ICON_CONFIG} <b>SETTINGS MENU</b>
+{ds.SEP_THICK}
+
+Trading: {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+RL Agent: {"🟢 Enabled" if rl_enabled else "⚪ Disabled"}
+"""
+    
+    keyboard = {
+        'inline_keyboard': [
+            [{'text': '🤖 RL Status', 'callback_data': 'rl'}],
+            [{'text': '❓ Help', 'callback_data': 'help'}],
+            [{'text': '🏠 Back', 'callback_data': 'start'}],
+        ]
+    }
+    
+    return (text, keyboard)
+
+
+def _build_stats_response() -> tuple:
+    """Build stats response"""
+    ds = DesignSystem
+    
+    total_trades = len(TRADE_HISTORY)
+    if total_trades == 0:
+        return (f"{ds.STATUS_INFO} No trades to analyze yet.", None)
+    
+    wins = [t for t in TRADE_HISTORY if t.get('pnl', 0) > 0]
+    losses = [t for t in TRADE_HISTORY if t.get('pnl', 0) <= 0]
+    win_rate = len(wins) / total_trades * 100
+    
+    gross_profit = sum(t['pnl'] for t in wins) if wins else 0
+    gross_loss = abs(sum(t['pnl'] for t in losses)) if losses else 0
+    net_pnl = gross_profit - gross_loss
+    
+    text = f"""
+{ds.ICON_CHART} <b>PERFORMANCE STATS</b>
+{ds.SEP_THICK}
+
+<b>Overview</b>
+Total Trades: {total_trades}
+Win Rate: {win_rate:.1f}%
+Net P&L: ${net_pnl:+,.2f}
+
+<b>Details</b>
+Wins: {len(wins)} (+${gross_profit:,.2f})
+Losses: {len(losses)} (-${gross_loss:,.2f})
+"""
+    
+    keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
+    return (text, keyboard)
+
+
+def _build_rl_response() -> tuple:
+    """Build RL agent response"""
+    ds = DesignSystem
+    
+    trader = get_live_trader()
+    
+    if trader and hasattr(trader, 'signal_gen') and hasattr(trader.signal_gen, 'rl_agent') and trader.signal_gen.rl_agent:
+        text = f"""
+{ds.ICON_ZAP} <b>RL AGENT STATUS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_SUCCESS} RL Agent: <b>ACTIVE</b>
+
+The RL agent is making entry/exit decisions
+based on the trained model.
+"""
+    else:
+        text = f"""
+{ds.ICON_ZAP} <b>RL AGENT STATUS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_WARNING} RL Agent: <b>INACTIVE</b>
+
+Start with --rl-model to enable.
+"""
+    
+    keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
+    return (text, keyboard)
+
+
+def _build_alerts_response() -> tuple:
+    """Build alerts response"""
+    ds = DesignSystem
+    
+    if not _price_alerts or all(len(a) == 0 for a in _price_alerts.values()):
+        return (f"{ds.ICON_BELL} No active alerts.\n\nUse /setalert SYMBOL PRICE to create one.", None)
+    
+    lines = []
+    for symbol, alerts in _price_alerts.items():
+        for alert in alerts:
+            if not alert.get('triggered'):
+                lines.append(f"  • {symbol}: ${alert['price']:,.2f}")
+    
+    text = f"""
+{ds.ICON_BELL} <b>PRICE ALERTS</b>
+{ds.SEP_THICK}
+
+{chr(10).join(lines) if lines else 'No active alerts'}
+
+Use /clearalerts to remove all
+"""
+    
+    keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
+    return (text, keyboard)
+
+
+def _build_status_response() -> tuple:
+    """Build status/dashboard response"""
+    ds = DesignSystem
+    session_icon, session_name = ds.get_session_icon()
+    
+    text = f"""
+{ds.ICON_CHART} <b>TRADING DASHBOARD</b>
+{ds.SEP_THICK}
+
+{session_icon} {session_name}
+Status: {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+
+<b>Today</b>
+P&L: ${DAILY_STATS['pnl']:+,.2f}
+Trades: {DAILY_STATS['trades']}
+Wins: {DAILY_STATS['wins']}
+
+<b>Positions</b>
+Open: {len(CURRENT_POSITIONS)}
+"""
+    
+    keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
+    return (text, keyboard)
+
+
+def _build_positions_response() -> tuple:
+    """Build positions response"""
+    ds = DesignSystem
+    
+    if not CURRENT_POSITIONS:
+        return (f"{ds.ICON_CHART} No open positions.", None)
+    
+    lines = []
+    for symbol, pos in CURRENT_POSITIONS.items():
+        direction = "LONG" if pos.get('direction', 0) == 1 else "SHORT"
+        entry = pos.get('entry', 0)
+        lines.append(f"  • {symbol} {direction} @ ${entry:,.2f}")
+    
+    text = f"""
+{ds.ICON_CHART} <b>OPEN POSITIONS</b>
+{ds.SEP_THICK}
+
+{chr(10).join(lines)}
+"""
+    
+    keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
+    return (text, keyboard)
 
 
 def stop_polling():
     """Stop the background polling"""
-    global _bot_thread, _event_loop
-    
-    if _event_loop:
-        try:
-            # Cancel all tasks
-            for task in asyncio.all_tasks(_event_loop):
-                task.cancel()
-        except:
-            pass
-    
+    global _bot_thread
     _bot_thread = None
-    _event_loop = None
+    logger.info("Polling stopped")
 
 
 # ============================================================================
