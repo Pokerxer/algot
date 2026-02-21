@@ -1,17 +1,19 @@
 """
-Telegram Notification Module for V5 Trading Bot
-=============================================
-Modern, beautiful notifications with interactive commands and animations.
+Telegram Notification Module for V8 ICT Trading Bot
+====================================================
+Modern, beautiful notifications with interactive commands and RL agent integration.
 
 Features:
 - Real-time trade notifications with visual animations
 - Interactive command menu with smart button layouts
 - Position tracking with live P&L updates
-- Advanced performance analytics
+- Advanced performance analytics with RL agent status
 - Market bias display with trend indicators
 - Confluence monitoring with visual gauges
 - Price alerts and watchlist management
 - Trade management commands (close, modify positions)
+- Trading control (pause/resume) via Telegram
+- RL agent monitoring and statistics
 """
 
 import os
@@ -594,45 +596,31 @@ class TelegramNotifier:
     # === Command Handlers ===
     
     async def _start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command with beautiful modern UI"""
+        """Handle /start command with compact submenu UI"""
         ds = DesignSystem
         session_icon, session_name = ds.get_session_icon()
         
-        # Create smart button layout with categories
+        # Compact menu with category submenus
+        paused_text = "⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"
         keyboard = [
-            # Row 1: Primary trading actions
+            # Row 1: Status overview
             [
                 InlineKeyboardButton("📊 Dashboard", callback_data="status"),
                 InlineKeyboardButton("📈 Positions", callback_data="positions"),
             ],
-            # Row 2: Trading operations
+            # Row 2: Category submenus
             [
-                InlineKeyboardButton("🎯 Close Pos", callback_data="close"),
-                InlineKeyboardButton("✏️ Modify", callback_data="modify"),
-                InlineKeyboardButton("👀 Watchlist", callback_data="watchlist"),
+                InlineKeyboardButton("💼 Trading", callback_data="menu_trading"),
+                InlineKeyboardButton("📉 Analysis", callback_data="menu_analysis"),
             ],
-            # Row 3: Analysis
             [
-                InlineKeyboardButton("⚡ Live Prices", callback_data="price"),
-                InlineKeyboardButton("🔮 Market Bias", callback_data="bias"),
+                InlineKeyboardButton("💰 Performance", callback_data="menu_performance"),
+                InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
             ],
-            # Row 4: Performance
+            # Row 3: Quick actions
             [
-                InlineKeyboardButton("💰 P&L", callback_data="pnl"),
-                InlineKeyboardButton("📈 Performance", callback_data="performance"),
-                InlineKeyboardButton("📜 History", callback_data="trades"),
-            ],
-            # Row 5: Risk & Tools
-            [
-                InlineKeyboardButton("⚠️ Risk", callback_data="risk"),
-                InlineKeyboardButton("⚡ Confluence", callback_data="confluence"),
-                InlineKeyboardButton("📊 Summary", callback_data="summary"),
-            ],
-            # Row 6: Settings & Help
-            [
-                InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-                InlineKeyboardButton("🔔 Alerts", callback_data="alerts"),
-                InlineKeyboardButton("❓ Help", callback_data="help"),
+                InlineKeyboardButton(f"🤖 RL Agent", callback_data="rl"),
+                InlineKeyboardButton(f"{paused_text}", callback_data="toggle_pause"),
             ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -650,11 +638,15 @@ class TelegramNotifier:
         elif DAILY_STATS['streak'] < 0:
             streak_text = f" | {abs(DAILY_STATS['streak'])}L streak"
         
+        # RL status indicator
+        trader = get_live_trader()
+        rl_status = "🟢" if (trader and hasattr(trader, 'use_rl') and trader.use_rl) else "⚪"
+        
         message = f"""
-{ds.ICON_ROCKET} <b>V5 ICT TRADING BOT</b>
+{ds.ICON_ROCKET} <b>V8 ICT TRADING BOT</b>
 {ds.SEP_THICK}
 
-{session_icon} <i>{session_name}</i>
+{session_icon} <i>{session_name}</i> | {rl_status} RL | {"⏸️" if _trading_paused else "▶️"} {"Paused" if _trading_paused else "Active"}
 
 <b>Quick Stats</b>
 {ds.SEP_THIN}
@@ -665,11 +657,10 @@ class TelegramNotifier:
 {ds.SEP_THICK}
 <b>Quick Commands</b>
 {ds.SEP_THIN}
-<code>/status</code>  - Full dashboard
-<code>/price</code>   - Live prices
-<code>/close</code>   - Close positions
-<code>/alert</code>   - Set price alerts
-<code>/help</code>    - All commands
+<code>/pause</code> <code>/resume</code> - Control trading
+<code>/stats</code> - Performance stats
+<code>/setalert SYMBOL PRICE</code> - Price alert
+<code>/rl</code> - RL agent status
 
 {ds.SEP_DOT}
 {ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')} | {datetime.now().strftime('%b %d, %Y')}
@@ -1744,7 +1735,7 @@ Prices from IBKR (real-time)
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         message = f"""
-{ds.STATUS_INFO} <b>HELP & COMMANDS</b>
+{ds.STATUS_INFO} <b>V8 HELP & COMMANDS</b>
 {ds.SEP_THICK}
 
 <b>Dashboard</b>
@@ -1754,13 +1745,13 @@ Prices from IBKR (real-time)
 <code>/positions</code> - Open positions
 <code>/trades</code>    - Trade history
 
-<b>Trading</b>
+<b>Trading Control</b>
 {ds.SEP_THIN}
+<code>/pause</code>     - Pause trading
+<code>/resume</code>    - Resume trading
 <code>/close</code>     - Close position
 <code>/modify</code>    - Modify SL/TP
 <code>/watchlist</code> - View watchlist
-<code>/add</code>       - Add to watchlist
-<code>/remove</code>    - Remove from watchlist
 
 <b>Analysis</b>
 {ds.SEP_THIN}
@@ -1771,18 +1762,26 @@ Prices from IBKR (real-time)
 
 <b>Performance</b>
 {ds.SEP_THIN}
+<code>/stats</code>     - Full statistics
 <code>/pnl</code>       - P&L breakdown
-<code>/performance</code> - Analytics
 <code>/risk</code>      - Risk dashboard
-<code>/compare</code>   - Symbol comparison
 <code>/summary</code>   - Daily summary
 <code>/export</code>    - Export trades
+
+<b>Alerts</b>
+{ds.SEP_THIN}
+<code>/setalert SYMBOL PRICE</code>
+<code>/alerts</code>    - View alerts
+<code>/clearalerts</code> - Clear all
+
+<b>RL Agent</b>
+{ds.SEP_THIN}
+<code>/rl</code>        - RL agent status
 
 <b>Settings</b>
 {ds.SEP_THIN}
 <code>/settings</code>  - Configuration
-<code>/alerts</code>    - Toggle alerts
-<code>/alert</code>     - Price alerts
+<code>/help</code>      - This help
 
 {ds.SEP_THICK}
 <b>Legend</b>
@@ -1790,12 +1789,10 @@ Prices from IBKR (real-time)
 {ds.STATUS_SUCCESS} Profit/Win/Bullish
 {ds.STATUS_ERROR} Loss/Bearish
 {ds.STATUS_WARNING} Medium/Warning
-{ds.SESSION_LONDON} Kill Zone Active
-{ds.ICON_ZAP} Live Data
-{ds.ICON_FIRE} Hot/Streak
+🟢 RL Active | ⏸️ Paused
 
 {ds.SEP_DOT}
-V5 ICT Trading Bot
+V8 ICT Trading Bot + RL
 """
         await message_obj.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
     
@@ -2612,6 +2609,32 @@ Start the bot with --rl-model to enable.
             )
             return
         
+        # Handle submenu navigation
+        if callback_data == "menu_trading":
+            await self._menu_trading(update, context)
+            return
+        elif callback_data == "menu_analysis":
+            await self._menu_analysis(update, context)
+            return
+        elif callback_data == "menu_performance":
+            await self._menu_performance(update, context)
+            return
+        elif callback_data == "menu_settings":
+            await self._menu_settings(update, context)
+            return
+        elif callback_data == "toggle_pause":
+            await self._toggle_pause(update, context)
+            return
+        elif callback_data == "rl":
+            await self._rl_command(update, context)
+            return
+        elif callback_data == "setalert_prompt":
+            await self._setalert_prompt(update, context)
+            return
+        elif callback_data == "stats":
+            await self._stats_command(update, context)
+            return
+        
         # Handle navigation commands
         command_map = {
             "start": self._start_command,
@@ -2639,6 +2662,281 @@ Start the bot with --rl-model to enable.
         handler = command_map.get(callback_data)
         if handler:
             await handler(update, context)
+    
+    async def _menu_trading(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Trading submenu"""
+        query = update.callback_query
+        ds = DesignSystem
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🎯 Close Position", callback_data="close"),
+                InlineKeyboardButton("✏️ Modify SL/TP", callback_data="modify"),
+            ],
+            [
+                InlineKeyboardButton("👀 Watchlist", callback_data="watchlist"),
+                InlineKeyboardButton("➕ Add Symbol", callback_data="add_watchlist"),
+            ],
+            [
+                InlineKeyboardButton("⏸️ Pause Trading", callback_data="toggle_pause") if not _trading_paused else InlineKeyboardButton("▶️ Resume Trading", callback_data="toggle_pause"),
+            ],
+            [InlineKeyboardButton("🏠 Back to Menu", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = f"""
+{ds.ICON_CHART} <b>TRADING MENU</b>
+{ds.SEP_THICK}
+
+<b>Position Management</b>
+{ds.SEP_THIN}
+• Close Position - Exit an open trade
+• Modify SL/TP - Adjust stop loss/take profit
+• Watchlist - View/manage watched symbols
+
+<b>Trading Status</b>
+{ds.SEP_THIN}
+• Status: {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+• Positions: {len(CURRENT_POSITIONS)} open
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        if query and query.message:
+            await query.message.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    
+    async def _menu_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Analysis submenu"""
+        query = update.callback_query
+        ds = DesignSystem
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("⚡ Live Prices", callback_data="price"),
+                InlineKeyboardButton("🔮 Market Bias", callback_data="bias"),
+            ],
+            [
+                InlineKeyboardButton("📊 Confluence", callback_data="confluence"),
+                InlineKeyboardButton("📈 Chart", callback_data="chart"),
+            ],
+            [
+                InlineKeyboardButton("🔔 Set Alert", callback_data="setalert_prompt"),
+                InlineKeyboardButton("📋 View Alerts", callback_data="alerts"),
+            ],
+            [InlineKeyboardButton("🏠 Back to Menu", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Count active alerts
+        alert_count = sum(len(alerts) for alerts in _price_alerts.values())
+        
+        message = f"""
+{ds.ICON_ZAP} <b>ANALYSIS MENU</b>
+{ds.SEP_THICK}
+
+<b>Market Data</b>
+{ds.SEP_THIN}
+• Live Prices - Real-time IBKR prices
+• Market Bias - HTF trend analysis
+• Confluence - Signal strength check
+
+<b>Alerts</b>
+{ds.SEP_THIN}
+• Active Alerts: {alert_count}
+• Use <code>/setalert SYMBOL PRICE</code>
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        if query and query.message:
+            await query.message.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    
+    async def _menu_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Performance submenu"""
+        query = update.callback_query
+        ds = DesignSystem
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("💰 P&L Today", callback_data="pnl"),
+                InlineKeyboardButton("📈 Full Stats", callback_data="stats"),
+            ],
+            [
+                InlineKeyboardButton("📜 Trade History", callback_data="trades"),
+                InlineKeyboardButton("📊 Summary", callback_data="summary"),
+            ],
+            [
+                InlineKeyboardButton("⚠️ Risk Dashboard", callback_data="risk"),
+                InlineKeyboardButton("📁 Export", callback_data="export"),
+            ],
+            [InlineKeyboardButton("🏠 Back to Menu", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Quick stats
+        total_trades = len(TRADE_HISTORY)
+        daily_pnl = DAILY_STATS['pnl']
+        win_rate = (DAILY_STATS['wins'] / max(DAILY_STATS['trades'], 1)) * 100
+        
+        pnl_icon = ds.STATUS_SUCCESS if daily_pnl >= 0 else ds.STATUS_ERROR
+        
+        message = f"""
+{ds.ICON_CHART} <b>PERFORMANCE MENU</b>
+{ds.SEP_THICK}
+
+<b>Today's Summary</b>
+{ds.SEP_THIN}
+{pnl_icon} P&L: <b>${daily_pnl:+,.2f}</b>
+• Trades: {DAILY_STATS['trades']}
+• Win Rate: {win_rate:.1f}%
+
+<b>All-Time</b>
+{ds.SEP_THIN}
+• Total Trades: {total_trades}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        if query and query.message:
+            await query.message.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    
+    async def _menu_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Settings submenu"""
+        query = update.callback_query
+        ds = DesignSystem
+        
+        # Get current settings
+        notifications_on = BOT_SETTINGS.get('notifications_enabled', True)
+        signal_alerts_on = BOT_SETTINGS.get('signal_alerts', True)
+        trade_alerts_on = BOT_SETTINGS.get('trade_alerts', True)
+        
+        keyboard = [
+            [
+                InlineKeyboardButton(f"{'🔔' if notifications_on else '🔕'} Notifications", callback_data="toggle_all_alerts"),
+                InlineKeyboardButton("⚙️ Config", callback_data="settings"),
+            ],
+            [
+                InlineKeyboardButton(f"{'✅' if signal_alerts_on else '❌'} Signal Alerts", callback_data="toggle_signal_alerts"),
+                InlineKeyboardButton(f"{'✅' if trade_alerts_on else '❌'} Trade Alerts", callback_data="toggle_trade_alerts"),
+            ],
+            [
+                InlineKeyboardButton("🤖 RL Agent Status", callback_data="rl"),
+                InlineKeyboardButton("❓ Help", callback_data="help"),
+            ],
+            [InlineKeyboardButton("🏠 Back to Menu", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Get RL status
+        trader = get_live_trader()
+        rl_enabled = trader and hasattr(trader, 'use_rl') and trader.use_rl
+        
+        message = f"""
+{ds.ICON_CONFIG} <b>SETTINGS MENU</b>
+{ds.SEP_THICK}
+
+<b>Notifications</b>
+{ds.SEP_THIN}
+• All Notifications: {'🔔 ON' if notifications_on else '🔕 OFF'}
+• Signal Alerts: {'✅ ON' if signal_alerts_on else '❌ OFF'}
+• Trade Alerts: {'✅ ON' if trade_alerts_on else '❌ OFF'}
+
+<b>Bot Status</b>
+{ds.SEP_THIN}
+• Trading: {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+• RL Agent: {"🟢 Enabled" if rl_enabled else "⚪ Disabled"}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        if query and query.message:
+            await query.message.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    
+    async def _toggle_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Toggle trading pause state"""
+        global _trading_paused
+        query = update.callback_query
+        ds = DesignSystem
+        
+        _trading_paused = not _trading_paused
+        
+        if _trading_paused:
+            message = f"""
+{ds.STATUS_WARNING} <b>TRADING PAUSED</b>
+{ds.SEP_THICK}
+
+{ds.ICON_LOCK} Trading is now <b>PAUSED</b>
+
+• No new positions will be opened
+• Existing positions remain active
+• Use the menu or /resume to resume
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+            send_notification(f"{ds.STATUS_WARNING} Trading PAUSED via menu")
+        else:
+            message = f"""
+{ds.STATUS_SUCCESS} <b>TRADING RESUMED</b>
+{ds.SEP_THICK}
+
+{ds.ICON_UNLOCK} Trading is now <b>ACTIVE</b>
+
+• Bot will process new signals
+• All systems operational
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+            send_notification(f"{ds.STATUS_SUCCESS} Trading RESUMED via menu")
+        
+        keyboard = [[InlineKeyboardButton("🏠 Back to Menu", callback_data="start")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if query and query.message:
+            await query.message.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    
+    async def _setalert_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show prompt for setting price alerts"""
+        query = update.callback_query
+        ds = DesignSystem
+        
+        # Get current trading symbols
+        trader = get_live_trader()
+        symbols = trader.symbols if trader and hasattr(trader, 'symbols') else ['BTCUSD', 'ETHUSD', 'SOLUSD']
+        
+        symbol_list = ', '.join(symbols[:5])
+        
+        message = f"""
+{ds.ICON_BELL} <b>SET PRICE ALERT</b>
+{ds.SEP_THICK}
+
+<b>Usage:</b>
+<code>/setalert SYMBOL PRICE</code>
+
+<b>Examples:</b>
+<code>/setalert BTCUSD 100000</code>
+<code>/setalert ETHUSD 4000</code>
+<code>/setalert ES 5500</code>
+
+<b>Active Symbols:</b>
+{symbol_list}
+
+{ds.SEP_THIN}
+<b>Current Alerts:</b> {sum(len(a) for a in _price_alerts.values())}
+
+{ds.SEP_DOT}
+Use /alerts to view all alerts
+Use /clearalerts to remove all
+"""
+        keyboard = [
+            [InlineKeyboardButton("📋 View Alerts", callback_data="alerts")],
+            [InlineKeyboardButton("🏠 Back to Menu", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if query and query.message:
+            await query.message.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
 
 
 # Global notifier instance
