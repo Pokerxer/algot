@@ -22,7 +22,7 @@ import time
 import pickle
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Import V8 signal generator
 from v8_backtest import V8SignalGenerator, TrainingConfig
@@ -58,6 +58,8 @@ try:
     from ib_insync import IB, util
     IBKR_AVAILABLE = True
 except ImportError:
+    IB = None  # type: ignore
+    util = None  # type: ignore
     IBKR_AVAILABLE = False
     print("WARNING: ib_insync not installed. Run: pip install ib_insync")
 
@@ -67,7 +69,7 @@ class V8LiveTrader:
     
     def __init__(
         self,
-        ib: 'IB',
+        ib: Any,  # IB connection object
         symbols: List[str],
         risk_pct: float = 0.02,
         poll_interval: int = 30,
@@ -75,7 +77,8 @@ class V8LiveTrader:
         rr_ratio: float = 4.0,  # Risk:Reward ratio (1:4)
         confluence_threshold: int = 60,
         use_rl: bool = True,
-        rl_model_path: Optional[str] = None
+        rl_model_path: Optional[str] = None,
+        port: int = 7497  # IBKR port for reconnection
     ):
         self.ib = ib
         self.symbols = symbols
@@ -85,6 +88,7 @@ class V8LiveTrader:
         self.rr_ratio = rr_ratio
         self.confluence_threshold = confluence_threshold
         self.use_rl = use_rl
+        self.port = port  # Store port for reconnection
         
         # State tracking
         self.positions = {}
@@ -107,6 +111,8 @@ class V8LiveTrader:
         self.streaming_symbols = set()
         self.last_poll_time = {}
         self.bar_handlers = {}
+        self.last_signal_time = {}  # Track when we last checked signals per symbol
+        self.last_hourly_bar = {}   # Track last hourly bar timestamp per symbol
         
         # Initialize
         self._init_account()
@@ -153,6 +159,8 @@ class V8LiveTrader:
                 data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=True)
                 if data and len(data.get('closes', [])) >= 50:
                     self.historical_data[symbol] = data
+                    # Track initial bar count for new bar detection
+                    self.last_hourly_bar[symbol] = len(data['closes'])
                     print(f"  {symbol}: {len(data['closes'])} bars loaded")
                 else:
                     print(f"  {symbol}: Failed to load data")
@@ -195,14 +203,43 @@ class V8LiveTrader:
         
         # Check daily loss limit
         if self.daily_pnl <= self.max_daily_loss:
-            print(f"[{symbol}] Daily loss limit reached (${self.daily_pnl:.2f}). Not trading.")
-            return
+            return  # Silently skip - already logged once
         
-        # Check position management
+        # Check position management first
         if symbol in self.positions:
             self._manage_position(symbol, current_price)
         else:
+            # Only check for new entry once per hour to prevent duplicate signals
+            current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+            last_signal = self.last_signal_time.get(symbol)
+            
+            if last_signal and last_signal >= current_hour:
+                return  # Already checked this hour
+            
             self._check_entry(symbol, current_price)
+    
+    def _refresh_hourly_data(self):
+        """Refresh hourly data for all symbols and check for new bars."""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Refreshing hourly data...")
+        for symbol in self.symbols:
+            try:
+                old_bar_count = len(self.historical_data.get(symbol, {}).get('closes', []))
+                data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=False)  # Force refresh
+                if data and len(data.get('closes', [])) >= 50:
+                    new_bar_count = len(data['closes'])
+                    self.historical_data[symbol] = data
+                    
+                    # Check if we have a new bar
+                    if new_bar_count > old_bar_count:
+                        print(f"  {symbol}: {new_bar_count} bars (NEW BAR DETECTED)")
+                        # New bar detected - check for signal
+                        if symbol not in self.positions:
+                            self._check_entry(symbol, data['closes'][-1])
+                    else:
+                        print(f"  {symbol}: {new_bar_count} bars")
+            except Exception as e:
+                print(f"  {symbol}: Error - {e}")
+        print("")
     
     def _check_entry(self, symbol: str, current_price: float):
         """Check for entry signal using V8 + RL."""
@@ -212,6 +249,10 @@ class V8LiveTrader:
             
             # Get V8 signal with RL
             signal = self.signal_gen.generate_signal(data, idx)
+            
+            # Track that we checked this hour (even if no signal)
+            current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+            self.last_signal_time[symbol] = current_hour
             
             if not signal:
                 return
@@ -268,7 +309,7 @@ class V8LiveTrader:
             print(f"[{symbol}] Error checking entry: {e}")
     
     def _execute_entry(self, symbol: str, signal: Dict, entry_price: float,
-                       stop: float, target: float, qty: int):
+                       stop: float, target: float, qty: float):
         """Execute entry order via IBKR."""
         try:
             contract = get_ibkr_contract(symbol)
@@ -477,7 +518,7 @@ class V8LiveTrader:
             print(f"[{symbol}] Error handling position close: {e}")
     
     def _log_shadow_trade(self, symbol: str, signal: Dict, entry: float,
-                          stop: float, target: float, qty: int):
+                          stop: float, target: float, qty: float):
         """Log shadow trade to file."""
         try:
             trade = {
@@ -511,6 +552,10 @@ class V8LiveTrader:
         print(f"Account Value: ${self.account_value:,.2f}")
         print(f"{'='*60}\n")
         
+        # Track last signal time to prevent duplicate trades
+        self.last_signal_time = {}
+        self.last_hourly_refresh = {}
+        
         # Start streaming for each symbol
         for symbol in self.symbols:
             try:
@@ -535,25 +580,134 @@ class V8LiveTrader:
                 print(f"[{symbol}] Streaming failed: {e}")
                 print(f"[{symbol}] Will use polling instead")
         
-        # Main loop
+        # Main loop with auto-reconnection for nightly IBKR restart
         print("\nTrading started. Press Ctrl+C to stop.\n")
+        print("NOTE: Signals are checked on hourly bar close. Data refreshes every hour.")
+        print("Auto-reconnect enabled for nightly IBKR restart (~11:45 PM ET).\n")
         
         try:
+            iteration = 0
+            reconnect_attempts = 0
+            max_reconnect_attempts = 10
+            
             while True:
-                self.ib.sleep(1)
+                try:
+                    # Check if still connected
+                    if not self.ib.isConnected():
+                        raise ConnectionError("IBKR connection lost")
+                    
+                    self.ib.sleep(1)
+                    iteration += 1
+                    reconnect_attempts = 0  # Reset on successful iteration
+                    
+                    # Refresh hourly data every 5 minutes for all symbols
+                    if iteration % 300 == 0:
+                        self._refresh_hourly_data()
+                    
+                    # Poll symbols that aren't streaming
+                    current_time = time.time()
+                    for symbol in self.symbols:
+                        if symbol not in self.streaming_symbols:
+                            last_poll = self.last_poll_time.get(symbol, 0)
+                            if current_time - last_poll >= self.poll_interval:
+                                self._poll_symbol(symbol)
+                                self.last_poll_time[symbol] = current_time
                 
-                # Poll symbols that aren't streaming
-                current_time = time.time()
-                for symbol in self.symbols:
-                    if symbol not in self.streaming_symbols:
-                        last_poll = self.last_poll_time.get(symbol, 0)
-                        if current_time - last_poll >= self.poll_interval:
-                            self._poll_symbol(symbol)
-                            self.last_poll_time[symbol] = current_time
+                except (ConnectionError, OSError, Exception) as e:
+                    error_msg = str(e)
+                    if 'connection' in error_msg.lower() or 'disconnect' in error_msg.lower() or not self.ib.isConnected():
+                        reconnect_attempts += 1
+                        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Connection lost: {e}")
+                        
+                        if reconnect_attempts > max_reconnect_attempts:
+                            print(f"Max reconnect attempts ({max_reconnect_attempts}) reached. Stopping.")
+                            break
+                        
+                        # Wait before reconnecting (longer wait during nightly restart window)
+                        current_hour = datetime.now().hour
+                        if 23 <= current_hour or current_hour < 1:
+                            # Nightly restart window - wait longer
+                            wait_time = 120  # 2 minutes
+                            print(f"Nightly restart window detected. Waiting {wait_time}s before reconnect...")
+                        else:
+                            wait_time = 10 + (reconnect_attempts * 5)  # Progressive backoff
+                            print(f"Waiting {wait_time}s before reconnect (attempt {reconnect_attempts}/{max_reconnect_attempts})...")
+                        
+                        time.sleep(wait_time)
+                        
+                        # Attempt reconnection
+                        if self._reconnect():
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Reconnected successfully!")
+                            # Re-sync positions after reconnect
+                            self._sync_positions()
+                            # Re-initialize streaming
+                            self._restart_streaming()
+                            iteration = 0
+                        else:
+                            print(f"Reconnection failed. Will retry...")
+                    else:
+                        # Non-connection error, log and continue
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {e}")
                 
         except KeyboardInterrupt:
             print("\nStopping trader...")
             self.stop()
+    
+    def _reconnect(self) -> bool:
+        """Attempt to reconnect to IBKR."""
+        try:
+            # Disconnect first if partially connected
+            try:
+                self.ib.disconnect()
+            except:
+                pass
+            
+            time.sleep(2)
+            
+            # Try to reconnect using stored port
+            print(f"Attempting to reconnect to IBKR on port {self.port}...")
+            self.ib.connect('127.0.0.1', self.port, clientId=1, timeout=30)
+            
+            if self.ib.isConnected():
+                # Re-initialize account info
+                self._init_account()
+                return True
+            return False
+            
+        except Exception as e:
+            print(f"Reconnection error: {e}")
+            return False
+    
+    def _restart_streaming(self):
+        """Restart real-time data streaming after reconnection."""
+        print("Restarting data streams...")
+        
+        # Clear old handlers
+        self.bar_handlers = {}
+        self.streaming_symbols = set()
+        
+        # Re-subscribe to real-time bars
+        for symbol in self.symbols:
+            try:
+                contract = get_ibkr_contract(symbol)
+                bars = self.ib.reqRealTimeBars(contract, 5, 'MIDPOINT', False)
+                
+                def make_handler(sym):
+                    def handler(bars, hasNewBar):
+                        if hasNewBar and len(bars) > 0:
+                            self._on_realtime_bar(sym, bars[-1])
+                    return handler
+                
+                bars.updateEvent += make_handler(symbol)
+                self.bar_handlers[symbol] = bars
+                self.streaming_symbols.add(symbol)
+                print(f"  [{symbol}] Streaming restarted")
+                
+            except Exception as e:
+                print(f"  [{symbol}] Streaming failed: {e}")
+        
+        # Refresh historical data
+        self._refresh_hourly_data()
     
     def _poll_symbol(self, symbol: str):
         """Poll symbol for updates (fallback for non-streaming)."""
@@ -622,18 +776,64 @@ def main():
     
     if not IBKR_AVAILABLE:
         print("ERROR: ib_insync not installed")
+        print("Install with: pip install ib_insync")
         return
     
-    # Connect to IBKR
-    print("Connecting to IBKR...")
-    ib = IB()
+    # Connect to IBKR with retry logic
+    print("="*60)
+    print("V8 Live Trading System")
+    print("="*60)
+    print(f"IBKR Port: {args.port}")
+    print(f"Mode: {args.mode}")
+    print(f"Symbols: {args.symbols}")
+    print("="*60)
     
-    try:
-        ib.connect('127.0.0.1', args.port, clientId=1)
-        print("Connected to IBKR")
-    except Exception as e:
-        print(f"Failed to connect to IBKR: {e}")
-        print("Make sure TWS/IB Gateway is running with API enabled")
+    assert IB is not None, "IB should be available after IBKR_AVAILABLE check"
+    ib = IB()
+    connected = False
+    
+    # Try to connect with retries
+    for attempt in range(3):
+        try:
+            print(f"Connecting to IBKR (attempt {attempt + 1}/3)...", end=" ")
+            ib.connect('127.0.0.1', args.port, clientId=1, timeout=10)
+            connected = True
+            print("SUCCESS!")
+            break
+        except Exception as e:
+            print(f"FAILED - {e}")
+            if attempt < 2:
+                print("Retrying in 5 seconds...")
+                time.sleep(5)
+    
+    if not connected:
+        port = args.port
+        print("\n" + "="*60)
+        print("ERROR: Could not connect to IBKR")
+        print("="*60)
+        print(f"""
+To enable IBKR API:
+
+1. IB Gateway (recommended):
+   - Open IB Gateway
+   - Go to Settings (gear icon) → API
+   - Check "Enable API connections"
+   - Make sure port is correct (7497=paper, 7496=live)
+
+2. TWS (alternative):
+   - Open TWS
+   - File → Global Configuration → API
+   - Check "Enable ActiveX and Socket Clients"
+   - Uncheck "Read-Only API" if you want to trade
+
+3. Verify IB Gateway is running:
+   - Check that IB Gateway process is running
+   - Check firewall isn't blocking port {port}
+
+Current settings:
+- Port: {port} (try 7497 for paper, 7496 for live)
+- Host: 127.0.0.1 (localhost)
+""")
         return
     
     # Parse symbols
@@ -648,7 +848,8 @@ def main():
         rr_ratio=args.rr,
         confluence_threshold=args.confluence,
         use_rl=not args.no_rl,
-        rl_model_path=args.rl_model
+        rl_model_path=args.rl_model,
+        port=args.port  # Pass port for auto-reconnection
     )
     
     # Start trading

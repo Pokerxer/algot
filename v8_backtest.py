@@ -27,6 +27,7 @@ prepare_data_ibkr = ict_v5.prepare_data_ibkr
 get_signal = ict_v5.get_signal
 calculate_position_size = ict_v5.calculate_position_size
 get_contract_info = ict_v5.get_contract_info
+get_ibkr_contract = ict_v5.get_ibkr_contract
 
 # Import RL Agent
 from reinforcement_learning_agent import (
@@ -981,171 +982,250 @@ def run_v8_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
 
 
 if __name__ == "__main__":
-    import argparse
+    # Use IBKR for historical data
+    from ib_insync import IB, util
+    from datetime import datetime, timedelta
+    import time as time_module
     
-    parser = argparse.ArgumentParser(description='V8 Backtest with RL Agent')
-    parser.add_argument('--symbols', type=str, 
-                       default='BTCUSD,ETHUSD,ES,NQ,GC,SI,NG,CL',
-                       help='Comma-separated symbols')
-    parser.add_argument('--no-rl', action='store_true',
-                       help='Disable RL agent (use V7-like signals only)')
-    parser.add_argument('--rl-model', type=str, default=None,
-                       help='Path to pre-trained RL model')
-    parser.add_argument('--rr', type=float, default=4.0,
-                       help='Risk:Reward ratio (default: 4)')
-    parser.add_argument('--confluence', type=int, default=60,
-                       help='Minimum confluence threshold (default: 60)')
-    parser.add_argument('--train-episodes', type=int, default=3000,
-                       help='Training episodes (default: 3000)')
-    parser.add_argument('--months', type=int, default=6,
-                       help='Total months of data to fetch (default: 6)')
-    parser.add_argument('--train-ratio', type=float, default=0.75,
-                       help='Train/test split ratio (default: 0.75)')
-    
-    args = parser.parse_args()
-    
-    # Update symbols list
-    symbols = [s.strip() for s in args.symbols.split(',')]
-    # Import yfinance directly for longer historical data
-    import yfinance as yf
-    
-    # Map symbols to Yahoo format
-    yahoo_map = {
-        'BTCUSD': 'BTC-USD',
-        'ETHUSD': 'ETH-USD',
-        'ES': 'ES=F',
-        'NQ': 'NQ=F',
-        'GC': 'GC=F',
-        'SI': 'SI=F',
-        'NG': 'NG=F',
-        'CL': 'CL=F',
-    }
-    
-    def fetch_extended_data(symbol, months=12):
-        """Fetch extended historical data using yfinance"""
-        yahoo_symbol = yahoo_map.get(symbol, symbol)
+    def fetch_ibkr_extended_data(symbol, days=540, ib=None):
+        """Fetch extended historical data from IBKR (up to 540 days = 18 months)"""
         try:
-            # Fetch hourly data for the past 'months' months
-            df = yf.Ticker(yahoo_symbol).history(period=f"{months}mo", interval="1h")
-            df = df.dropna()
-            df = df[~df.index.duplicated(keep='first')]
-        except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
-            return None
-        
-        if len(df) < 100:
-            print(f"Not enough data for {symbol}: {len(df)} rows")
-            return None
-        
-        # Prepare data similar to prepare_data_ibkr - convert to numpy arrays
-        highs = np.array(df['High'])
-        lows = np.array(df['Low'])
-        closes = np.array(df['Close'])
-        opens = np.array(df['Open'])
-        
-        # Calculate FVG
-        bullish_fvgs = []
-        bearish_fvgs = []
-        for i in range(3, len(df)):
-            if lows[i] > highs[i-2]:
-                bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
-            if highs[i] < lows[i-2]:
-                bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
-        
-        # Daily data for HTF trend
-        df_daily = yf.Ticker(yahoo_symbol).history(period=f"{months}mo", interval="1d")
-        if df_daily is None or len(df_daily) < 5:
-            htf_trend = np.zeros(len(df))
-        else:
-            daily_highs = np.array(df_daily['High'])
-            daily_lows = np.array(df_daily['Low'])
-            htf = []
-            for i in range(1, len(df_daily)):
-                if daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] > np.min(daily_lows[max(0,i-5):i]):
-                    htf.append(1)
-                elif daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] < np.min(daily_lows[max(0,i-5):i]):
-                    htf.append(-1)
+            contract = get_ibkr_contract(symbol)
+            
+            # IBKR limits: max 1 year of hourly data per request
+            # We need to make multiple requests for longer periods
+            all_bars = []
+            
+            # For 18 months, we need to fetch in chunks
+            # IBKR allows ~365 days of hourly data per request
+            chunks = []
+            remaining_days = days
+            end_date = ''  # Empty string means "now"
+            
+            while remaining_days > 0:
+                chunk_days = min(remaining_days, 365)
+                chunks.append((chunk_days, end_date))
+                remaining_days -= chunk_days
+                # Calculate new end date (go back chunk_days)
+                if end_date == '':
+                    from datetime import datetime, timedelta
+                    end_dt = datetime.now() - timedelta(days=chunk_days)
                 else:
-                    htf.append(0)
+                    end_dt = datetime.strptime(end_date, '%Y%m%d %H:%M:%S') - timedelta(days=chunk_days)
+                end_date = end_dt.strftime('%Y%m%d %H:%M:%S')
             
-            htf_trend = np.zeros(len(df))
-            df_daily_index = pd.DatetimeIndex(df_daily.index).tz_localize(None)
-            df_index = pd.DatetimeIndex(df.index).tz_localize(None)
+            # Fetch chunks (most recent first)
+            for chunk_days, end_dt in chunks:
+                print(f"    Fetching {chunk_days} days...", end=' ')
+                try:
+                    bars = ib.reqHistoricalData(
+                        contract,
+                        endDateTime=end_dt,
+                        durationStr=f"{chunk_days} D",
+                        barSizeSetting="1 hour",
+                        whatToShow='MIDPOINT',
+                        useRTH=False,
+                        formatDate=2
+                    )
+                    if bars:
+                        all_bars.extend(bars)
+                        print(f"got {len(bars)} bars")
+                    else:
+                        print("no data")
+                    ib.sleep(1)  # Rate limiting
+                except Exception as e:
+                    print(f"error: {e}")
+                    continue
             
+            if not all_bars:
+                return None
+            
+            # Convert to DataFrame
+            df = util.df(all_bars)
+            df.set_index('date', inplace=True)
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            df = df[~df.index.duplicated(keep='first')]
+            
+            if len(df) < 100:
+                print(f"Not enough data for {symbol}: {len(df)} rows")
+                return None
+            
+            # Prepare data arrays
+            highs = np.array(df['high'])
+            lows = np.array(df['low'])
+            closes = np.array(df['close'])
+            opens = np.array(df['open'])
+            
+            # Calculate FVG
+            bullish_fvgs = []
+            bearish_fvgs = []
+            for i in range(3, len(df)):
+                if lows[i] > highs[i-2]:
+                    bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
+                if highs[i] < lows[i-2]:
+                    bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
+            
+            # Daily data for HTF trend (fetch separately)
+            print(f"    Fetching daily data...", end=' ')
+            try:
+                daily_bars = ib.reqHistoricalData(
+                    contract,
+                    endDateTime='',
+                    durationStr=f"{days} D",
+                    barSizeSetting="1 day",
+                    whatToShow='MIDPOINT',
+                    useRTH=False,
+                    formatDate=2
+                )
+                if daily_bars:
+                    df_daily = util.df(daily_bars)
+                    df_daily.set_index('date', inplace=True)
+                    df_daily.index = pd.to_datetime(df_daily.index)
+                    print(f"got {len(df_daily)} days")
+                else:
+                    df_daily = None
+                    print("no data")
+            except Exception as e:
+                df_daily = None
+                print(f"error: {e}")
+            
+            # Calculate HTF trend - try daily data first, fallback to resampling hourly
+            if df_daily is not None and len(df_daily) >= 5:
+                daily_highs = np.array(df_daily['high'])
+                daily_lows = np.array(df_daily['low'])
+                htf = []
+                for i in range(1, len(df_daily)):
+                    if daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] > np.min(daily_lows[max(0,i-5):i]):
+                        htf.append(1)
+                    elif daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] < np.min(daily_lows[max(0,i-5):i]):
+                        htf.append(-1)
+                    else:
+                        htf.append(0)
+                
+                htf_trend = np.zeros(len(df))
+                df_daily_index = pd.DatetimeIndex(df_daily.index).tz_localize(None) if df_daily.index.tz else df_daily.index
+                df_index = pd.DatetimeIndex(df.index).tz_localize(None) if df.index.tz else df.index
+                
+                for i in range(len(df)):
+                    bar_time = df_index[i]
+                    for j in range(len(df_daily) - 1, -1, -1):
+                        if df_daily_index[j] <= bar_time:
+                            htf_trend[i] = htf[j] if j < len(htf) else 0
+                            break
+            else:
+                # Fallback: Compute daily bars from hourly data
+                print("    Computing HTF from hourly data...")
+                df_resampled = df.resample('1D').agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last'
+                }).dropna()
+                
+                daily_highs = np.array(df_resampled['high'])
+                daily_lows = np.array(df_resampled['low'])
+                htf = []
+                for i in range(1, len(df_resampled)):
+                    if i >= 5:
+                        if daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] > np.min(daily_lows[max(0,i-5):i]):
+                            htf.append(1)
+                        elif daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] < np.min(daily_lows[max(0,i-5):i]):
+                            htf.append(-1)
+                        else:
+                            htf.append(0)
+                    else:
+                        htf.append(0)
+                
+                htf_trend = np.zeros(len(df))
+                df_resampled_index = df_resampled.index.tz_localize(None) if df_resampled.index.tz else df_resampled.index
+                df_index = df.index.tz_localize(None) if df.index.tz else df.index
+                
+                for i in range(len(df)):
+                    bar_time = df_index[i]
+                    for j in range(len(df_resampled) - 1, -1, -1):
+                        if df_resampled_index[j] <= bar_time:
+                            htf_trend[i] = htf[j] if j < len(htf) else 0
+                            break
+            
+            ltf_trend = htf_trend.copy()
+            
+            # Kill zone
+            kill_zone = np.zeros(len(df), dtype=int)
             for i in range(len(df)):
-                bar_time = df_index[i]
-                for j in range(len(df_daily) - 1, -1, -1):
-                    if df_daily_index[j] <= bar_time:
-                        htf_trend[i] = htf[j] if j < len(htf) else 0
-                        break
-        
-        # LTF trend (same as HTF for now but could be different)
-        ltf_trend = htf_trend.copy()
-        
-        # Kill zone (NY session: 8am-12pm and 1pm-4pm EST = 13:00-17:00 and 18:00-21:00 UTC)
-        kill_zone = np.zeros(len(df), dtype=int)
-        for i in range(len(df)):
-            hour = df.index[i].hour
-            # NY time in UTC: 13:00-17:00 (morning) and 18:00-21:00 (afternoon)
-            if (13 <= hour < 17) or (18 <= hour < 21):
-                kill_zone[i] = 1
-        
-        # Price position (where in daily range)
-        price_position = np.zeros(len(df))
-        for i in range(len(df)):
-            # Get same-day range
-            day_start = df.index[i].replace(hour=0, minute=0)
-            day_end = df.index[i].replace(hour=23, minute=59)
-            day_mask = (df.index >= day_start) & (df.index <= day_end)
-            day_highs = highs[day_mask]
-            day_lows = lows[day_mask]
+                hour = df.index[i].hour
+                if (13 <= hour < 17) or (18 <= hour < 21):
+                    kill_zone[i] = 1
             
-            if len(day_highs) > 0:
-                day_range = np.max(day_highs) - np.min(day_lows)
-                if day_range > 0:
-                    price_position[i] = (closes[i] - np.min(day_lows)) / day_range
+            # Price position
+            price_position = np.zeros(len(df))
+            for i in range(len(df)):
+                day_bars = df.iloc[max(0, i-24):i+1]
+                if len(day_bars) > 0:
+                    day_range = day_bars['high'].max() - day_bars['low'].min()
+                    if day_range > 0:
+                        price_position[i] = (closes[i] - day_bars['low'].min()) / day_range
+                    else:
+                        price_position[i] = 0.5
                 else:
                     price_position[i] = 0.5
-            else:
-                price_position[i] = 0.5
-        
-        return {
-            'opens': opens,
-            'highs': highs,
-            'lows': lows,
-            'closes': closes,
-            'df': df,
-            'bullish_fvgs': bullish_fvgs,
-            'bearish_fvgs': bearish_fvgs,
-            'htf_trend': htf_trend,
-            'ltf_trend': ltf_trend,
-            'kill_zone': kill_zone,
-            'price_position': price_position
-        }
+            
+            return {
+                'opens': opens,
+                'highs': highs,
+                'lows': lows,
+                'closes': closes,
+                'df': df,
+                'bullish_fvgs': bullish_fvgs,
+                'bearish_fvgs': bearish_fvgs,
+                'htf_trend': htf_trend,
+                'ltf_trend': ltf_trend,
+                'kill_zone': kill_zone,
+                'price_position': price_position
+            }
+            
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
-    # Use train/test split: 4 months train, 2 months test
-    symbols = ['BTCUSD', 'ETHUSD', 'ES', 'NQ', 'GC', 'SI', 'NG', 'CL']
+    # Symbols: Crypto + Futures (as requested)
+    # Train: 1 year, Test: 6 months (need 18 months = 540 days)
+    symbols = ['SOLUSD', 'LINKUSD', 'LTCUSD', 'UNIUSD', 'BTCUSD', 'ETHUSD', 'SI', 'NQ', 'ES', 'GC']
     
     print("\n" + "="*80)
-    print("V8 RL TRAINING & TESTING - TRAIN/TEST SPLIT")
+    print("V8 RL TRAINING & TESTING - IBKR DATA")
     print("="*80)
-    print("Training Period: 9 months")
-    print(f"RL Agent: {'Disabled' if args.no_rl else 'Enabled'}")
-    print(f"Risk:Reward: 1:{args.rr}")
-    print(f"Confluence threshold: {args.confluence}")
+    print("Training Period: 12 months (1 year)")
+    print("Testing Period: 6 months")
+    print("Symbols:", ', '.join(symbols))
+    print("Settings: Confluence >= 60, RR 1:4")
     print("="*80 + "\n")
     
-    # Load extended data (6 months)
-    print("Loading 12 months of historical data...")
+    # Connect to IBKR
+    print("Connecting to IBKR...")
+    ib = IB()
+    try:
+        ib.connect('127.0.0.1', 7497, clientId=99)
+        print("Connected to IBKR successfully!\n")
+    except Exception as e:
+        print(f"ERROR: Could not connect to IBKR: {e}")
+        print("Make sure IB Gateway or TWS is running with API enabled on port 7497")
+        exit(1)
+    
+    # Load extended data from IBKR (18 months = 540 days)
+    print("Loading 18 months of IBKR historical data...")
     extended_data = {}
     for symbol in symbols:
-        print(f"  Loading {symbol}...", end=' ')
-        data = fetch_extended_data(symbol, months=12)
+        print(f"  Loading {symbol}...")
+        data = fetch_ibkr_extended_data(symbol, days=540, ib=ib)
         if data and len(data.get('closes', [])) >= 500:
             extended_data[symbol] = data
-            print(f"✓ {len(data['closes'])} bars from {data['df'].index[0]} to {data['df'].index[-1]}")
+            print(f"    ✓ {len(data['closes'])} bars from {data['df'].index[0]} to {data['df'].index[-1]}")
         else:
-            print(f"✗ (got {len(data.get('closes', [])) if data else 0} bars)")
+            print(f"    ✗ Failed (got {len(data.get('closes', [])) if data else 0} bars)")
+        ib.sleep(2)  # Rate limiting between symbols
     
     if not extended_data:
         print("No data loaded!")
@@ -1156,8 +1236,8 @@ if __name__ == "__main__":
     print(f"\nTotal timestamps: {len(all_timestamps)}")
     print(f"Date range: {all_timestamps[0]} to {all_timestamps[-1]}")
     
-    # Split: first ~67% for training (4 months), last ~33% for testing (2 months)
-    split_idx = int(len(all_timestamps) * args.train_ratio)
+    # Split: first 12 months for training, last 6 months for testing (67% / 33%)
+    split_idx = int(len(all_timestamps) * 0.67)  # 12 months out of 18
     train_timestamps = all_timestamps[:split_idx]
     test_timestamps = all_timestamps[split_idx:]
     
@@ -1182,51 +1262,31 @@ if __name__ == "__main__":
         buffer_size=20000
     )
     
-    # Handle RL: either load pre-trained model or create new agent
-    agent = None
-    if args.rl_model and os.path.exists(args.rl_model):
-        print(f"\nLoading pre-trained RL model from {args.rl_model}...")
-        try:
-            with open(args.rl_model, 'rb') as f:
-                model_data = pickle.load(f)
-            agent = model_data.get('agent')
-            if agent:
-                print("RL model loaded successfully!")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            agent = None
+    agent = ICTReinforcementLearningAgent(config)
+    reward_calc = RewardCalculator(reward_scale=1.0, penalty_scale=1.0)
     
-    if agent is None and not args.no_rl:
-        agent = ICTReinforcementLearningAgent(config)
-        reward_calc = RewardCalculator(reward_scale=1.0, penalty_scale=1.0)
-    else:
-        reward_calc = None
-    
-    if args.no_rl:
-        print("\nRL Agent disabled - running without RL")
-    else:
-        print(f"\nTraining on {len(train_timestamps)} timestamps with {training_episodes} episodes...")
-        print("Using actual trade outcome rewards...")
+    # Training loop using actual historical data with ACTUAL TRADE OUTCOMES
+    training_episodes = 3000  # Keep at 3000 for faster iteration
+    print(f"\nTraining on {len(train_timestamps)} timestamps with {training_episodes} episodes...")
+    print("Using actual trade outcome rewards...")
     
     episode_rewards = []
     winning_trades = 0
     losing_trades = 0
     
-    # Only train if RL is enabled and we have an agent
-    if agent is not None and not args.no_rl:
-        for episode in range(training_episodes):
-            # Randomly sample from training period
-            ts = np.random.choice(train_timestamps[:-50])  # Leave room for forward look
+    for episode in range(training_episodes):
+        # Randomly sample from training period
+        ts = np.random.choice(train_timestamps[:-50])  # Leave room for forward look
+        
+        for symbol, data in extended_data.items():
+            if ts not in data['df'].index:
+                continue
             
-            for symbol, data in extended_data.items():
-                if ts not in data['df'].index:
-                    continue
-                
-                idx = data['df'].index.get_loc(ts)
-                if idx < 50 or idx >= len(data['closes']) - 20:
-                    continue
-                
-                current_price = data['closes'][idx]
+            idx = data['df'].index.get_loc(ts)
+            if idx < 50 or idx >= len(data['closes']) - 20:
+                continue
+            
+            current_price = data['closes'][idx]
             
             # Calculate features
             if idx >= 5:
@@ -1437,13 +1497,12 @@ if __name__ == "__main__":
             print(f"  Episode {episode}/{training_episodes} | Avg Reward: {recent_avg:.3f} | ε: {agent.entry_agent.epsilon:.3f} | SimWR: {sim_wr:.1f}%")
     
     # Final training pass
-    if agent is not None and not args.no_rl:
-        print("\nFinal training pass...")
-        for _ in range(100):
-            if len(agent.entry_agent.replay_buffer) >= config.batch_size:
-                agent.entry_agent.train_step()
-        
-        print(f"Training complete! Final ε: {agent.entry_agent.epsilon:.3f}")
+    print("\nFinal training pass...")
+    for _ in range(100):
+        if len(agent.entry_agent.replay_buffer) >= config.batch_size:
+            agent.entry_agent.train_step()
+    
+    print(f"Training complete! Final ε: {agent.entry_agent.epsilon:.3f}")
     
     # Now test on test period
     print("\n" + "="*80)
@@ -1451,11 +1510,10 @@ if __name__ == "__main__":
     print("="*80)
     
     # Run backtest using only test timestamps
-    signal_gen = V8SignalGenerator(use_rl=not args.no_rl)
-    if agent is not None:
-        signal_gen.rl_agent = agent
+    signal_gen = V8SignalGenerator(use_rl=True)
+    signal_gen.rl_agent = agent
     
-    balance = initial_capital = 50000
+    balance = initial_capital = 5000
     positions = {}
     trades = []
     rl_decisions = {'entry': [], 'exit': []}
@@ -1523,7 +1581,7 @@ if __name__ == "__main__":
             elif symbol not in positions:
                 signal = signal_gen.generate_signal(data, idx)
                 
-                if signal and signal['confluence'] >= 60:
+                if signal and signal['confluence'] >= 65:
                     # Check RL entry decision
                     rl_entry_ok = True
                     if signal.get('rl_entry_action'):
@@ -1536,10 +1594,10 @@ if __name__ == "__main__":
                     
                     if signal['direction'] == 1:
                         stop = data['lows'][idx]
-                        target = current_price + (current_price - stop) * 4
+                        target = current_price + (current_price - stop) * 3
                     else:
                         stop = data['highs'][idx]
-                        target = current_price - (stop - current_price) * 4
+                        target = current_price - (stop - current_price) * 3
                     
                     stop_distance = abs(current_price - stop)
                     if stop_distance > 0:
@@ -1612,3 +1670,19 @@ if __name__ == "__main__":
     with open('v8_train_test_results.json', 'w') as f:
         json.dump(results, f, indent=2, default=str)
     print("Results saved to v8_train_test_results.json")
+    
+    # Save trained RL model for live trading
+    import pickle
+    model_path = 'v8_rl_model.pkl'
+    with open(model_path, 'wb') as f:
+        pickle.dump({
+            'agent': agent,
+            'config': config,
+            'train_timestamps': len(train_timestamps),
+            'test_results': {
+                'return_pct': return_pct,
+                'win_rate': win_rate,
+                'trades': total_trades
+            }
+        }, f)
+    print(f"RL model saved to {model_path}")
