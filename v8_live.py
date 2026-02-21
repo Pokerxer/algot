@@ -557,6 +557,7 @@ class V8LiveTrader:
         self.last_hourly_refresh = {}
         
         # Start streaming for each symbol
+        streaming_failed = []
         for symbol in self.symbols:
             try:
                 contract = get_ibkr_contract(symbol)
@@ -577,8 +578,17 @@ class V8LiveTrader:
                 print(f"[{symbol}] Streaming started")
                 
             except Exception as e:
-                print(f"[{symbol}] Streaming failed: {e}")
-                print(f"[{symbol}] Will use polling instead")
+                error_msg = str(e)
+                if 'permissions' in error_msg.lower() or '420' in error_msg:
+                    print(f"[{symbol}] No market data permissions - using polling mode")
+                    streaming_failed.append(symbol)
+                else:
+                    print(f"[{symbol}] Streaming failed: {e}")
+                    streaming_failed.append(symbol)
+        
+        # Initialize polling for failed symbols
+        if streaming_failed:
+            print(f"\nUsing polling for: {', '.join(streaming_failed)}")
         
         # Main loop with auto-reconnection for nightly IBKR restart
         print("\nTrading started. Press Ctrl+C to stop.\n")
@@ -754,8 +764,8 @@ class V8LiveTrader:
 
 def main():
     parser = argparse.ArgumentParser(description='V8 Live Trading System')
-    parser.add_argument('--symbols', type=str, default='BTCUSD,ETHUSD,ES,NQ,GC',
-                        help='Comma-separated symbols')
+    parser.add_argument('--symbols', type=str, default='BTCUSD,ETHUSD,SOLUSD,LINKUSD,LTCUSD',
+                        help='Comma-separated symbols (crypto only - no futures permissions needed)')
     parser.add_argument('--mode', type=str, default='shadow',
                         choices=['shadow', 'paper', 'live'],
                         help='Trading mode')
