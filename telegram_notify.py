@@ -2292,6 +2292,14 @@ def send_message(message: str):
     return get_notifier().send_message(message)
 
 
+def send_notification(message: str):
+    """Send notification synchronously - more reliable than async"""
+    notifier = get_notifier()
+    if not notifier._initialized:
+        notifier.init()
+    return notifier.send_message(message)
+
+
 def update_market_data(symbol: str, data: Dict):
     """Update market data for a symbol with price history for sparklines"""
     global LAST_MARKET_DATA, PRICE_HISTORY
@@ -2628,7 +2636,7 @@ def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl, pd
 {ds.SEP_DOT}
 {ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')} | {datetime.now().strftime('%b %d')}
 """
-    get_notifier().send_message_async(message)
+    send_notification(message)
 
 
 def send_trade_exit(symbol, direction, pnl, exit_reason, entry_price, exit_price, bars_held):
@@ -2728,7 +2736,7 @@ def send_trade_exit(symbol, direction, pnl, exit_reason, entry_price, exit_price
 {ds.SEP_DOT}
 {ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')} | {datetime.now().strftime('%b %d')}
 """
-    get_notifier().send_message_async(message)
+    send_notification(message)
 
 
 def send_startup(symbols, risk_pct, interval, mode):
