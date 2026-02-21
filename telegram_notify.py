@@ -343,8 +343,39 @@ app = None
 _bot_thread = None
 _event_loop = None
 
+# Global reference to live trader (set by v8_live.py)
+_live_trader = None
+
+# Trading state (pause/resume)
+_trading_paused = False
+
+# Price alerts
+_price_alerts: Dict[str, List[Dict]] = {}  # {symbol: [{price, direction, triggered}]}
+
 # IBKR connection for Telegram commands to fetch live data
 _ibkr_connection = None
+
+
+def set_live_trader(trader):
+    """Set reference to live trader for Telegram commands."""
+    global _live_trader
+    _live_trader = trader
+
+
+def get_live_trader():
+    """Get reference to live trader."""
+    return _live_trader
+
+
+def is_trading_paused() -> bool:
+    """Check if trading is paused."""
+    return _trading_paused
+
+
+def set_trading_paused(paused: bool):
+    """Set trading paused state."""
+    global _trading_paused
+    _trading_paused = paused
 
 def get_ibkr_connection():
     """Get or create IBKR connection for Telegram commands."""
@@ -497,6 +528,14 @@ class TelegramNotifier:
             self.app.add_handler(CommandHandler("watchlist", self._watchlist_command))
             self.app.add_handler(CommandHandler("add", self._add_watchlist_command))
             self.app.add_handler(CommandHandler("remove", self._remove_watchlist_command))
+            # New V8 commands
+            self.app.add_handler(CommandHandler("pause", self._pause_command))
+            self.app.add_handler(CommandHandler("resume", self._resume_command))
+            self.app.add_handler(CommandHandler("setalert", self._setalert_command))
+            self.app.add_handler(CommandHandler("alerts", self._listalerts_command))
+            self.app.add_handler(CommandHandler("cleareaalerts", self._clearalerts_command))
+            self.app.add_handler(CommandHandler("stats", self._stats_command))
+            self.app.add_handler(CommandHandler("rl", self._rl_command))
             self.app.add_handler(CallbackQueryHandler(self._button_callback))
             
             self._initialized = True
@@ -2132,6 +2171,340 @@ Use /watchlist to view
 """
         await message_obj.reply_text(message, parse_mode='HTML')
     
+    async def _pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /pause command - Pause trading"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        global _trading_paused
+        _trading_paused = True
+        
+        message = f"""
+{ds.STATUS_WARNING} <b>TRADING PAUSED</b>
+{ds.SEP_THICK}
+
+{ds.ICON_LOCK} Trading is now paused.
+
+No new positions will be opened.
+Existing positions remain active.
+
+{ds.SEP_THIN}
+Use /resume to resume trading.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+        send_notification(f"{ds.STATUS_WARNING} Trading PAUSED by user command")
+    
+    async def _resume_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /resume command - Resume trading"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        global _trading_paused
+        _trading_paused = False
+        
+        message = f"""
+{ds.STATUS_SUCCESS} <b>TRADING RESUMED</b>
+{ds.SEP_THICK}
+
+{ds.ICON_UNLOCK} Trading is now active.
+
+Bot will process new signals normally.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+        send_notification(f"{ds.STATUS_SUCCESS} Trading RESUMED by user command")
+    
+    async def _setalert_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /setalert command - Set price alerts"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        args = context.args if context.args else []
+        
+        if len(args) < 2:
+            await message_obj.reply_text(
+                f"{ds.STATUS_WARNING} <b>Set Price Alert</b>\n\n"
+                f"Usage: <code>/setalert SYMBOL PRICE</code>\n\n"
+                f"Examples:\n"
+                f"<code>/setalert BTCUSD 70000</code> - Alert when BTC hits $70k\n"
+                f"<code>/setalert ES 5000</code> - Alert when ES hits 5000",
+                parse_mode='HTML'
+            )
+            return
+        
+        try:
+            symbol = args[0].upper()
+            price = float(args[1])
+            
+            if symbol not in _price_alerts:
+                _price_alerts[symbol] = []
+            
+            _price_alerts[symbol].append({
+                'price': price,
+                'set_at': datetime.now().isoformat(),
+                'triggered': False
+            })
+            
+            message = f"""
+{ds.ICON_BELL} <b>PRICE ALERT SET</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_SUCCESS} Alert created!
+
+<code>
+ Symbol : {symbol}
+ Price  : ${price:,.2f}
+</code>
+
+{ds.SEP_THIN}
+You'll be notified when price reaches this level.
+
+{ds.SEP_DOT}
+Use /alerts to view all alerts
+"""
+            await message_obj.reply_text(message, parse_mode='HTML')
+        except ValueError:
+            await message_obj.reply_text(f"{ds.STATUS_ERROR} Invalid price. Use a number.", parse_mode='HTML')
+    
+    async def _listalerts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /alerts list command - Show all price alerts"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        
+        if not _price_alerts or all(len(alerts) == 0 for alerts in _price_alerts.values()):
+            message = f"""
+{ds.ICON_BELL} <b>PRICE ALERTS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_INFO} No price alerts set.
+
+{ds.SEP_THIN}
+Use /setalert SYMBOL PRICE to create one.
+"""
+            await message_obj.reply_text(message, parse_mode='HTML')
+            return
+        
+        lines = []
+        total = 0
+        for symbol, alerts in _price_alerts.items():
+            for alert in alerts:
+                if not alert.get('triggered', False):
+                    total += 1
+                    lines.append(f"  {ds.ICON_BELL} {symbol}: ${alert['price']:,.2f}")
+        
+        message = f"""
+{ds.ICON_BELL} <b>PRICE ALERTS</b> ({total})
+{ds.SEP_THICK}
+
+{chr(10).join(lines) if lines else f'{ds.STATUS_INFO} No active alerts'}
+
+{ds.SEP_THIN}
+Use /clearalerts to remove all
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _clearalerts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /clearalerts command - Clear all price alerts"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        global _price_alerts
+        
+        count = sum(len(alerts) for alerts in _price_alerts.values())
+        _price_alerts = {}
+        
+        message = f"""
+{ds.ICON_BELL} <b>ALERTS CLEARED</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_SUCCESS} Removed {count} price alert(s).
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /stats command - Show detailed performance statistics"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        
+        # Calculate detailed stats
+        total_trades = len(TRADE_HISTORY)
+        if total_trades == 0:
+            message = f"""
+{ds.ICON_CHART} <b>PERFORMANCE STATS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_INFO} No trades to analyze yet.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+            await message_obj.reply_text(message, parse_mode='HTML')
+            return
+        
+        wins = [t for t in TRADE_HISTORY if t.get('pnl', 0) > 0]
+        losses = [t for t in TRADE_HISTORY if t.get('pnl', 0) <= 0]
+        
+        win_rate = len(wins) / total_trades * 100
+        
+        gross_profit = sum(t['pnl'] for t in wins) if wins else 0
+        gross_loss = abs(sum(t['pnl'] for t in losses)) if losses else 0
+        net_pnl = gross_profit - gross_loss
+        
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        
+        avg_win = gross_profit / len(wins) if wins else 0
+        avg_loss = gross_loss / len(losses) if losses else 0
+        
+        # Risk/Reward ratio
+        rr_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+        
+        # Largest win/loss
+        largest_win = max((t['pnl'] for t in wins), default=0)
+        largest_loss = min((t['pnl'] for t in losses), default=0)
+        
+        # By symbol
+        by_symbol = {}
+        for trade in TRADE_HISTORY:
+            sym = trade.get('symbol', 'UNK')
+            if sym not in by_symbol:
+                by_symbol[sym] = {'pnl': 0, 'trades': 0, 'wins': 0}
+            by_symbol[sym]['pnl'] += trade.get('pnl', 0)
+            by_symbol[sym]['trades'] += 1
+            if trade.get('pnl', 0) > 0:
+                by_symbol[sym]['wins'] += 1
+        
+        # Best/worst symbols
+        sorted_symbols = sorted(by_symbol.items(), key=lambda x: x[1]['pnl'], reverse=True)
+        best_symbol = sorted_symbols[0] if sorted_symbols else None
+        worst_symbol = sorted_symbols[-1] if len(sorted_symbols) > 1 else None
+        
+        best_text = f"{best_symbol[0]}: +${best_symbol[1]['pnl']:,.2f}" if best_symbol else "N/A"
+        worst_text = f"{worst_symbol[0]}: ${worst_symbol[1]['pnl']:,.2f}" if worst_symbol else "N/A"
+        
+        # Expectancy
+        expectancy = (win_rate/100 * avg_win) - ((100-win_rate)/100 * avg_loss)
+        
+        message = f"""
+{ds.ICON_CHART} <b>PERFORMANCE STATISTICS</b>
+{ds.SEP_THICK}
+
+<b>Overview</b>
+<code>
+ Total Trades  : {total_trades}
+ Wins          : {len(wins)} ({win_rate:.1f}%)
+ Losses        : {len(losses)}
+ Net P&L       : ${net_pnl:+,.2f}
+</code>
+
+<b>Profitability</b>
+<code>
+ Gross Profit  : +${gross_profit:,.2f}
+ Gross Loss    : -${gross_loss:,.2f}
+ Profit Factor : {profit_factor:.2f}
+ Expectancy    : ${expectancy:,.2f}
+</code>
+
+<b>Trade Metrics</b>
+<code>
+ Avg Win       : +${avg_win:,.2f}
+ Avg Loss      : -${avg_loss:,.2f}
+ Avg R:R       : 1:{rr_ratio:.2f}
+ Largest Win   : +${largest_win:,.2f}
+ Largest Loss  : ${largest_loss:,.2f}
+</code>
+
+<b>By Symbol</b>
+ {ds.TREND_UP} Best: {best_text}
+ {ds.TREND_DOWN} Worst: {worst_text}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _rl_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /rl command - Show RL agent info"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        
+        trader = get_live_trader()
+        
+        if trader and hasattr(trader, 'signal_gen') and trader.signal_gen.rl_agent:
+            agent = trader.signal_gen.rl_agent
+            
+            # Get agent stats if available
+            entry_agent = agent.entry_agent if hasattr(agent, 'entry_agent') else None
+            exit_agent = agent.exit_agent if hasattr(agent, 'exit_agent') else None
+            
+            message = f"""
+{ds.ICON_ZAP} <b>RL AGENT STATUS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_SUCCESS} <b>RL Agent Active</b>
+
+<b>Entry Agent:</b>
+<code>
+ State Size   : {entry_agent.state_size if entry_agent else 'N/A'}
+ Actions      : {entry_agent.action_size if entry_agent else 'N/A'}
+ Epsilon      : {entry_agent.epsilon:.4f if entry_agent and hasattr(entry_agent, 'epsilon') else 'N/A'}
+</code>
+
+<b>Exit Agent:</b>
+<code>
+ State Size   : {exit_agent.state_size if exit_agent else 'N/A'}
+ Actions      : {exit_agent.action_size if exit_agent else 'N/A'}
+ Epsilon      : {exit_agent.epsilon:.4f if exit_agent and hasattr(exit_agent, 'epsilon') else 'N/A'}
+</code>
+
+<b>Model Info:</b>
+ Loaded from: v8_rl_model.pkl
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        else:
+            message = f"""
+{ds.ICON_ZAP} <b>RL AGENT STATUS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_WARNING} RL Agent not active
+
+{ds.SEP_THIN}
+Start the bot with --rl-model to enable.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML')
+    
     async def _button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button callbacks with enhanced functionality"""
         query = update.callback_query
@@ -2357,16 +2730,25 @@ def get_total_unrealized_pnl() -> float:
     return total
 
 
-def check_price_alerts():
-    """Check if any price alerts have been triggered"""
+def check_price_alerts(current_prices: Optional[Dict[str, float]] = None):
+    """Check if any price alerts have been triggered.
+    
+    Args:
+        current_prices: Optional dict of {symbol: price}. If not provided, uses LAST_MARKET_DATA.
+    """
+    global _price_alerts
     ds = DesignSystem
     triggered = []
     
+    # Check legacy alerts in BOT_SETTINGS
     price_alerts = BOT_SETTINGS.get('price_alerts', {})
     
     for symbol, alert_data in list(price_alerts.items()):
         target_price = alert_data.get('price', 0)
-        current_price = LAST_MARKET_DATA.get(symbol, {}).get('price', 0)
+        if current_prices:
+            current_price = current_prices.get(symbol, 0)
+        else:
+            current_price = LAST_MARKET_DATA.get(symbol, {}).get('price', 0)
         
         if current_price <= 0 or target_price <= 0:
             continue
@@ -2391,10 +2773,40 @@ def check_price_alerts():
             # Remove the alert
             del price_alerts[symbol]
     
+    # Check new-style alerts in _price_alerts (from /setalert command)
+    for symbol, alerts in list(_price_alerts.items()):
+        if current_prices:
+            current_price = current_prices.get(symbol, 0)
+        else:
+            current_price = LAST_MARKET_DATA.get(symbol, {}).get('price', 0)
+        
+        if current_price <= 0:
+            continue
+        
+        for alert in alerts[:]:  # Copy list to iterate while modifying
+            if alert.get('triggered', False):
+                continue
+                
+            target_price = alert.get('price', 0)
+            if target_price <= 0:
+                continue
+            
+            # Check if price crossed target (within 0.1%)
+            if abs(current_price - target_price) / target_price < 0.001:
+                alert['triggered'] = True
+                triggered.append({
+                    'symbol': symbol,
+                    'target': target_price,
+                    'current': current_price
+                })
+        
+        # Remove triggered alerts
+        _price_alerts[symbol] = [a for a in alerts if not a.get('triggered', False)]
+    
     # Send notifications for triggered alerts
     for alert in triggered:
         message = f"""
-{ds.ICON_BELL} <b>PRICE ALERT</b>
+{ds.ICON_BELL} <b>PRICE ALERT TRIGGERED</b>
 {ds.SEP_THICK}
 
 <b>{alert['symbol']}</b>

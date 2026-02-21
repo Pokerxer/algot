@@ -61,6 +61,13 @@ except ImportError:
     tn = None
     print("WARNING: telegram_notify not installed")
 
+
+def is_trading_paused() -> bool:
+    """Check if trading is paused via Telegram."""
+    if tn and hasattr(tn, 'is_trading_paused'):
+        return tn.is_trading_paused()
+    return False
+
 # IBKR connection
 try:
     from ib_insync import IB, util
@@ -263,6 +270,11 @@ class V8LiveTrader:
             self.last_signal_time[symbol] = current_hour
             
             if not signal:
+                return
+            
+            # Check if trading is paused
+            if is_trading_paused():
+                print(f"[{symbol}] Signal found but trading is PAUSED")
                 return
             
             # Check confluence threshold
@@ -664,6 +676,21 @@ class V8LiveTrader:
                     # Send hourly position update (every hour)
                     if iteration % 3600 == 0 and self.positions:
                         self._send_position_update()
+                    
+                    # Check price alerts every 30 seconds
+                    if iteration % 30 == 0 and tn and hasattr(tn, 'check_price_alerts'):
+                        try:
+                            # Build current prices dict from historical data
+                            current_prices = {}
+                            for symbol in self.symbols:
+                                if symbol in self.historical_data and 'closes' in self.historical_data[symbol]:
+                                    closes = self.historical_data[symbol]['closes']
+                                    if len(closes) > 0:
+                                        current_prices[symbol] = closes[-1]
+                            if current_prices:
+                                tn.check_price_alerts(current_prices)
+                        except Exception as e:
+                            print(f"Price alert check error: {e}")
                 
                 except (ConnectionError, OSError, Exception) as e:
                     error_msg = str(e)
@@ -953,6 +980,11 @@ Current settings:
         rl_model_path=args.rl_model,
         port=args.port  # Pass port for auto-reconnection
     )
+    
+    # Set live trader reference for Telegram commands
+    if tn and hasattr(tn, 'set_live_trader'):
+        tn.set_live_trader(trader)
+        print("Live trader registered with Telegram")
     
     # Start trading
     try:
