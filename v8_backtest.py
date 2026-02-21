@@ -69,6 +69,112 @@ class V8SignalGenerator:
         else:
             self.rl_agent = None
     
+    def prepare_data(self, symbol: str, data_manager, bars: int = 500) -> Optional[Dict]:
+        """Prepare data from a data manager (e.g., Yahoo/TradingView)"""
+        import numpy as np
+        import pandas as pd
+        
+        # Fetch hourly data
+        df_1h = data_manager.fetch(symbol, '1h', bars)
+        if df_1h is None or len(df_1h) < 100:
+            print(f"Failed to fetch data for {symbol}")
+            return None
+        
+        # Fetch daily data
+        df_1d = data_manager.fetch(symbol, '1d', 100)
+        
+        opens = df_1h['Open'].values
+        highs = df_1h['High'].values
+        lows = df_1h['Low'].values
+        closes = df_1h['Close'].values
+        
+        # Detect FVGs
+        bullish_fvgs = []
+        bearish_fvgs = []
+        for i in range(3, len(df_1h)):
+            if lows[i] > highs[i-2]:
+                bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
+            if highs[i] < lows[i-2]:
+                bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
+        
+        # Calculate HTF trend
+        if df_1d is not None and len(df_1d) >= 5:
+            daily_highs = df_1d['High'].values
+            daily_lows = df_1d['Low'].values
+            htf = []
+            for i in range(1, len(df_1d)):
+                if daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] > np.min(daily_lows[max(0,i-5):i]):
+                    htf.append(1)
+                elif daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] < np.min(daily_lows[max(0,i-5):i]):
+                    htf.append(-1)
+                else:
+                    htf.append(0)
+            
+            df_daily_index = pd.DatetimeIndex(df_1d.index).tz_localize(None)
+            df_index = pd.DatetimeIndex(df_1h.index).tz_localize(None)
+            htf_trend = np.zeros(len(df_1h))
+            for i in range(len(df_1h)):
+                bar_time = df_index[i]
+                for j in range(len(df_1d) - 1, -1, -1):
+                    if df_daily_index[j] <= bar_time:
+                        htf_trend[i] = htf[j] if j < len(htf) else 0
+                        break
+        else:
+            htf_trend = np.zeros(len(df_1h))
+        
+        # Calculate LTF trend
+        trend = np.zeros(len(df_1h))
+        for i in range(20, len(df_1h)):
+            rh = np.max(highs[max(0,i-20):i])
+            rl = np.min(lows[max(0,i-20):i])
+            if rh > highs[i-5] and rl > lows[i-5]:
+                trend[i] = 1
+            elif rh < highs[i-5] and rl < lows[i-5]:
+                trend[i] = -1
+        
+        # Price position
+        price_position = np.zeros(len(df_1h))
+        for i in range(20, len(df_1h)):
+            ph = np.max(highs[i-20:i])
+            pl = np.min(lows[i-20:i])
+            rng = ph - pl
+            if rng < 0.001:
+                rng = 0.001
+            price_position[i] = (closes[i] - pl) / rng
+        
+        # Kill zones
+        hours = pd.to_datetime(df_1h.index).hour.values
+        kill_zone = np.zeros(len(df_1h), dtype=bool)
+        for i in range(len(hours)):
+            h = hours[i]
+            kill_zone[i] = (1 <= h < 5) or (7 <= h < 12) or (13.5 <= h < 16)
+        
+        # Volatility
+        volatility = np.zeros(len(df_1h))
+        for i in range(14, len(df_1h)):
+            trs = []
+            for j in range(max(0, i-14), i+1):
+                tr = max(highs[j] - lows[j], abs(highs[j] - closes[j-1]), abs(lows[j] - closes[j-1])) if j > 0 else highs[j] - lows[j]
+                trs.append(tr)
+            volatility[i] = np.mean(trs) if trs else 0
+        
+        return {
+            'symbol': symbol,
+            'df': df_1h,
+            'opens': opens,
+            'highs': highs,
+            'lows': lows,
+            'closes': closes,
+            'bullish_fvgs': bullish_fvgs,
+            'bearish_fvgs': bearish_fvgs,
+            'htf_trend': htf_trend,
+            'ltf_trend': trend,
+            'price_position': price_position,
+            'kill_zone': kill_zone,
+            'volatility': volatility,
+            'hours': hours
+        }
+    
     def calculate_daily_quadrants(self, highs, lows, lookback=24):
         """Calculate daily range quadrants (ICT: Grade everything)"""
         if len(highs) < lookback:
