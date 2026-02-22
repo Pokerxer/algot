@@ -49,9 +49,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "╔══════════════════════════════════════╗\n"
-        "║    🚀 V5 TRADING BOT MENU       ║\n"
-        "╚══════════════════════════════════════╝\n\n"
+        "┌──────────────────────────────────────┐\n"
+        "│      🚀 V5 TRADING BOT MENU          │\n"
+        "└──────────────────────────────────────┘\n\n"
         "Select an option:",
         reply_markup=reply_markup
     )
@@ -68,18 +68,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         positions_text = "\n".join(lines)
     
     message = f"""
-╔══════════════════════════════════════╗
-║         📊 CURRENT STATUS          ║
-╚══════════════════════════════════════╝
+ ┌──────────────────────────────────────┐
+ │         📊 CURRENT STATUS           │
+ └──────────────────────────────────────┘
 
-📈 <b>Open Positions:</b>
-{positions_text}
+ 📈 <b>Open Positions:</b>
+ {positions_text}
 
-📊 <b>Today's Stats:</b>
-• Trades: {DAILY_STATS['trades']}
-• Wins: {DAILY_STATS['wins']} | Losses: {DAILY_STATS['losses']}
-• P&L: ${DAILY_STATS['pnl']:,.2f}
-"""
+ 📊 <b>Today's Stats:</b>
+ • Trades: {DAILY_STATS['trades']}
+ • Wins: {DAILY_STATS['wins']} | Losses: {DAILY_STATS['losses']}
+ • P&L: ${DAILY_STATS['pnl']:,.2f}
+ """
     await update.message.reply_text(message, parse_mode='HTML')
 
 
@@ -99,14 +99,14 @@ async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     message = f"""
-╔══════════════════════════════════════╗
-║       📜 RECENT TRADES             ║
-╚══════════════════════════════════════╝
+ ┌──────────────────────────────────────┐
+ │       📜 RECENT TRADES               │
+ └──────────────────────────────────────┘
 
-{chr(10).join(lines)}
+ {chr(10).join(lines)}
 
-Total: {len(TRADE_HISTORY)} trades today
-"""
+ Total: {len(TRADE_HISTORY)} trades today
+ """
     await update.message.reply_text(message)
 
 
@@ -131,18 +131,18 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = "🟢" if total_pnl > 0 else "🔴"
     
     message = f"""
-╔══════════════════════════════════════╗
-║         💰 P&L BREAKDOWN            ║
-╚══════════════════════════════════════╝
+ ┌──────────────────────────────────────┐
+ │         💰 P&L BREAKDOWN             │
+ └──────────────────────────────────────┘
 
-{chr(10).join(lines) if lines else 'No trades yet'}
+ {chr(10).join(lines) if lines else 'No trades yet'}
 
-{'─'*40}
-Total: {emoji} <b>${total_pnl:,.2f}</b>
+ {'─'*40}
+ Total: {emoji} <b>${total_pnl:,.2f}</b>
 
-Today's: Wins: {DAILY_STATS['wins']} | Losses: {DAILY_STATS['losses']}
-Win Rate: {DAILY_STATS['wins']/max(DAILY_STATS['trades'],1)*100:.1f}%
-"""
+ Today's: Wins: {DAILY_STATS['wins']} | Losses: {DAILY_STATS['losses']}
+ Win Rate: {DAILY_STATS['wins']/max(DAILY_STATS['trades'],1)*100:.1f}%
+ """
     await update.message.reply_text(message, parse_mode='HTML')
 
 
@@ -173,12 +173,12 @@ async def bias_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{symbol}: {bias} | ${price:,.2f} | KZ: {kz}")
     
     message = f"""
-╔══════════════════════════════════════╗
-║       📈 MARKET BIAS              ║
-╚══════════════════════════════════════╝
+ ┌──────────────────────────────────────┐
+ │       📈 MARKET BIAS                 │
+ └──────────────────────────────────────┘
 
-{chr(10).join(lines)}
-"""
+ {chr(10).join(lines)}
+ """
     await update.message.reply_text(message)
 
 
@@ -210,17 +210,17 @@ async def confluence_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     
     message = f"""
-╔══════════════════════════════════════╗
-║      ⚡ CONF LUENCE STATUS         ║
-╚══════════════════════════════════════╝
+ ┌──────────────────────────────────────┐
+ │      ⚡ CONF LUENCE STATUS          │
+ └──────────────────────────────────────┘
 
-{chr(10).join(lines)}
+ {chr(10).join(lines)}
 
-{'─'*40}
-🟢 60+ = Signal Zone
-🟡 40-59 = Watching
-🔴 <40 = No Signal
-"""
+ {'─'*40}
+ 🟢 60+ = Signal Zone
+ 🟡 40-59 = Watching
+ 🔴 <40 = No Signal
+ """
     await update.message.reply_text(message)
 
 
@@ -242,17 +242,17 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = """
-╔══════════════════════════════════════╗
-║         ❓ AVAILABLE COMMANDS       ║
-╚══════════════════════════════════════╝
+ ┌──────────────────────────────────────┐
+ │         ❓ AVAILABLE COMMANDS         │
+ └──────────────────────────────────────┘
 
-/start - Show menu
-/status - Positions & stats
-/trades - Recent trades
-/pnl - P&L breakdown
-/bias - Market bias
-/confluence - Confluence levels
-"""
+ /start - Show menu
+ /status - Positions & stats
+ /trades - Recent trades
+ /pnl - P&L breakdown
+ /bias - Market bias
+ /confluence - Confluence levels
+ """
     await update.message.reply_text(message)
 
 

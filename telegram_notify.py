@@ -42,81 +42,81 @@ class DesignSystem:
     """Modern design system with consistent visual elements"""
     
     # Box Drawing Characters
-    BOX_TL = ""
-    BOX_TR = ""
-    BOX_BL = ""
-    BOX_BR = ""
-    BOX_H = ""
-    BOX_V = ""
-    BOX_ML = ""
-    BOX_MR = ""
+    BOX_TL = "┌"
+    BOX_TR = "┐"
+    BOX_BL = "└"
+    BOX_BR = "┘"
+    BOX_H = "─"
+    BOX_V = "│"
+    BOX_ML = "├"
+    BOX_MR = "┤"
     
     # Rounded corners alternative
-    ROUND_TL = ""
-    ROUND_TR = ""
-    ROUND_BL = ""
-    ROUND_BR = ""
+    ROUND_TL = "╭"
+    ROUND_TR = "╮"
+    ROUND_BL = "╰"
+    ROUND_BR = "╯"
     
     # Separators
-    SEP_THICK = ""
-    SEP_THIN = ""
-    SEP_DOT = ""
-    SEP_WAVE = ""
+    SEP_THICK = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    SEP_THIN = "────────────────────────────────"
+    SEP_DOT = "⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅"
+    SEP_WAVE = "≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋"
     
     # Progress bar elements
-    PROGRESS_FULL = ""
-    PROGRESS_EMPTY = ""
-    PROGRESS_START = ""
-    PROGRESS_END = ""
+    PROGRESS_FULL = "█"
+    PROGRESS_EMPTY = "░"
+    PROGRESS_START = "┏"
+    PROGRESS_END = "┓"
     
     # Direction indicators
-    ARROW_UP = ""
-    ARROW_DOWN = ""
-    ARROW_RIGHT = ""
-    ARROW_LEFT = ""
-    TREND_UP = ""
-    TREND_DOWN = ""
-    TREND_FLAT = ""
+    ARROW_UP = "↑"
+    ARROW_DOWN = "↓"
+    ARROW_RIGHT = "→"
+    ARROW_LEFT = "←"
+    TREND_UP = "↗"
+    TREND_DOWN = "↘"
+    TREND_FLAT = "➜"
     
     # Status indicators
-    STATUS_SUCCESS = ""
-    STATUS_ERROR = ""
-    STATUS_WARNING = ""
-    STATUS_INFO = ""
-    STATUS_NEUTRAL = ""
+    STATUS_SUCCESS = "🟢"
+    STATUS_ERROR = "🔴"
+    STATUS_WARNING = "🟡"
+    STATUS_INFO = "🔵"
+    STATUS_NEUTRAL = "⚪"
     
     # Trading icons
-    ICON_BULL = ""
-    ICON_BEAR = ""
-    ICON_MONEY = ""
-    ICON_CHART = ""
-    ICON_TARGET = ""
-    ICON_SHIELD = ""
-    ICON_ROCKET = ""
-    ICON_FIRE = ""
-    ICON_DIAMOND = ""
-    ICON_CROWN = ""
-    ICON_STAR = ""
-    ICON_ZAP = ""
-    ICON_CLOCK = ""
-    ICON_CALENDAR = ""
-    ICON_LOCK = ""
-    ICON_UNLOCK = ""
-    ICON_EYE = ""
-    ICON_BELL = ""
-    ICON_GEAR = ""
-    ICON_REFRESH = ""
+    ICON_BULL = "🐂"
+    ICON_BEAR = "🐻"
+    ICON_MONEY = "💰"
+    ICON_CHART = "📊"
+    ICON_TARGET = "🎯"
+    ICON_SHIELD = "🛡️"
+    ICON_ROCKET = "🚀"
+    ICON_FIRE = "🔥"
+    ICON_DIAMOND = "💎"
+    ICON_CROWN = "👑"
+    ICON_STAR = "⭐"
+    ICON_ZAP = "⚡"
+    ICON_CLOCK = "🕐"
+    ICON_CALENDAR = "📅"
+    ICON_LOCK = "🔒"
+    ICON_UNLOCK = "🔓"
+    ICON_EYE = "👁️"
+    ICON_BELL = "🔔"
+    ICON_GEAR = "⚙️"
+    ICON_REFRESH = "🔄"
     
     # Session icons
-    SESSION_LONDON = ""
-    SESSION_NYC = ""
-    SESSION_ASIA = ""
-    SESSION_CLOSED = ""
+    SESSION_LONDON = "🇬🇧"
+    SESSION_NYC = "🇺🇸"
+    SESSION_ASIA = "🌏"
+    SESSION_CLOSED = "🌙"
     
     # Medals
-    MEDAL_GOLD = ""
-    MEDAL_SILVER = ""
-    MEDAL_BRONZE = ""
+    MEDAL_GOLD = "🥇"
+    MEDAL_SILVER = "🥈"
+    MEDAL_BRONZE = "🥉"
     
     @staticmethod
     def progress_bar(value: float, max_value: float = 100, width: int = 10, show_pct: bool = True) -> str:
@@ -145,10 +145,10 @@ class DesignSystem:
         filled = int(pct * width)
         
         if pnl >= 0:
-            bar = "" * filled + "" * (width - filled)
+            bar = DesignSystem.STATUS_SUCCESS * filled + DesignSystem.PROGRESS_EMPTY * (width - filled)
             return f"[{bar}] +${abs(pnl):,.0f}"
         else:
-            bar = "" * filled + "" * (width - filled)
+            bar = DesignSystem.STATUS_ERROR * filled + DesignSystem.PROGRESS_EMPTY * (width - filled)
             return f"[{bar}] -${abs(pnl):,.0f}"
     
     @staticmethod
@@ -266,15 +266,15 @@ class DesignSystem:
     def sparkline(values: List[float], width: int = 8) -> str:
         """Create a text-based sparkline"""
         if not values or len(values) < 2:
-            return "--------"
+            return "────────"
         
         # Normalize values
         min_val = min(values)
         max_val = max(values)
         range_val = max_val - min_val if max_val != min_val else 1
         
-        # Map to sparkline characters
-        chars = ['', '', '', '', '', '', '', '']
+        # Map to sparkline characters (low to high)
+        chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
         result = []
         
         # Sample values if too many
@@ -337,8 +337,8 @@ BOT_SETTINGS = {
 }
 
 # Animation frames for loading/updates
-LOADING_FRAMES = ["", "", "", "", "", "", "", ""]
-PULSE_FRAMES = ["", "", "", "", "", "", "", ""]
+LOADING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+PULSE_FRAMES = ["▌", "▀", "▐", "█▌", "▀", "▐", "█▌", "▀"]
 
 # Bot instance
 app = None

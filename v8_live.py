@@ -986,6 +986,14 @@ Current settings:
         tn.set_live_trader(trader)
         print("Live trader registered with Telegram")
     
+    # Start Telegram polling for commands (non-blocking)
+    if tn and hasattr(tn, 'start_polling_background'):
+        try:
+            tn.start_polling_background()
+            print("Telegram command polling started")
+        except Exception as e:
+            print(f"Failed to start Telegram polling: {e}")
+    
     # Start trading
     try:
         trader.start()
