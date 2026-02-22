@@ -1,7 +1,11 @@
 """
 ICT V6 Trading Bot - Combined FVG + Gap Analysis
 =================================================
-Combines V5 live trading with comprehensive FVG and Gap handlers
+Combines V5 live trading with comprehensive FVG and Gap handlers.
+Full Telegram integration for commands and notifications.
+
+Usage:
+    python3 ict_v6_ibkr.py --symbols "BTCUSD,ETHUSD,GC,CL" --port 7497
 """
 
 import asyncio
@@ -9,6 +13,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 
 import sys
 import os
+import time
 
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +34,27 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+# Telegram notifications
+try:
+    import telegram_notify as tn
+    # Initialize Telegram bot
+    if tn and hasattr(tn, 'init_bot'):
+        try:
+            tn.init_bot()
+            print("Telegram bot initialized")
+        except Exception as e:
+            print(f"Telegram bot init failed: {e}")
+except ImportError:
+    tn = None
+    print("WARNING: telegram_notify not installed")
+
+
+def is_trading_paused() -> bool:
+    """Check if trading is paused via Telegram."""
+    if tn and hasattr(tn, 'is_trading_paused'):
+        return tn.is_trading_paused()
+    return False
 
 
 class V6SignalGenerator:
@@ -226,11 +252,14 @@ class V6SignalGenerator:
 
 
 class V6LiveTrader(LiveTrader):
-    """V6 Live Trader with FVG and Gap analysis"""
+    """V6 Live Trader with FVG and Gap analysis and Telegram integration"""
     
     def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30):
         super().__init__(ib, symbols, risk_pct, poll_interval)
         self.signal_generator = V6SignalGenerator()
+        self.mode = 'paper'  # Default mode
+        self.use_rl = False  # V6 doesn't use RL
+        self.port = 7497     # Default port
     
     def _on_realtime_bar(self, symbol, bar):
         """Enhanced real-time bar handler with V6 signals"""
@@ -267,6 +296,11 @@ class V6LiveTrader(LiveTrader):
     
     def _enter_trade_v6(self, symbol, signal, current_price):
         """Enter trade using V6 signal"""
+        # Check if trading is paused via Telegram
+        if is_trading_paused():
+            print(f"[{symbol}] Signal found but trading is PAUSED")
+            return
+        
         try:
             entry_price = signal['entry_price']
             stop_price = signal['stop_loss']
@@ -313,10 +347,22 @@ class V6LiveTrader(LiveTrader):
                     
                     if tn:
                         try:
-                            tn.send_trade_entry(symbol, signal['direction'], filled_qty, 
-                                              fill_price, signal['confluence'], target_price, stop_price)
-                        except:
-                            pass
+                            # V6 specific: include FVG/Gap data in notification
+                            fvg_info = signal.get('fvg_data', {})
+                            gap_info = signal.get('gap_data', {})
+                            pd_zone = None
+                            if fvg_info:
+                                pd_zone = f"FVG {fvg_info.get('type', '')}"
+                            elif gap_info:
+                                pd_zone = f"Gap {gap_info.get('type', '')}"
+                            
+                            tn.send_trade_entry(
+                                symbol, signal['direction'], filled_qty, 
+                                fill_price, signal['confluence'], target_price, stop_price,
+                                pd_zone=pd_zone
+                            )
+                        except Exception as e:
+                            print(f"[{symbol}] Telegram notification error: {e}")
         except Exception as e:
             print(f"[{symbol}] V6 Error entering trade: {e}")
     
@@ -367,8 +413,8 @@ class V6LiveTrader(LiveTrader):
                 print(f"[{symbol}] Error polling: {e}")
 
 
-def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497):
-    """Run V6 trading with FVG + Gap analysis"""
+def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper'):
+    """Run V6 trading with FVG + Gap analysis and Telegram integration"""
     try:
         from ib_insync import IB
     except ImportError:
@@ -395,27 +441,41 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497):
         pass
     
     print(f"\nICT V6 - FVG + Gap Trading")
+    print(f"Mode: {mode.upper()}")
     print(f"Symbols: {symbols}")
     print(f"Risk: {risk_pct*100}%")
     print("-" * 50)
     
+    # Send startup notification to Telegram
     if tn:
         try:
-            message = f"""
-🚀 <b>V6 Trading Bot Started</b>
-━━━━━━━━━━━━━━━━━━━━
-<b>FVG + Gap Analysis</b>
-<b>Symbols:</b> {', '.join(symbols)}
-<b>Risk:</b> {risk_pct*100}%
-<b>Account:</b> ${account_value:,.0f}
-━━━━━━━━━━━━━━━━━━━━
-"""
-            tn.send_message(message)
-        except:
-            pass
+            tn.send_startup(
+                symbols=symbols,
+                risk_pct=risk_pct,
+                interval=interval,
+                mode=f"V6 {mode.upper()}"
+            )
+        except Exception as e:
+            print(f"Telegram startup notification failed: {e}")
     
     trader = V6LiveTrader(ib, symbols, risk_pct, poll_interval=interval)
     trader.account_value = account_value
+    trader.mode = mode  # Add mode attribute for Telegram status
+    trader.use_rl = False  # V6 doesn't use RL
+    trader.port = port  # Store port for potential reconnection
+    
+    # Set live trader reference for Telegram commands
+    if tn and hasattr(tn, 'set_live_trader'):
+        tn.set_live_trader(trader)
+        print("Live trader registered with Telegram")
+    
+    # Start Telegram polling for commands (non-blocking)
+    if tn and hasattr(tn, 'start_polling_background'):
+        try:
+            tn.start_polling_background()
+            print("Telegram command polling started")
+        except Exception as e:
+            print(f"Failed to start Telegram polling: {e}")
     
     try:
         trader.start()
@@ -428,6 +488,7 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497):
             if iteration % interval == 0:
                 trader.poll_historical_symbols()
             
+            # Update account value every minute
             if iteration % 60 == 0:
                 try:
                     for av in ib.accountValues():
@@ -436,6 +497,21 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497):
                             break
                 except:
                     pass
+            
+            # Check price alerts every 30 seconds
+            if iteration % 30 == 0 and tn and hasattr(tn, 'check_price_alerts'):
+                try:
+                    # Build current prices dict from historical data
+                    current_prices = {}
+                    for symbol in symbols:
+                        if hasattr(trader, 'historical_data') and symbol in trader.historical_data:
+                            closes = trader.historical_data[symbol].get('closes', [])
+                            if len(closes) > 0:
+                                current_prices[symbol] = closes[-1]
+                    if current_prices:
+                        tn.check_price_alerts(current_prices)
+                except Exception as e:
+                    print(f"Price alert check error: {e}")
                 
     except KeyboardInterrupt:
         print("\n\nShutdown...")
@@ -448,14 +524,29 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='ICT V6 - FVG + Gap Trading')
-    parser.add_argument("--symbols", default="BTCUSD,ETHUSD,SOLUSD,ES,NQ,GC", 
+    parser = argparse.ArgumentParser(description='ICT V6 - FVG + Gap Trading with Telegram')
+    parser.add_argument("--symbols", default="BTCUSD,ETHUSD,SOLUSD,GC,CL", 
                         help="Comma-separated symbols")
-    parser.add_argument("--interval", type=int, default=30)
-    parser.add_argument("--risk", type=float, default=0.02)
-    parser.add_argument("--port", type=int, default=7497)
+    parser.add_argument("--interval", type=int, default=30,
+                        help="Poll interval in seconds")
+    parser.add_argument("--risk", type=float, default=0.02,
+                        help="Risk per trade (e.g., 0.02 for 2%)")
+    parser.add_argument("--port", type=int, default=7497,
+                        help="IBKR port (7497=paper, 7496=live)")
+    parser.add_argument("--mode", type=str, default="paper",
+                        choices=["shadow", "paper", "live"],
+                        help="Trading mode")
     
     args = parser.parse_args()
-    symbols = [s.strip() for s in args.symbols.split(',')]
+    symbols = [s.strip().upper() for s in args.symbols.split(',')]
     
-    run_v6_trading(symbols, args.interval, args.risk, args.port)
+    print("="*60)
+    print("ICT V6 Trading Bot - FVG + Gap Analysis")
+    print("="*60)
+    print(f"Mode: {args.mode.upper()}")
+    print(f"Symbols: {', '.join(symbols)}")
+    print(f"Risk: {args.risk*100}%")
+    print(f"Port: {args.port}")
+    print("="*60)
+    
+    run_v6_trading(symbols, args.interval, args.risk, args.port, args.mode)
