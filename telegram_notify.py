@@ -3809,6 +3809,12 @@ def _handle_command(cmd: str, args: list, chat_id: int) -> tuple:
     elif cmd == 'positions':
         return _build_positions_response()
     
+    elif cmd == 'signals':
+        return _build_signals_response()
+    
+    elif cmd == 'balance':
+        return _build_balance_response()
+    
     return (f"Unknown command: /{cmd}\nUse /help for available commands.", None)
 
 
@@ -3841,6 +3847,10 @@ def _handle_callback(data: str, chat_id: int, message_id: int = None) -> tuple:
         return _build_help_menu()
     elif data == 'alerts':
         return _build_alerts_response()
+    elif data == 'signals':
+        return _build_signals_response()
+    elif data == 'balance':
+        return _build_balance_response()
     
     return (f"Action: {data}", None)
 
@@ -3914,6 +3924,7 @@ def _build_help_menu() -> tuple:
 <code>/resume</code> - Resume trading
 <code>/status</code> - Dashboard
 <code>/positions</code> - Open positions
+<code>/signals</code> - Recent signals
 
 <b>Alerts</b>
 <code>/setalert SYMBOL PRICE</code>
@@ -3922,6 +3933,7 @@ def _build_help_menu() -> tuple:
 
 <b>Performance</b>
 <code>/stats</code> - Full statistics
+<code>/balance</code> - Account balance
 <code>/rl</code> - RL agent status
 
 {ds.SEP_DOT}
@@ -4124,48 +4136,259 @@ Use /clearalerts to remove all
 
 
 def _build_status_response() -> tuple:
-    """Build status/dashboard response"""
+    """Build status/dashboard response with live V8 data"""
     ds = DesignSystem
     session_icon, session_name = ds.get_session_icon()
     
+    trader = get_live_trader()
+    
+    # Get live positions from V8 trader
+    open_positions = 0
+    position_lines = []
+    total_unrealized = 0
+    
+    if trader and hasattr(trader, 'positions'):
+        open_positions = len(trader.positions)
+        for symbol, pos in trader.positions.items():
+            direction = "🟢 LONG" if pos.get('direction', 0) == 1 else "🔴 SHORT"
+            entry = pos.get('entry', 0)
+            current = pos.get('current_price', entry)
+            pnl = (current - entry) * pos.get('direction', 1) * pos.get('qty', 1)
+            total_unrealized += pnl
+            position_lines.append(f"  {direction} {symbol} @ ${entry:,.2f} ({'+' if pnl >= 0 else ''}{pnl:.2f})")
+    
+    # Get symbols being monitored
+    symbols_str = "N/A"
+    if trader and hasattr(trader, 'symbols'):
+        symbols_str = ", ".join(trader.symbols[:5])
+        if len(trader.symbols) > 5:
+            symbols_str += f" +{len(trader.symbols)-5} more"
+    
+    # Get RL status
+    rl_status = "⚪ OFF"
+    if trader and hasattr(trader, 'use_rl') and trader.use_rl:
+        rl_status = "🟢 ON"
+    
+    # Get mode
+    mode = "N/A"
+    if trader and hasattr(trader, 'mode'):
+        mode = trader.mode.upper()
+    
+    positions_text = chr(10).join(position_lines) if position_lines else "  No open positions"
+    
     text = f"""
-{ds.ICON_CHART} <b>TRADING DASHBOARD</b>
+{ds.ICON_CHART} <b>V8 TRADING DASHBOARD</b>
 {ds.SEP_THICK}
 
 {session_icon} {session_name}
 Status: {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+Mode: {mode} | RL: {rl_status}
 
-<b>Today</b>
+<b>Monitoring</b>
+{symbols_str}
+
+<b>Today's Stats</b>
 P&L: ${DAILY_STATS['pnl']:+,.2f}
-Trades: {DAILY_STATS['trades']}
-Wins: {DAILY_STATS['wins']}
+Trades: {DAILY_STATS['trades']} | Wins: {DAILY_STATS['wins']}
 
-<b>Positions</b>
-Open: {len(CURRENT_POSITIONS)}
+<b>Open Positions ({open_positions})</b>
+{positions_text}
+{f"Unrealized: ${total_unrealized:+,.2f}" if total_unrealized != 0 else ""}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    
+    keyboard = {'inline_keyboard': [
+        [{'text': '📈 Positions', 'callback_data': 'positions'}, {'text': '📊 Stats', 'callback_data': 'stats'}],
+        [{'text': '🏠 Home', 'callback_data': 'start'}]
+    ]}
+    return (text, keyboard)
+
+
+def _build_positions_response() -> tuple:
+    """Build positions response with live V8 data"""
+    ds = DesignSystem
+    
+    trader = get_live_trader()
+    
+    # Get positions from V8 trader
+    positions = {}
+    if trader and hasattr(trader, 'positions'):
+        positions = trader.positions
+    
+    if not positions:
+        text = f"""
+{ds.ICON_CHART} <b>OPEN POSITIONS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_INFO} No open positions
+
+Trading is {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+        keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
+        return (text, keyboard)
+    
+    lines = []
+    total_pnl = 0
+    
+    for symbol, pos in positions.items():
+        direction = pos.get('direction', 0)
+        dir_icon = "🟢" if direction == 1 else "🔴"
+        dir_str = "LONG" if direction == 1 else "SHORT"
+        entry = pos.get('entry', 0)
+        stop = pos.get('stop', 0)
+        target = pos.get('target', 0)
+        qty = pos.get('qty', 0)
+        current = pos.get('current_price', entry)
+        bars_held = pos.get('bars_held', 0)
+        
+        # Calculate P&L
+        if direction == 1:
+            pnl = (current - entry) * qty
+            pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        else:
+            pnl = (entry - current) * qty
+            pnl_pct = ((entry - current) / entry * 100) if entry > 0 else 0
+        
+        total_pnl += pnl
+        pnl_icon = "+" if pnl >= 0 else ""
+        
+        lines.append(f"""
+{dir_icon} <b>{symbol}</b> {dir_str}
+  Entry: ${entry:,.2f} | Qty: {qty:.4f}
+  Stop: ${stop:,.2f} | Target: ${target:,.2f}
+  Current: ${current:,.2f} ({pnl_icon}{pnl_pct:.2f}%)
+  P&L: <b>${pnl_icon}{pnl:,.2f}</b> | Bars: {bars_held}
+""")
+    
+    text = f"""
+{ds.ICON_CHART} <b>OPEN POSITIONS</b> ({len(positions)})
+{ds.SEP_THICK}
+{"".join(lines)}
+{ds.SEP_THIN}
+Total Unrealized: <b>${'+' if total_pnl >= 0 else ''}{total_pnl:,.2f}</b>
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    
+    keyboard = {'inline_keyboard': [
+        [{'text': '🔄 Refresh', 'callback_data': 'positions'}],
+        [{'text': '🏠 Home', 'callback_data': 'start'}]
+    ]}
+    return (text, keyboard)
+
+
+def _build_signals_response() -> tuple:
+    """Build recent signals response"""
+    ds = DesignSystem
+    
+    trader = get_live_trader()
+    
+    if not trader or not hasattr(trader, 'last_signals'):
+        return (f"{ds.STATUS_INFO} No recent signals.", None)
+    
+    signals = trader.last_signals if hasattr(trader, 'last_signals') else {}
+    
+    if not signals:
+        text = f"""
+{ds.ICON_ZAP} <b>RECENT SIGNALS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_INFO} No signals detected recently.
+
+The bot is monitoring for ICT setups.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    else:
+        lines = []
+        for symbol, sig in signals.items():
+            direction = sig.get('direction', 0)
+            dir_icon = "🟢" if direction == 1 else "🔴"
+            dir_str = "LONG" if direction == 1 else "SHORT"
+            confluence = sig.get('confluence', 0)
+            pd_zone = sig.get('pd_zone', 'N/A')
+            entry = sig.get('entry', 0)
+            
+            lines.append(f"  {dir_icon} {symbol} {dir_str} @ ${entry:,.2f}")
+            lines.append(f"     Conf: {confluence} | Zone: {pd_zone}")
+        
+        text = f"""
+{ds.ICON_ZAP} <b>RECENT SIGNALS</b>
+{ds.SEP_THICK}
+
+{chr(10).join(lines)}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
 """
     
     keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
     return (text, keyboard)
 
 
-def _build_positions_response() -> tuple:
-    """Build positions response"""
+def _build_balance_response() -> tuple:
+    """Build account balance response"""
     ds = DesignSystem
     
-    if not CURRENT_POSITIONS:
-        return (f"{ds.ICON_CHART} No open positions.", None)
+    trader = get_live_trader()
     
-    lines = []
-    for symbol, pos in CURRENT_POSITIONS.items():
-        direction = "LONG" if pos.get('direction', 0) == 1 else "SHORT"
-        entry = pos.get('entry', 0)
-        lines.append(f"  • {symbol} {direction} @ ${entry:,.2f}")
+    # Try to get account info from IBKR
+    balance = 0
+    buying_power = 0
+    unrealized_pnl = 0
+    realized_pnl = 0
     
-    text = f"""
-{ds.ICON_CHART} <b>OPEN POSITIONS</b>
+    if trader and hasattr(trader, 'ib'):
+        try:
+            account_values = trader.ib.accountSummary()
+            for av in account_values:
+                if av.tag == 'NetLiquidation':
+                    balance = float(av.value)
+                elif av.tag == 'BuyingPower':
+                    buying_power = float(av.value)
+                elif av.tag == 'UnrealizedPnL':
+                    unrealized_pnl = float(av.value)
+                elif av.tag == 'RealizedPnL':
+                    realized_pnl = float(av.value)
+        except:
+            pass
+    
+    if balance == 0:
+        text = f"""
+{ds.ICON_CHART} <b>ACCOUNT BALANCE</b>
 {ds.SEP_THICK}
 
-{chr(10).join(lines)}
+{ds.STATUS_WARNING} Unable to fetch account data.
+
+Make sure IBKR is connected.
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+    else:
+        text = f"""
+{ds.ICON_CHART} <b>ACCOUNT BALANCE</b>
+{ds.SEP_THICK}
+
+<b>Net Liquidation</b>
+${balance:,.2f}
+
+<b>Buying Power</b>
+${buying_power:,.2f}
+
+<b>P&L</b>
+Unrealized: ${unrealized_pnl:+,.2f}
+Realized: ${realized_pnl:+,.2f}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
 """
     
     keyboard = {'inline_keyboard': [[{'text': '🏠 Home', 'callback_data': 'start'}]]}
