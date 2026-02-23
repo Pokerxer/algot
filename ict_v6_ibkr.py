@@ -134,13 +134,58 @@ class V6SignalGenerator:
             'gap_data': None
         }
         
-        # Base confluence from V5
-        base_confluence = v5_signal['confluence'] if v5_signal else 0
-        signal['confluence'] = base_confluence
+        # Get trend data for direction determination
+        htf = data['htf_trend'][idx]
+        ltf = data['ltf_trend'][idx]
+        kz = data['kill_zone'][idx]
+        pp = data['price_position'][idx]
+        closes = data['closes'][idx]
         
-        if v5_signal:
-            signal['direction'] = v5_signal['direction']
-            signal['reasoning'].append(f"V5 Signal: Confluence {base_confluence}/100")
+        # Check V5 FVGs
+        near_bull_fvg = next((f for f in reversed(data['bullish_fvgs']) if f['idx'] < idx and f['mid'] < closes), None)
+        near_bear_fvg = next((f for f in reversed(data['bearish_fvgs']) if f['idx'] < idx and f['mid'] > closes), None)
+        
+        # Calculate base confluence directly (don't rely on V5's threshold)
+        base_confluence = 0
+        if kz:
+            base_confluence += 15
+            signal['reasoning'].append("Kill Zone: +15")
+            
+        # HTF/LTF alignment
+        if htf == 1 and ltf >= 0:
+            base_confluence += 25
+            signal['direction'] = 1
+            signal['reasoning'].append("HTF+LTF Bullish: +25")
+        elif htf == -1 and ltf <= 0:
+            base_confluence += 25
+            signal['direction'] = -1
+            signal['reasoning'].append("HTF+LTF Bearish: +25")
+        elif htf == 0 and ltf == 1:
+            base_confluence += 15
+            signal['direction'] = 1
+            signal['reasoning'].append("LTF Bullish (HTF flat): +15")
+        elif htf == 0 and ltf == -1:
+            base_confluence += 15
+            signal['direction'] = -1
+            signal['reasoning'].append("LTF Bearish (HTF flat): +15")
+        
+        # Price position
+        if pp < 0.25:
+            base_confluence += 20
+            signal['reasoning'].append("Price near lows: +20")
+        elif pp > 0.75:
+            base_confluence += 20
+            signal['reasoning'].append("Price near highs: +20")
+            
+        # V5 FVGs
+        if near_bull_fvg and ltf >= 0:
+            base_confluence += 15
+            signal['reasoning'].append("V5 Bull FVG: +15")
+        if near_bear_fvg and ltf <= 0:
+            base_confluence += 15
+            signal['reasoning'].append("V5 Bear FVG: +15")
+        
+        signal['confluence'] = base_confluence
         
         # Add FVG confluence
         fvg_confluence = 0
@@ -211,15 +256,15 @@ class V6SignalGenerator:
         total_confluence = base_confluence + fvg_confluence + gap_confluence
         signal['confluence'] = min(total_confluence, 100)
         
-        # Set confidence level
+        # Set confidence level based on confluence threshold (default 60)
         if total_confluence >= 80:
             signal['confidence'] = 'HIGH'
         elif total_confluence >= 60:
             signal['confidence'] = 'MEDIUM'
-        elif total_confluence >= 40:
+        elif total_confluence >= 50:
             signal['confidence'] = 'LOW'
         else:
-            signal['direction'] = 0  # No trade
+            signal['direction'] = 0  # Below threshold, no trade
         
         # Calculate stop/target if we have a signal
         if signal['direction'] != 0:
@@ -789,7 +834,7 @@ class V6LiveTrader(LiveTrader):
 
 
 def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper',
-                   rr_ratio=2.0, confluence_threshold=60, max_daily_loss=-2000):
+                   rr_ratio=3.0, confluence_threshold=60, max_daily_loss=-2000):
     """Run V6 trading with FVG + Gap analysis and Telegram integration"""
     try:
         from ib_insync import IB

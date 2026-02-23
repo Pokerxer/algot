@@ -248,14 +248,26 @@ def prepare_data_ibkr(symbol, lookback=200, ib=None, use_cache=True):
                     htf_trend[i] = htf[j] if j < len(htf) else 0
                     break
     
+    # LTF trend using momentum-based approach (more responsive in ranging markets)
     trend = np.zeros(len(df))
     for i in range(20, len(df)):
-        rh = np.max(highs[max(0,i-20):i])
-        rl = np.min(lows[max(0,i-20):i])
-        if rh > highs[i-5] and rl > lows[i-5]:
+        # Primary: momentum over 10 bars
+        momentum = closes[i] - closes[i-10]
+        pct_change = momentum / closes[i-10] if closes[i-10] > 0 else 0
+        
+        # Secondary: EMA crossover confirmation (5 vs 13 EMA approximation)
+        ema_fast = np.mean(closes[max(0,i-5):i+1])
+        ema_slow = np.mean(closes[max(0,i-13):i+1])
+        ema_bullish = ema_fast > ema_slow
+        ema_bearish = ema_fast < ema_slow
+        
+        # Bullish: positive momentum OR (slight positive + EMA bullish)
+        if pct_change > 0.005 or (pct_change > 0.001 and ema_bullish):
             trend[i] = 1
-        elif rh < highs[i-5] and rl < lows[i-5]:
+        # Bearish: negative momentum OR (slight negative + EMA bearish)
+        elif pct_change < -0.005 or (pct_change < -0.001 and ema_bearish):
             trend[i] = -1
+        # else stays 0 (ranging/flat)
     
     price_position = np.zeros(len(df))
     for i in range(20, len(df)):
@@ -643,10 +655,18 @@ def get_signal(data, idx):
     confluence = 0
     if kz:
         confluence += 15
+    
+    # HTF/LTF alignment bonus
     if htf == 1 and ltf >= 0:
         confluence += 25
     elif htf == -1 and ltf <= 0:
         confluence += 25
+    # NEW: LTF-only bonus when HTF is flat (ranging market)
+    elif htf == 0 and ltf == 1:
+        confluence += 15  # Smaller bonus for LTF-only bullish
+    elif htf == 0 and ltf == -1:
+        confluence += 15  # Smaller bonus for LTF-only bearish
+    
     if pp < 0.25:
         confluence += 20
     elif pp > 0.75:
@@ -657,9 +677,15 @@ def get_signal(data, idx):
         confluence += 15
     
     if confluence >= 60:
+        # Full HTF+LTF alignment
         if htf == 1 and ltf >= 0:
             return {'direction': 1, 'confluence': confluence, 'entry': closes}
         elif htf == -1 and ltf <= 0:
+            return {'direction': -1, 'confluence': confluence, 'entry': closes}
+        # NEW: Allow LTF-only signals when HTF is flat (ranging market)
+        elif htf == 0 and ltf == 1:
+            return {'direction': 1, 'confluence': confluence, 'entry': closes}
+        elif htf == 0 and ltf == -1:
             return {'direction': -1, 'confluence': confluence, 'entry': closes}
     
     return None
