@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=jrwaldehzx
 WorkingDirectory=/home/jrwaldehzx/algot
-ExecStart=/usr/bin/python3 /home/jrwaldehzx/algot/ict_v6_ibkr.py --symbols "BTCUSD,ETHUSD,GC,CL" --mode paper --port 7497
+ExecStart=/usr/bin/python3 /home/jrwaldehzx/algot/ict_v6_ibkr.py --symbols "SOLUSD,ETHUSD,BTCUSD,LINKUSD,LTCUSD,SI,UNIUSD,NG,NQ,GC,CL,ES" --mode paper --port 7497
 Restart=always
 RestartSec=10
 
