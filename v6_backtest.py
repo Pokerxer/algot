@@ -323,7 +323,7 @@ def run_v6_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
 
 if __name__ == "__main__":
     # Use fewer symbols for faster backtest
-    symbols = ['BTCUSD', 'ETHUSD', 'ES', 'NQ', 'GC']
+    symbols = ['SOLUSD','ETHUSD','BTCUSD','LINKUSD','LTCUSD','SI','UNIUSD','NG','NQ','GC','CL','ES']
     
     print("="*80)
     print("ICT V6 - FVG + Gap Backtest")
@@ -331,8 +331,8 @@ if __name__ == "__main__":
     
     results = run_v6_backtest(
         symbols=symbols,
-        days=30,
-        initial_capital=50000,
+        days=360,
+        initial_capital=5000,
         risk_per_trade=0.02,
         use_ibkr=True
     )
