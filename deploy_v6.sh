@@ -4,7 +4,9 @@
 
 set -e
 
-ALGOT_DIR="/home/ubuntu/algot"
+# Get current user and home directory
+CURRENT_USER=$(whoami)
+ALGOT_DIR="$HOME/algot"
 SERVICE_FILE="/etc/systemd/system/v6-trading.service"
 
 echo "=========================================="
