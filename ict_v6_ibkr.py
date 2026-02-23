@@ -347,14 +347,14 @@ class V6LiveTrader(LiveTrader):
             }
         
         # Update Telegram with enhanced data
-        if tn:
+        if tn and signal:
             try:
                 tn.update_market_data(symbol, {
                     'price': current_price,
-                    'confluence': signal['confluence'],
-                    'confidence': signal['confidence'],
-                    'v5_confluence': signal['v5_signal']['confluence'] if signal['v5_signal'] else 0,
-                    'fvg_count': signal.get('fvg_data', {}).get('type', 'None'),
+                    'confluence': signal.get('confluence', 0),
+                    'confidence': signal.get('confidence', 'LOW'),
+                    'v5_confluence': signal.get('v5_signal', {}).get('confluence', 0) if signal.get('v5_signal') else 0,
+                    'fvg_count': signal.get('fvg_data', {}).get('type', 'None') if signal.get('fvg_data') else 'None',
                     'last_update': datetime.now().isoformat()
                 })
             except:
