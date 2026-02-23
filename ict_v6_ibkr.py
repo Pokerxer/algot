@@ -337,11 +337,13 @@ class V6LiveTrader(LiveTrader):
         
         # Store signal for Telegram /signals command
         if signal and signal['direction'] != 0:
+            fvg_data = signal.get('fvg_data') or {}
+            gap_data = signal.get('gap_data') or {}
             self.last_signals[symbol] = {
                 'direction': signal['direction'],
                 'confluence': signal['confluence'],
                 'confidence': signal['confidence'],
-                'pd_zone': signal.get('fvg_data', {}).get('type', '') or signal.get('gap_data', {}).get('type', ''),
+                'pd_zone': fvg_data.get('type', '') or gap_data.get('type', ''),
                 'entry': signal['entry_price'],
                 'timestamp': datetime.now().isoformat()
             }
