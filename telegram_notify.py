@@ -22,8 +22,12 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -243,10 +247,16 @@ class DesignSystem:
     
     @staticmethod
     def get_session_icon() -> Tuple[str, str]:
-        """Get current trading session icon and name"""
-        now = datetime.now()
+        """Get current trading session icon and name (New York time)"""
+        try:
+            ny_tz = ZoneInfo("America/New_York")
+            now = datetime.now(ny_tz)
+        except Exception:
+            # Fallback: assume server is UTC, convert to ET (UTC-5 or UTC-4 DST)
+            now = datetime.utcnow() - timedelta(hours=5)
         hour = now.hour
         
+        # All times are in ET (Eastern Time)
         # London: 3 AM - 12 PM ET (8 AM - 5 PM GMT)
         # NYC: 8 AM - 5 PM ET
         # Asia: 7 PM - 4 AM ET
