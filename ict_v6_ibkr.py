@@ -257,9 +257,11 @@ class V6LiveTrader(LiveTrader):
     def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30):
         super().__init__(ib, symbols, risk_pct, poll_interval)
         self.signal_generator = V6SignalGenerator()
-        self.mode = 'paper'  # Default mode
+        self.mode = 'paper'  # Default mode, can be 'shadow', 'paper', 'live'
         self.use_rl = False  # V6 doesn't use RL
         self.port = 7497     # Default port
+        self.daily_pnl = 0.0
+        self.last_signals = {}  # Track last signals for Telegram /signals command
     
     def _on_realtime_bar(self, symbol, bar):
         """Enhanced real-time bar handler with V6 signals"""
@@ -271,6 +273,17 @@ class V6LiveTrader(LiveTrader):
         
         # Generate V6 signal
         signal = self.signal_generator.analyze_symbol(symbol, data, current_price)
+        
+        # Store signal for Telegram /signals command
+        if signal and signal['direction'] != 0:
+            self.last_signals[symbol] = {
+                'direction': signal['direction'],
+                'confluence': signal['confluence'],
+                'confidence': signal['confidence'],
+                'pd_zone': signal.get('fvg_data', {}).get('type', '') or signal.get('gap_data', {}).get('type', ''),
+                'entry': signal['entry_price'],
+                'timestamp': datetime.now().isoformat()
+            }
         
         # Update Telegram with enhanced data
         if tn:
@@ -288,7 +301,7 @@ class V6LiveTrader(LiveTrader):
         
         # Check position or signal
         if symbol in self.positions:
-            self._check_position_exit(symbol, current_price)
+            self._check_position_exit_v6(symbol, current_price)
         else:
             # Use V6 signal for entry
             if signal['direction'] != 0 and signal['confluence'] >= 60:
@@ -310,10 +323,43 @@ class V6LiveTrader(LiveTrader):
             if stop_distance <= 0:
                 return
             
-            qty, _ = calculate_position_size(symbol, self.account_value, self.risk_pct, stop_distance, entry_price)
+            qty, risk_amount = calculate_position_size(symbol, self.account_value, self.risk_pct, stop_distance, entry_price)
             if qty <= 0:
                 return
             
+            direction_str = 'LONG' if signal['direction'] == 1 else 'SHORT'
+            
+            # Get FVG/Gap info for logging
+            fvg_info = signal.get('fvg_data', {})
+            gap_info = signal.get('gap_data', {})
+            pd_zone = None
+            if fvg_info:
+                pd_zone = f"FVG {fvg_info.get('type', '')}"
+            elif gap_info:
+                pd_zone = f"Gap {gap_info.get('type', '')}"
+            
+            # Shadow mode - just log, don't execute
+            if self.mode == 'shadow':
+                print(f"[{symbol}] V6 SHADOW SIGNAL: {direction_str} @ {current_price:.4f}")
+                print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f}")
+                print(f"  Confluence: {signal['confluence']}/100 | {pd_zone or 'No PD'}")
+                print(f"  Risk: ${risk_amount:.2f} | Qty: {qty}")
+                
+                # Send signal alert to Telegram
+                if tn:
+                    try:
+                        tn.send_signal_alert(
+                            symbol=symbol,
+                            direction=signal['direction'],
+                            confluence=signal['confluence'],
+                            pd_zone=pd_zone or '',
+                            current_price=current_price
+                        )
+                    except:
+                        pass
+                return
+            
+            # Paper or Live mode - execute trade
             contract = get_ibkr_contract(symbol)
             bracket = place_bracket_order(self.ib, contract, signal['direction'], qty, stop_price, target_price)
             
@@ -331,7 +377,9 @@ class V6LiveTrader(LiveTrader):
                         'confluence': signal['confluence'],
                         'confidence': signal['confidence'],
                         'entry_time': datetime.now(),
-                        'reasoning': signal['reasoning']
+                        'reasoning': signal['reasoning'],
+                        'bars_held': 0,
+                        'current_price': fill_price
                     }
                     
                     self.active_orders[symbol] = {
@@ -339,23 +387,16 @@ class V6LiveTrader(LiveTrader):
                         'tp_order_id': tp_trade.order.orderId
                     }
                     
-                    print(f"[{symbol}] V6 ENTRY: {'LONG' if signal['direction'] == 1 else 'SHORT'} x {filled_qty} @ {fill_price:.4f}")
+                    print(f"[{symbol}] V6 ENTRY: {direction_str} x {filled_qty} @ {fill_price:.4f}")
                     print(f"  Confidence: {signal['confidence']} | Confluence: {signal['confluence']}/100")
-                    print(f"  Reasoning: {' | '.join(signal['reasoning'][:3])}")
+                    print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f}")
+                    if signal['reasoning']:
+                        print(f"  Reasoning: {' | '.join(signal['reasoning'][:3])}")
                     
                     self.trade_count += 1
                     
                     if tn:
                         try:
-                            # V6 specific: include FVG/Gap data in notification
-                            fvg_info = signal.get('fvg_data', {})
-                            gap_info = signal.get('gap_data', {})
-                            pd_zone = None
-                            if fvg_info:
-                                pd_zone = f"FVG {fvg_info.get('type', '')}"
-                            elif gap_info:
-                                pd_zone = f"Gap {gap_info.get('type', '')}"
-                            
                             tn.send_trade_entry(
                                 symbol, signal['direction'], filled_qty, 
                                 fill_price, signal['confluence'], target_price, stop_price,
@@ -365,6 +406,95 @@ class V6LiveTrader(LiveTrader):
                             print(f"[{symbol}] Telegram notification error: {e}")
         except Exception as e:
             print(f"[{symbol}] V6 Error entering trade: {e}")
+    
+    def _check_position_exit_v6(self, symbol, current_price):
+        """Check if position hit stop/target and handle exit with Telegram notification."""
+        try:
+            if symbol not in self.positions:
+                return
+            
+            pos = self.positions[symbol]
+            pos['bars_held'] = pos.get('bars_held', 0) + 1
+            pos['current_price'] = current_price
+            
+            # Query IBKR to see if position still exists
+            ibkr_pos = self.ib.positions()
+            has_position = False
+            
+            for p in ibkr_pos:
+                p_symbol = p.contract.symbol
+                if p.contract.secType == 'CASH':
+                    p_symbol = f"{p.contract.symbol}{p.contract.currency}"
+                elif p.contract.secType == 'CRYPTO':
+                    p_symbol = f"{p.contract.symbol}USD"
+                
+                if p_symbol.upper() == symbol.upper() and abs(p.position) > 0:
+                    has_position = True
+                    break
+            
+            if not has_position:
+                # Position was closed by bracket order
+                self._handle_position_closed_v6(symbol, current_price)
+                
+        except Exception as e:
+            print(f"[{symbol}] Error checking position: {e}")
+    
+    def _handle_position_closed_v6(self, symbol, exit_price):
+        """Handle position closure with PnL calculation and Telegram notification."""
+        try:
+            if symbol not in self.positions:
+                return
+            
+            pos = self.positions[symbol]
+            
+            # Calculate PnL
+            if pos['direction'] == 1:
+                pnl = (exit_price - pos['entry']) * pos['qty']
+            else:
+                pnl = (pos['entry'] - exit_price) * pos['qty']
+            
+            # Apply contract multiplier for futures
+            contract_info = get_contract_info(symbol)
+            if contract_info['type'] == 'futures':
+                pnl *= contract_info['multiplier']
+            
+            self.daily_pnl += pnl
+            
+            # Determine exit reason
+            if pos['direction'] == 1:
+                if exit_price <= pos['stop']:
+                    exit_reason = 'stop'
+                else:
+                    exit_reason = 'target'
+            else:
+                if exit_price >= pos['stop']:
+                    exit_reason = 'stop'
+                else:
+                    exit_reason = 'target'
+            
+            direction_str = 'LONG' if pos['direction'] == 1 else 'SHORT'
+            pnl_str = f"+${pnl:.2f}" if pnl > 0 else f"-${abs(pnl):.2f}"
+            
+            print(f"[{symbol}] V6 EXIT ({exit_reason}): {direction_str} @ {exit_price:.4f} | P&L: {pnl_str}")
+            print(f"  Daily P&L: ${self.daily_pnl:.2f}")
+            
+            # Telegram notification
+            if tn:
+                try:
+                    tn.send_trade_exit(
+                        symbol, pos['direction'], pnl, exit_reason,
+                        pos['entry'], exit_price, pos.get('bars_held', 0)
+                    )
+                except:
+                    pass
+            
+            # Clean up
+            del self.positions[symbol]
+            if symbol in self.active_orders:
+                del self.active_orders[symbol]
+        
+        except Exception as e:
+            print(f"[{symbol}] Error handling position close: {e}")
     
     def poll_historical_symbols(self):
         """Poll with V6 signal generation"""
@@ -389,6 +519,17 @@ class V6LiveTrader(LiveTrader):
                 # Generate V6 signal
                 signal = self.signal_generator.analyze_symbol(symbol, data, current_price)
                 
+                # Store signal for Telegram /signals command
+                if signal and signal['direction'] != 0:
+                    self.last_signals[symbol] = {
+                        'direction': signal['direction'],
+                        'confluence': signal['confluence'],
+                        'confidence': signal['confidence'],
+                        'pd_zone': signal.get('fvg_data', {}).get('type', '') or signal.get('gap_data', {}).get('type', ''),
+                        'entry': signal['entry_price'],
+                        'timestamp': datetime.now().isoformat()
+                    }
+                
                 if tn:
                     try:
                         htf = data['htf_trend'][idx]
@@ -404,7 +545,7 @@ class V6LiveTrader(LiveTrader):
                         pass
                 
                 if symbol in self.positions:
-                    self._check_position_exit(symbol, current_price)
+                    self._check_position_exit_v6(symbol, current_price)
                 else:
                     if signal['direction'] != 0 and signal['confluence'] >= 60:
                         self._enter_trade_v6(symbol, signal, current_price)
