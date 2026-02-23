@@ -254,7 +254,8 @@ class V6SignalGenerator:
 class V6LiveTrader(LiveTrader):
     """V6 Live Trader with FVG and Gap analysis and Telegram integration"""
     
-    def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30):
+    def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30, 
+                 rr_ratio=2.0, confluence_threshold=60, max_daily_loss=-2000):
         super().__init__(ib, symbols, risk_pct, poll_interval)
         self.signal_generator = V6SignalGenerator()
         self.mode = 'paper'  # Default mode, can be 'shadow', 'paper', 'live'
@@ -262,11 +263,26 @@ class V6LiveTrader(LiveTrader):
         self.port = 7497     # Default port
         self.daily_pnl = 0.0
         self.last_signals = {}  # Track last signals for Telegram /signals command
+        
+        # Configurable parameters
+        self.rr_ratio = rr_ratio  # Risk:Reward ratio (default 1:2)
+        self.confluence_threshold = confluence_threshold  # Min confluence to trade
+        self.max_daily_loss = max_daily_loss  # Stop trading if daily loss exceeds this
+        
+        # Signal deduplication - prevent duplicate signals within same hour
+        self.last_signal_time = {}
+        
+        # Sync existing positions on startup
+        self._sync_positions()
     
     def _on_realtime_bar(self, symbol, bar):
         """Enhanced real-time bar handler with V6 signals"""
         if not self.historical_data.get(symbol):
             return
+        
+        # Check daily loss limit
+        if self.daily_pnl <= self.max_daily_loss:
+            return  # Stop trading if daily loss exceeded
         
         data = self.historical_data[symbol]
         current_price = bar.close
@@ -303,8 +319,16 @@ class V6LiveTrader(LiveTrader):
         if symbol in self.positions:
             self._check_position_exit_v6(symbol, current_price)
         else:
+            # Signal deduplication - only check for new entry once per hour
+            current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+            last_signal = self.last_signal_time.get(symbol)
+            
+            if last_signal and last_signal >= current_hour:
+                return  # Already checked this hour
+            
             # Use V6 signal for entry
-            if signal['direction'] != 0 and signal['confluence'] >= 60:
+            if signal['direction'] != 0 and signal['confluence'] >= self.confluence_threshold:
+                self.last_signal_time[symbol] = current_hour  # Mark as checked
                 self._enter_trade_v6(symbol, signal, current_price)
     
     def _enter_trade_v6(self, symbol, signal, current_price):
@@ -314,14 +338,24 @@ class V6LiveTrader(LiveTrader):
             print(f"[{symbol}] Signal found but trading is PAUSED")
             return
         
+        # Check daily loss limit
+        if self.daily_pnl <= self.max_daily_loss:
+            print(f"[{symbol}] Daily loss limit reached (${self.daily_pnl:.2f}), skipping trade")
+            return
+        
         try:
             entry_price = signal['entry_price']
             stop_price = signal['stop_loss']
-            target_price = signal['take_profit']
             
+            # Calculate target using configurable R:R ratio
             stop_distance = abs(entry_price - stop_price)
             if stop_distance <= 0:
                 return
+            
+            if signal['direction'] == 1:
+                target_price = entry_price + (stop_distance * self.rr_ratio)
+            else:
+                target_price = entry_price - (stop_distance * self.rr_ratio)
             
             qty, risk_amount = calculate_position_size(symbol, self.account_value, self.risk_pct, stop_distance, entry_price)
             if qty <= 0:
@@ -341,9 +375,12 @@ class V6LiveTrader(LiveTrader):
             # Shadow mode - just log, don't execute
             if self.mode == 'shadow':
                 print(f"[{symbol}] V6 SHADOW SIGNAL: {direction_str} @ {current_price:.4f}")
-                print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f}")
+                print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f} (R:R 1:{self.rr_ratio})")
                 print(f"  Confluence: {signal['confluence']}/100 | {pd_zone or 'No PD'}")
                 print(f"  Risk: ${risk_amount:.2f} | Qty: {qty}")
+                
+                # Log to file
+                self._log_shadow_trade(symbol, signal, current_price, stop_price, target_price, qty, risk_amount)
                 
                 # Send signal alert to Telegram
                 if tn:
@@ -496,6 +533,195 @@ class V6LiveTrader(LiveTrader):
         except Exception as e:
             print(f"[{symbol}] Error handling position close: {e}")
     
+    def _sync_positions(self):
+        """Sync positions with IBKR on startup."""
+        print("\nSyncing positions with IBKR...")
+        try:
+            ibkr_positions = self.ib.positions()
+            for pos in ibkr_positions:
+                symbol = pos.contract.symbol
+                if pos.contract.secType == 'CASH':
+                    symbol = f"{pos.contract.symbol}{pos.contract.currency}"
+                elif pos.contract.secType == 'CRYPTO':
+                    symbol = f"{pos.contract.symbol}USD"
+                
+                if abs(pos.position) > 0 and symbol.upper() in [s.upper() for s in self.symbols]:
+                    self.positions[symbol] = {
+                        'qty': abs(pos.position),
+                        'direction': 1 if pos.position > 0 else -1,
+                        'entry': pos.avgCost,
+                        'stop': 0,  # Unknown, will need manual management
+                        'target': 0,  # Unknown
+                        'synced': True,
+                        'entry_time': datetime.now(),
+                        'bars_held': 0,
+                        'current_price': pos.avgCost
+                    }
+                    print(f"  Found open position: {symbol} x {pos.position} @ {pos.avgCost:.4f}")
+            
+            if not self.positions:
+                print("  No open positions found")
+        except Exception as e:
+            print(f"  Error syncing positions: {e}")
+    
+    def _refresh_hourly_data(self):
+        """Refresh hourly data for all symbols and check for new bars."""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Refreshing hourly data...")
+        for symbol in self.symbols:
+            try:
+                old_bar_count = len(self.historical_data.get(symbol, {}).get('closes', []))
+                data = prepare_data_ibkr(symbol, ib=self.ib, use_cache=False)  # Force refresh
+                if data and len(data.get('closes', [])) >= 50:
+                    new_bar_count = len(data['closes'])
+                    self.historical_data[symbol] = data
+                    
+                    # Check if we have a new bar
+                    if new_bar_count > old_bar_count:
+                        print(f"  {symbol}: {new_bar_count} bars (NEW BAR)")
+                        # New bar detected - check for signal
+                        if symbol not in self.positions:
+                            current_price = data['closes'][-1]
+                            signal = self.signal_generator.analyze_symbol(symbol, data, current_price)
+                            if signal and signal['direction'] != 0 and signal['confluence'] >= self.confluence_threshold:
+                                self._enter_trade_v6(symbol, signal, current_price)
+                    else:
+                        print(f"  {symbol}: {new_bar_count} bars")
+            except Exception as e:
+                print(f"  {symbol}: Error - {e}")
+        print("")
+    
+    def _reconnect(self) -> bool:
+        """Attempt to reconnect to IBKR."""
+        try:
+            # Disconnect first if partially connected
+            try:
+                self.ib.disconnect()
+            except:
+                pass
+            
+            time.sleep(2)
+            
+            # Try to reconnect using stored port
+            print(f"Attempting to reconnect to IBKR on port {self.port}...")
+            self.ib.connect('127.0.0.1', self.port, clientId=1, timeout=30)
+            
+            if self.ib.isConnected():
+                # Re-initialize account info
+                self._init_account()
+                return True
+            return False
+            
+        except Exception as e:
+            print(f"Reconnection error: {e}")
+            return False
+    
+    def _init_account(self):
+        """Get account value from IBKR."""
+        try:
+            account_values = self.ib.accountValues()
+            for av in account_values:
+                if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                    self.account_value = float(av.value)
+                    break
+            print(f"Account Value: ${self.account_value:,.2f}")
+        except Exception as e:
+            print(f"Error getting account value: {e}")
+    
+    def _restart_streaming(self):
+        """Restart real-time data streaming after reconnection."""
+        print("Restarting data streams...")
+        
+        # Clear old handlers
+        self.bar_handlers = {}
+        self.streaming_symbols = set()
+        
+        # Re-subscribe to real-time bars
+        for symbol in self.symbols:
+            try:
+                contract = get_ibkr_contract(symbol)
+                bars = self.ib.reqRealTimeBars(contract, 5, 'MIDPOINT', False)
+                
+                def make_handler(sym):
+                    def handler(bars, hasNewBar):
+                        if hasNewBar and len(bars) > 0:
+                            self._on_realtime_bar(sym, bars[-1])
+                    return handler
+                
+                bars.updateEvent += make_handler(symbol)
+                self.bar_handlers[symbol] = bars
+                self.streaming_symbols.add(symbol)
+                print(f"  [{symbol}] Streaming restarted")
+                
+            except Exception as e:
+                print(f"  [{symbol}] Streaming failed: {e}")
+        
+        # Refresh historical data
+        self._refresh_hourly_data()
+    
+    def _log_shadow_trade(self, symbol, signal, current_price, stop_price, target_price, qty, risk_amount):
+        """Log shadow trade to JSON file."""
+        try:
+            trade = {
+                'timestamp': datetime.now().isoformat(),
+                'symbol': symbol,
+                'direction': 'LONG' if signal['direction'] == 1 else 'SHORT',
+                'entry': current_price,
+                'stop': stop_price,
+                'target': target_price,
+                'qty': qty,
+                'risk_amount': risk_amount,
+                'confluence': signal['confluence'],
+                'confidence': signal['confidence'],
+                'fvg_data': signal.get('fvg_data'),
+                'gap_data': signal.get('gap_data'),
+                'reasoning': signal.get('reasoning', [])[:3]
+            }
+            
+            with open('v6_shadow_trades.json', 'a') as f:
+                f.write(json.dumps(trade) + '\n')
+        except Exception as e:
+            print(f"Error logging shadow trade: {e}")
+    
+    def _send_position_update(self):
+        """Send hourly position update to Telegram."""
+        if not self.positions or not tn:
+            return
+        
+        try:
+            total_pnl = 0.0
+            positions_data = {}
+            
+            for symbol, pos in self.positions.items():
+                # Get current price
+                current_price = pos.get('current_price', pos.get('entry', 0))
+                if symbol in self.historical_data:
+                    closes = self.historical_data[symbol].get('closes', [])
+                    if closes:
+                        current_price = closes[-1]
+                
+                positions_data[symbol] = {
+                    **pos,
+                    'current_price': current_price
+                }
+                
+                # Calculate P&L
+                if pos['direction'] == 1:
+                    pnl = (current_price - pos['entry']) * pos.get('qty', 0)
+                else:
+                    pnl = (pos['entry'] - current_price) * pos.get('qty', 0)
+                
+                # Apply multiplier for futures
+                contract_info = get_contract_info(symbol)
+                if contract_info['type'] == 'futures':
+                    pnl *= contract_info['multiplier']
+                
+                total_pnl += pnl
+            
+            tn.send_position_update(positions_data, total_pnl)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent hourly position update")
+        except Exception as e:
+            print(f"Error sending position update: {e}")
+    
     def poll_historical_symbols(self):
         """Poll with V6 signal generation"""
         current_time = time.time()
@@ -547,14 +773,23 @@ class V6LiveTrader(LiveTrader):
                 if symbol in self.positions:
                     self._check_position_exit_v6(symbol, current_price)
                 else:
-                    if signal['direction'] != 0 and signal['confluence'] >= 60:
+                    # Signal deduplication for polling
+                    current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+                    last_signal = self.last_signal_time.get(symbol)
+                    
+                    if last_signal and last_signal >= current_hour:
+                        continue  # Already checked this hour
+                    
+                    if signal['direction'] != 0 and signal['confluence'] >= self.confluence_threshold:
+                        self.last_signal_time[symbol] = current_hour
                         self._enter_trade_v6(symbol, signal, current_price)
                         
             except Exception as e:
                 print(f"[{symbol}] Error polling: {e}")
 
 
-def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper'):
+def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper',
+                   rr_ratio=2.0, confluence_threshold=60, max_daily_loss=-2000):
     """Run V6 trading with FVG + Gap analysis and Telegram integration"""
     try:
         from ib_insync import IB
@@ -584,7 +819,8 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper')
     print(f"\nICT V6 - FVG + Gap Trading")
     print(f"Mode: {mode.upper()}")
     print(f"Symbols: {symbols}")
-    print(f"Risk: {risk_pct*100}%")
+    print(f"Risk: {risk_pct*100}% | R:R 1:{rr_ratio}")
+    print(f"Confluence: {confluence_threshold}+ | Max Loss: ${max_daily_loss}")
     print("-" * 50)
     
     # Send startup notification to Telegram
@@ -599,11 +835,14 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper')
         except Exception as e:
             print(f"Telegram startup notification failed: {e}")
     
-    trader = V6LiveTrader(ib, symbols, risk_pct, poll_interval=interval)
+    trader = V6LiveTrader(
+        ib, symbols, risk_pct, poll_interval=interval,
+        rr_ratio=rr_ratio, confluence_threshold=confluence_threshold,
+        max_daily_loss=max_daily_loss
+    )
     trader.account_value = account_value
-    trader.mode = mode  # Add mode attribute for Telegram status
-    trader.use_rl = False  # V6 doesn't use RL
-    trader.port = port  # Store port for potential reconnection
+    trader.mode = mode
+    trader.port = port
     
     # Set live trader reference for Telegram commands
     if tn and hasattr(tn, 'set_live_trader'):
@@ -618,48 +857,122 @@ def run_v6_trading(symbols, interval=30, risk_pct=0.02, port=7497, mode='paper')
         except Exception as e:
             print(f"Failed to start Telegram polling: {e}")
     
+    print("\nTrading started. Press Ctrl+C to stop.")
+    print("Auto-reconnect enabled for nightly IBKR restart (~11:45 PM ET).\n")
+    
     try:
         trader.start()
         
         iteration = 0
+        reconnect_attempts = 0
+        max_reconnect_attempts = 10
+        
         while True:
-            ib.sleep(1)
-            iteration += 1
+            try:
+                # Check if still connected
+                if not ib.isConnected():
+                    raise ConnectionError("IBKR connection lost")
+                
+                ib.sleep(1)
+                iteration += 1
+                reconnect_attempts = 0  # Reset on successful iteration
+                
+                # Poll historical symbols
+                if iteration % interval == 0:
+                    trader.poll_historical_symbols()
+                
+                # Refresh hourly data every 5 minutes
+                if iteration % 300 == 0:
+                    trader._refresh_hourly_data()
+                
+                # Update account value every minute
+                if iteration % 60 == 0:
+                    try:
+                        for av in ib.accountValues():
+                            if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                                trader.account_value = float(av.value)
+                                break
+                    except:
+                        pass
+                
+                # Send hourly position update
+                if iteration % 3600 == 0 and trader.positions:
+                    trader._send_position_update()
+                
+                # Check price alerts every 30 seconds
+                if iteration % 30 == 0 and tn and hasattr(tn, 'check_price_alerts'):
+                    try:
+                        current_prices = {}
+                        for symbol in symbols:
+                            if hasattr(trader, 'historical_data') and symbol in trader.historical_data:
+                                closes = trader.historical_data[symbol].get('closes', [])
+                                if len(closes) > 0:
+                                    current_prices[symbol] = closes[-1]
+                        if current_prices:
+                            tn.check_price_alerts(current_prices)
+                    except Exception as e:
+                        print(f"Price alert check error: {e}")
+                
+                # Check daily loss limit
+                if trader.daily_pnl <= trader.max_daily_loss and iteration % 60 == 0:
+                    print(f"[WARNING] Daily loss limit reached: ${trader.daily_pnl:.2f}")
             
-            if iteration % interval == 0:
-                trader.poll_historical_symbols()
-            
-            # Update account value every minute
-            if iteration % 60 == 0:
-                try:
-                    for av in ib.accountValues():
-                        if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                            trader.account_value = float(av.value)
-                            break
-                except:
-                    pass
-            
-            # Check price alerts every 30 seconds
-            if iteration % 30 == 0 and tn and hasattr(tn, 'check_price_alerts'):
-                try:
-                    # Build current prices dict from historical data
-                    current_prices = {}
-                    for symbol in symbols:
-                        if hasattr(trader, 'historical_data') and symbol in trader.historical_data:
-                            closes = trader.historical_data[symbol].get('closes', [])
-                            if len(closes) > 0:
-                                current_prices[symbol] = closes[-1]
-                    if current_prices:
-                        tn.check_price_alerts(current_prices)
-                except Exception as e:
-                    print(f"Price alert check error: {e}")
+            except (ConnectionError, OSError, Exception) as e:
+                error_msg = str(e)
+                if 'connection' in error_msg.lower() or 'disconnect' in error_msg.lower() or not ib.isConnected():
+                    reconnect_attempts += 1
+                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Connection lost: {e}")
+                    
+                    # Send disconnection alert
+                    if tn:
+                        try:
+                            tn.send_reconnection_alert(success=False, attempt=reconnect_attempts)
+                        except:
+                            pass
+                    
+                    if reconnect_attempts > max_reconnect_attempts:
+                        print(f"Max reconnect attempts ({max_reconnect_attempts}) reached. Stopping.")
+                        break
+                    
+                    # Wait before reconnecting (longer during nightly restart window)
+                    current_hour = datetime.now().hour
+                    if 23 <= current_hour or current_hour < 1:
+                        wait_time = 120  # 2 minutes during nightly restart
+                        print(f"Nightly restart window. Waiting {wait_time}s...")
+                    else:
+                        wait_time = 10 + (reconnect_attempts * 5)  # Progressive backoff
+                        print(f"Waiting {wait_time}s (attempt {reconnect_attempts}/{max_reconnect_attempts})...")
+                    
+                    time.sleep(wait_time)
+                    
+                    # Attempt reconnection
+                    if trader._reconnect():
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Reconnected!")
+                        if tn:
+                            try:
+                                tn.send_reconnection_alert(success=True, attempt=reconnect_attempts)
+                            except:
+                                pass
+                        trader._sync_positions()
+                        trader._restart_streaming()
+                        iteration = 0
+                    else:
+                        print("Reconnection failed. Retrying...")
+                else:
+                    # Non-connection error
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {e}")
+                    if tn:
+                        try:
+                            tn.send_error_alert("V6 Trading Error", str(e))
+                        except:
+                            pass
                 
     except KeyboardInterrupt:
         print("\n\nShutdown...")
     finally:
         trader.stop()
         ib.disconnect()
-        print(f"\nTrades: {trader.trade_count} | Final: ${trader.account_value:,.2f}")
+        print(f"\nTrades: {trader.trade_count} | Daily P&L: ${trader.daily_pnl:.2f} | Final: ${trader.account_value:,.2f}")
 
 
 if __name__ == "__main__":
@@ -671,12 +984,18 @@ if __name__ == "__main__":
     parser.add_argument("--interval", type=int, default=30,
                         help="Poll interval in seconds")
     parser.add_argument("--risk", type=float, default=0.02,
-                        help="Risk per trade (e.g., 0.02 for 2%)")
+                        help="Risk per trade (e.g., 0.02 for 2%%)")
     parser.add_argument("--port", type=int, default=7497,
                         help="IBKR port (7497=paper, 7496=live)")
     parser.add_argument("--mode", type=str, default="paper",
                         choices=["shadow", "paper", "live"],
                         help="Trading mode")
+    parser.add_argument("--rr", type=float, default=2.0,
+                        help="Risk:Reward ratio (e.g., 2.0 for 1:2, 4.0 for 1:4)")
+    parser.add_argument("--confluence", type=int, default=60,
+                        help="Minimum confluence threshold (0-100)")
+    parser.add_argument("--max-loss", type=float, default=-2000,
+                        help="Max daily loss before stopping (negative value)")
     
     args = parser.parse_args()
     symbols = [s.strip().upper() for s in args.symbols.split(',')]
@@ -686,8 +1005,13 @@ if __name__ == "__main__":
     print("="*60)
     print(f"Mode: {args.mode.upper()}")
     print(f"Symbols: {', '.join(symbols)}")
-    print(f"Risk: {args.risk*100}%")
+    print(f"Risk: {args.risk*100}% | R:R 1:{args.rr}")
+    print(f"Confluence: {args.confluence}+ | Max Loss: ${args.max_loss}")
     print(f"Port: {args.port}")
     print("="*60)
     
-    run_v6_trading(symbols, args.interval, args.risk, args.port, args.mode)
+    run_v6_trading(
+        symbols, args.interval, args.risk, args.port, args.mode,
+        rr_ratio=args.rr, confluence_threshold=args.confluence,
+        max_daily_loss=args.max_loss
+    )
