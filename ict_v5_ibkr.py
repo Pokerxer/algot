@@ -1115,6 +1115,7 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
     """
     parent_trade = None
     try:
+        import asyncio
         from ib_insync import MarketOrder, StopOrder, LimitOrder
         
         # Create bracket order
@@ -1140,7 +1141,9 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         # Place parent first
         print(f"[BRACKET] Placing parent order...")
         parent_trade = ib.placeOrder(contract, parent)
-        ib.sleep(0.5)
+        
+        # Use time.sleep instead of ib.sleep to avoid event loop conflicts
+        time.sleep(0.5)
         
         # Get parent order ID and attach children
         parent_id = parent_trade.order.orderId
@@ -1167,8 +1170,8 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         print(f"[BRACKET] Placing TP order (parentId={parent_id}, transmit=True)...")
         tp_trade = ib.placeOrder(contract, tp_order)
         
-        # Give IBKR time to process
-        ib.sleep(0.5)
+        # Give IBKR time to process (use time.sleep to avoid event loop conflicts)
+        time.sleep(0.5)
         
         print(f"[BRACKET] Complete: parent={parent_id} ({parent_trade.orderStatus.status}), "
               f"SL={sl_trade.order.orderId} ({sl_trade.orderStatus.status}), "
