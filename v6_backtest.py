@@ -112,7 +112,7 @@ class V6SignalGenerator:
         return signal
 
 
-def run_v6_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02, use_ibkr=True):
+def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02, use_ibkr=True):
     """Run V6 backtest with FVG + Gap analysis"""
     
     print(f"\n{'='*80}")
@@ -331,7 +331,7 @@ if __name__ == "__main__":
     
     results = run_v6_backtest(
         symbols=symbols,
-        days=360,
+        days=6,
         initial_capital=5000,
         risk_per_trade=0.02,
         use_ibkr=True
@@ -349,6 +349,7 @@ if __name__ == "__main__":
         print(f"Win Rate: {results['summary']['win_rate']:.1f}%")
         print(f"Wins: {results['summary']['wins']} | Losses: {results['summary']['losses']}")
         print(f"Avg Trade: ${results['summary']['avg_trade_pnl']:.2f}")
+
         print(f"\n{'='*80}")
         
         print("\nSymbol Performance:")
