@@ -1213,6 +1213,20 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
             # Non-crypto: Full bracket order following IBKR official documentation
             # Pattern: Parent(transmit=False) -> SL(transmit=False) -> TP(transmit=True)
             
+            # Determine tick size based on contract type
+            # Forex: JPY pairs = 0.001, others = 0.00001 (5 decimal places)
+            tick_size = 0.00001  # Default for most forex
+            if hasattr(contract, 'symbol'):
+                symbol = contract.symbol.upper()
+                if 'JPY' in symbol or (hasattr(contract, 'currency') and contract.currency == 'JPY'):
+                    tick_size = 0.001  # JPY pairs have 3 decimal places
+            
+            # Round prices to valid tick size
+            stop_price = round_to_tick(stop_price, tick_size)
+            target_price = round_to_tick(target_price, tick_size)
+            
+            print(f"[BRACKET] Prices rounded to tick {tick_size}: SL={stop_price}, TP={target_price}")
+            
             # Get next valid order ID from IBKR
             parent_order_id = ib.client.getReqId()
             
