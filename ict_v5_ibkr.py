@@ -1124,19 +1124,31 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         
         print(f"[BRACKET] Creating {action} order for {qty} @ market, SL={stop_price}, TP={target_price}")
         
+        # Determine if this is a crypto contract (requires GTC time-in-force)
+        is_crypto = hasattr(contract, 'secType') and contract.secType == 'CRYPTO'
+        if not is_crypto:
+            # Check by exchange as fallback
+            is_crypto = hasattr(contract, 'exchange') and contract.exchange == 'PAXOS'
+        
         # Parent order (market entry)
         parent = MarketOrder(action, qty)
         parent.transmit = False  # Don't transmit yet
+        if is_crypto:
+            parent.tif = 'GTC'  # Crypto requires Good-Till-Cancelled
         
         # Stop loss order
         stop_order = StopOrder(close_action, qty, stop_price)
         stop_order.parentId = 0  # Will be set after parent is placed
         stop_order.transmit = False
+        if is_crypto:
+            stop_order.tif = 'GTC'  # Crypto requires Good-Till-Cancelled
         
         # Take profit order  
         tp_order = LimitOrder(close_action, qty, target_price)
         tp_order.parentId = 0
         tp_order.transmit = True  # Transmit all orders
+        if is_crypto:
+            tp_order.tif = 'GTC'  # Crypto requires Good-Till-Cancelled
         
         # Place parent first
         print(f"[BRACKET] Placing parent order...")
