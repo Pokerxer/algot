@@ -1113,12 +1113,15 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
     Place a bracket order with stop-loss and take-profit.
     Returns: (parent_trade, sl_trade, tp_trade) or None on failure
     """
+    parent_trade = None
     try:
         from ib_insync import MarketOrder, StopOrder, LimitOrder
         
         # Create bracket order
         action = 'BUY' if direction == 1 else 'SELL'
         close_action = 'SELL' if direction == 1 else 'BUY'
+        
+        print(f"[BRACKET] Creating {action} order for {qty} @ market, SL={stop_price}, TP={target_price}")
         
         # Parent order (market entry)
         parent = MarketOrder(action, qty)
@@ -1135,11 +1138,18 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         tp_order.transmit = True  # Transmit all orders
         
         # Place parent first
+        print(f"[BRACKET] Placing parent order...")
         parent_trade = ib.placeOrder(contract, parent)
         ib.sleep(0.5)
         
         # Get parent order ID and attach children
         parent_id = parent_trade.order.orderId
+        print(f"[BRACKET] Parent order ID: {parent_id}, status: {parent_trade.orderStatus.status}")
+        
+        if parent_id == 0:
+            print(f"[BRACKET] ERROR: Parent order ID is 0 - order not accepted by IBKR")
+            return None
+        
         stop_order.parentId = parent_id
         tp_order.parentId = parent_id
         
@@ -1151,13 +1161,32 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         tp_order.ocaType = 1
         
         # Place child orders
+        print(f"[BRACKET] Placing SL order (parentId={parent_id})...")
         sl_trade = ib.placeOrder(contract, stop_order)
+        
+        print(f"[BRACKET] Placing TP order (parentId={parent_id}, transmit=True)...")
         tp_trade = ib.placeOrder(contract, tp_order)
+        
+        # Give IBKR time to process
+        ib.sleep(0.5)
+        
+        print(f"[BRACKET] Complete: parent={parent_id} ({parent_trade.orderStatus.status}), "
+              f"SL={sl_trade.order.orderId} ({sl_trade.orderStatus.status}), "
+              f"TP={tp_trade.order.orderId} ({tp_trade.orderStatus.status})")
         
         return parent_trade, sl_trade, tp_trade
     
     except Exception as e:
-        print(f"Error placing bracket order: {e}")
+        import traceback
+        print(f"[BRACKET] ERROR placing bracket order: {e}")
+        traceback.print_exc()
+        # If parent was placed but children failed, cancel parent to avoid orphaned order
+        if parent_trade and parent_trade.order.orderId:
+            try:
+                ib.cancelOrder(parent_trade.order)
+                print(f"[BRACKET] Cancelled orphaned parent order {parent_trade.order.orderId}")
+            except Exception as cancel_err:
+                print(f"[BRACKET] Failed to cancel orphaned order: {cancel_err}")
         return None
 
 
