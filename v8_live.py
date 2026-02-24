@@ -553,11 +553,20 @@ class V8LiveTrader:
             # Place market order to close
             action = 'SELL' if pos['direction'] == 1 else 'BUY'
             from ib_insync import MarketOrder
-            order = MarketOrder(action, pos['qty'])
             
-            # Set IOC for crypto (IBKR docs: Market orders for crypto must use IOC)
+            # IBKR crypto rules: BUY must use cashQty, SELL must use totalQuantity
             if pos.get('is_crypto', False):
-                order.tif = 'IOC'
+                if action == 'BUY':
+                    # Closing short: use cashQty
+                    order = MarketOrder(action, 0)
+                    order.tif = 'IOC'
+                    order.cashQty = pos['entry'] * pos['qty']  # USD amount at entry price
+                else:
+                    # Closing long: use totalQuantity
+                    order = MarketOrder(action, pos['qty'])
+                    order.tif = 'IOC'
+            else:
+                order = MarketOrder(action, pos['qty'])
             
             trade = self.ib.placeOrder(contract, order)
             filled, fill_price, _ = wait_for_fill(self.ib, trade, timeout=10)

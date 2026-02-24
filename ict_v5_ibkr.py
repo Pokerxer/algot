@@ -1155,18 +1155,26 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         if is_crypto:
             # PAXOS crypto: Only supports Market and Limit orders (no Stop orders - Error 10292)
             # Official IBKR docs: "Cryptocurrency supports only Market and Limit Order order types"
-            # Market order TIF must be IOC. Limit order TIF supports IOC or Minutes (max 5 min)
+            # IBKR Crypto Trading rules:
+            # - BUY MKT: Must use cashQty (NOT totalQuantity)
+            # - SELL MKT: Use totalQuantity (NOT cashQty)
+            # - All MKT orders: TIF must be IOC
             
             # Round prices to valid tick size (0.01 for most crypto)
             target_price = round_to_tick(target_price, 0.01)
             
             # Parent order (market entry)
-            parent = MarketOrder(action, qty)
-            parent.tif = 'IOC'  # IBKR docs: Market orders for crypto must use IOC
-            # IBKR docs: When placing a BUY MKT order, cashQty must be specified
             if action == 'BUY':
-                parent.cashQty = stop_price * qty  # Use stop_price as estimate for USD needed
-            parent.transmit = True
+                # BUY: Use cashQty only (not totalQuantity)
+                parent = MarketOrder(action, 0)  # qty must be 0 for cashQty
+                parent.tif = 'IOC'
+                parent.cashQty = stop_price * qty  # USD amount
+                parent.transmit = True
+            else:
+                # SELL: Use totalQuantity (not cashQty)
+                parent = MarketOrder(action, qty)
+                parent.tif = 'IOC'
+                parent.transmit = True
             
             print(f"[BRACKET] Placing crypto market order...")
             parent_trade = ib.placeOrder(contract, parent)
