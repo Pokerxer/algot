@@ -360,6 +360,9 @@ class V8LiveTrader:
             
             parent_trade, sl_trade, tp_trade = bracket
             
+            # Check if this is a crypto position (sl_trade will be None)
+            is_crypto = sl_trade is None
+            
             # Wait for fill
             filled, fill_price, filled_qty = wait_for_fill(self.ib, parent_trade, timeout=10)
             
@@ -375,13 +378,18 @@ class V8LiveTrader:
                     'rl_action': signal.get('rl_entry_action'),
                     'risk_amount': risk_amount,
                     'entry_time': datetime.now(),
-                    'bars_held': 0
+                    'bars_held': 0,
+                    'is_crypto': is_crypto,  # Track if software stop-loss is needed
+                    'software_stop': is_crypto  # Flag for software-managed stop-loss
                 }
                 
                 self.active_orders[symbol] = {
-                    'sl_order_id': sl_trade.order.orderId,
+                    'sl_order_id': sl_trade.order.orderId if sl_trade else None,
                     'tp_order_id': tp_trade.order.orderId
                 }
+                
+                if is_crypto:
+                    print(f"[{symbol}] WARNING: Stop-loss @ {stop:.4f} managed in software (PAXOS limitation)")
                 
                 direction_str = 'LONG' if signal['direction'] == 1 else 'SHORT'
                 print(f"[{symbol}] ENTRY: {direction_str} x {filled_qty} @ {fill_price:.4f}")
@@ -408,10 +416,27 @@ class V8LiveTrader:
             print(f"[{symbol}] Error executing entry: {e}")
     
     def _manage_position(self, symbol: str, current_price: float):
-        """Manage open position using RL exit decisions."""
+        """Manage open position using RL exit decisions and software stop-loss for crypto."""
         try:
             pos = self.positions[symbol]
             pos['bars_held'] = pos.get('bars_held', 0) + 1
+            
+            # SOFTWARE STOP-LOSS CHECK (for crypto positions where PAXOS doesn't support stop orders)
+            if pos.get('software_stop', False):
+                stop = pos['stop']
+                direction = pos['direction']
+                
+                # Check if stop-loss hit
+                if direction == 1:  # Long position
+                    if current_price <= stop:
+                        print(f"[{symbol}] SOFTWARE STOP HIT: Price {current_price:.4f} <= Stop {stop:.4f}")
+                        self._execute_exit(symbol, current_price, 'software_stop')
+                        return
+                else:  # Short position
+                    if current_price >= stop:
+                        print(f"[{symbol}] SOFTWARE STOP HIT: Price {current_price:.4f} >= Stop {stop:.4f}")
+                        self._execute_exit(symbol, current_price, 'software_stop')
+                        return
             
             # Check if position still exists in IBKR
             ibkr_pos = self.ib.positions()
@@ -429,7 +454,7 @@ class V8LiveTrader:
                     break
             
             if not has_position:
-                # Position was closed by bracket order
+                # Position was closed by bracket order (TP hit)
                 self._handle_position_closed(symbol, current_price)
                 return
             
@@ -477,8 +502,20 @@ class V8LiveTrader:
             print(f"[{symbol}] Error managing position: {e}")
     
     def _modify_stop(self, symbol: str, new_stop: float):
-        """Modify stop loss order."""
+        """Modify stop loss order (or software stop for crypto)."""
         try:
+            if symbol not in self.positions:
+                return
+            
+            pos = self.positions[symbol]
+            
+            # For crypto with software stop, just update the stop price
+            if pos.get('software_stop', False):
+                self.positions[symbol]['stop'] = new_stop
+                print(f"[{symbol}] Software stop modified to {new_stop:.4f}")
+                return
+            
+            # For regular positions with exchange stop orders
             if symbol not in self.active_orders:
                 return
             
@@ -492,15 +529,35 @@ class V8LiveTrader:
             print(f"[{symbol}] Error modifying stop: {e}")
     
     def _execute_exit(self, symbol: str, current_price: float, reason: str):
-        """Execute market exit."""
+        """Execute market exit and cancel any open bracket orders."""
         try:
             pos = self.positions[symbol]
             contract = get_ibkr_contract(symbol)
+            
+            # Cancel any remaining bracket orders (SL/TP) before placing exit
+            if symbol in self.active_orders:
+                orders = self.active_orders[symbol]
+                for order_type in ['sl_order_id', 'tp_order_id']:
+                    order_id = orders.get(order_type)
+                    if order_id:
+                        try:
+                            # Find and cancel the order
+                            for order in self.ib.openOrders():
+                                if order.orderId == order_id:
+                                    self.ib.cancelOrder(order)
+                                    print(f"[{symbol}] Cancelled {order_type.replace('_order_id', '').upper()} order {order_id}")
+                                    break
+                        except Exception as cancel_err:
+                            print(f"[{symbol}] Failed to cancel {order_type}: {cancel_err}")
             
             # Place market order to close
             action = 'SELL' if pos['direction'] == 1 else 'BUY'
             from ib_insync import MarketOrder
             order = MarketOrder(action, pos['qty'])
+            
+            # Set IOC for crypto (IBKR docs: Market orders for crypto must use IOC)
+            if pos.get('is_crypto', False):
+                order.tif = 'IOC'
             
             trade = self.ib.placeOrder(contract, order)
             filled, fill_price, _ = wait_for_fill(self.ib, trade, timeout=10)

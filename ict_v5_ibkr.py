@@ -1115,17 +1115,23 @@ def round_to_tick(price, tick_size=0.01):
 
 def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
     """
-    Place a bracket order with stop-loss and take-profit.
+    Place a bracket order with stop-loss and take-profit following IBKR official documentation.
+    
     For crypto (PAXOS): Only market entry + limit TP (no stop orders supported).
-    For other instruments: Full bracket with stop-loss.
+    For other instruments: Full bracket with parent + SL + TP using proper orderId assignment.
+    
     Returns: (parent_trade, sl_trade, tp_trade) or None on failure
     Note: sl_trade may be None for crypto positions (stop managed in software)
+    
+    IBKR Bracket Order Pattern (from official docs):
+    - Parent order: transmit=False
+    - Child orders: parentId = parent.orderId, transmit=False (except last)
+    - Last child: transmit=True (triggers transmission of entire bracket)
     """
     parent_trade = None
     try:
         from ib_insync import MarketOrder, StopOrder, LimitOrder
         
-        # Create bracket order
         action = 'BUY' if direction == 1 else 'SELL'
         close_action = 'SELL' if direction == 1 else 'BUY'
         
@@ -1137,20 +1143,24 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         print(f"[BRACKET] Creating {action} order for {qty} @ market, SL={stop_price}, TP={target_price} (crypto={is_crypto})")
         
         if is_crypto:
-            # PAXOS crypto: Only supports Market and Limit orders (no Stop orders)
-            # We'll place market entry + limit TP, stop-loss must be managed in software
+            # PAXOS crypto: Only supports Market and Limit orders (no Stop orders - Error 10292)
+            # Official IBKR docs: "Cryptocurrency supports only Market and Limit Order order types"
+            # Market order TIF must be IOC. Limit order TIF supports IOC or Minutes (max 5 min)
             
             # Round prices to valid tick size (0.01 for most crypto)
             target_price = round_to_tick(target_price, 0.01)
             
-            # Parent order (market entry) - transmit immediately
+            # Parent order (market entry)
             parent = MarketOrder(action, qty)
-            parent.tif = 'GTC'
-            parent.transmit = True  # Transmit immediately for crypto
+            parent.tif = 'IOC'  # IBKR docs: Market orders for crypto must use IOC
+            # IBKR docs: When placing a BUY MKT order, cashQty must be specified
+            if action == 'BUY':
+                parent.cashQty = stop_price * qty  # Use stop_price as estimate for USD needed
+            parent.transmit = True
             
             print(f"[BRACKET] Placing crypto market order...")
             parent_trade = ib.placeOrder(contract, parent)
-            time.sleep(0.5)
+            time.sleep(0.5)  # Wait for order acknowledgment
             
             parent_id = parent_trade.order.orderId
             print(f"[BRACKET] Parent order ID: {parent_id}, status: {parent_trade.orderStatus.status}")
@@ -1160,8 +1170,9 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
                 return None
             
             # Take profit limit order (independent, not attached to parent for crypto)
+            # IBKR docs: Limit orders for crypto support IOC or Minutes (max 5 min)
             tp_order = LimitOrder(close_action, qty, target_price)
-            tp_order.tif = 'GTC'
+            tp_order.tif = 'IOC'  # Using IOC to avoid expiration issues
             tp_order.transmit = True
             
             print(f"[BRACKET] Placing crypto TP limit order @ {target_price}...")
@@ -1170,54 +1181,60 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
             
             print(f"[BRACKET] Crypto order complete: parent={parent_id} ({parent_trade.orderStatus.status}), "
                   f"TP={tp_trade.order.orderId} ({tp_trade.orderStatus.status})")
-            print(f"[BRACKET] WARNING: Stop-loss must be managed in software for crypto (PAXOS doesn't support stop orders)")
+            print(f"[BRACKET] NOTE: Stop-loss @ {stop_price} must be managed in software for crypto")
             
-            # Return None for sl_trade since crypto doesn't support it
+            # Return None for sl_trade since crypto doesn't support stop orders
             return parent_trade, None, tp_trade
         
         else:
-            # Non-crypto: Full bracket order with stop-loss
+            # Non-crypto: Full bracket order following IBKR official documentation
+            # Pattern: Parent(transmit=False) -> SL(transmit=False) -> TP(transmit=True)
+            
+            # Get next valid order ID from IBKR
+            parent_order_id = ib.client.getReqId()
+            
+            # Create parent order with explicit orderId
             parent = MarketOrder(action, qty)
-            parent.transmit = False
+            parent.orderId = parent_order_id
+            parent.transmit = False  # Don't transmit until all children are submitted
             
+            # Create stop-loss order with explicit orderId
             stop_order = StopOrder(close_action, qty, stop_price)
-            stop_order.parentId = 0
-            stop_order.transmit = False
+            stop_order.orderId = parent_order_id + 1
+            stop_order.parentId = parent_order_id
+            stop_order.transmit = False  # Not the last child
             
+            # Create take-profit order with explicit orderId (last child)
             tp_order = LimitOrder(close_action, qty, target_price)
-            tp_order.parentId = 0
-            tp_order.transmit = True
-            
-            print(f"[BRACKET] Placing parent order...")
-            parent_trade = ib.placeOrder(contract, parent)
-            time.sleep(0.5)
-            
-            parent_id = parent_trade.order.orderId
-            print(f"[BRACKET] Parent order ID: {parent_id}, status: {parent_trade.orderStatus.status}")
-            
-            if parent_id == 0:
-                print(f"[BRACKET] ERROR: Parent order ID is 0 - order not accepted")
-                return None
-            
-            stop_order.parentId = parent_id
-            tp_order.parentId = parent_id
+            tp_order.orderId = parent_order_id + 2
+            tp_order.parentId = parent_order_id
+            tp_order.transmit = True  # Last child - triggers transmission of all orders
             
             # Set OCA (One-Cancels-All) group for SL and TP
-            oca_group = f"OCA_{parent_id}_{int(time.time())}"
+            oca_group = f"OCA_{parent_order_id}_{int(time.time())}"
             stop_order.ocaGroup = oca_group
-            stop_order.ocaType = 1
+            stop_order.ocaType = 1  # Cancel with block
             tp_order.ocaGroup = oca_group
             tp_order.ocaType = 1
             
-            print(f"[BRACKET] Placing SL order (parentId={parent_id})...")
+            print(f"[BRACKET] Placing parent order (orderId={parent_order_id}, transmit=False)...")
+            parent_trade = ib.placeOrder(contract, parent)
+            
+            # Small delay between parent and children (IBKR Error 10189 prevention)
+            time.sleep(0.1)
+            
+            print(f"[BRACKET] Placing SL order (orderId={parent_order_id + 1}, parentId={parent_order_id}, transmit=False)...")
             sl_trade = ib.placeOrder(contract, stop_order)
             
-            print(f"[BRACKET] Placing TP order (parentId={parent_id}, transmit=True)...")
+            time.sleep(0.1)
+            
+            print(f"[BRACKET] Placing TP order (orderId={parent_order_id + 2}, parentId={parent_order_id}, transmit=True)...")
             tp_trade = ib.placeOrder(contract, tp_order)
             
+            # Wait for order processing
             time.sleep(0.5)
             
-            print(f"[BRACKET] Complete: parent={parent_id} ({parent_trade.orderStatus.status}), "
+            print(f"[BRACKET] Complete: parent={parent_trade.order.orderId} ({parent_trade.orderStatus.status}), "
                   f"SL={sl_trade.order.orderId} ({sl_trade.orderStatus.status}), "
                   f"TP={tp_trade.order.orderId} ({tp_trade.orderStatus.status})")
             
