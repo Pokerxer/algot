@@ -589,10 +589,14 @@ class V6LiveTrader(LiveTrader):
             print(f"[{symbol}] Error handling position close: {e}")
     
     def _sync_positions(self):
-        """Sync positions with IBKR on startup."""
+        """Sync positions with IBKR on startup, including SL/TP orders."""
         print("\nSyncing positions with IBKR...")
         try:
             ibkr_positions = self.ib.positions()
+            
+            open_trades = self.ib.openTrades()
+            print(f"  Found {len(open_trades)} open trades (including SL/TP orders)")
+            
             for pos in ibkr_positions:
                 symbol = pos.contract.symbol
                 if pos.contract.secType == 'CASH':
@@ -601,23 +605,49 @@ class V6LiveTrader(LiveTrader):
                     symbol = f"{pos.contract.symbol}USD"
                 
                 if abs(pos.position) > 0 and symbol.upper() in [s.upper() for s in self.symbols]:
+                    stop_price = 0
+                    target_price = 0
+                    
+                    for trade in open_trades:
+                        if not trade.order:
+                            continue
+                        
+                        order_symbol = trade.contract.symbol if hasattr(trade.contract, 'symbol') else ''
+                        if trade.contract.secType == 'CASH':
+                            order_symbol = f"{trade.contract.symbol}{trade.contract.currency}"
+                        elif trade.contract.secType == 'CRYPTO':
+                            order_symbol = f"{trade.contract.symbol}USD"
+                        
+                        if order_symbol.upper() != symbol.upper():
+                            continue
+                        
+                        if trade.order.parentId:
+                            if trade.order.orderType == 'STP':
+                                stop_price = trade.order.auxPrice
+                            elif trade.order.orderType == 'LMT':
+                                target_price = trade.order.lmtPrice
+                    
                     self.positions[symbol] = {
                         'qty': abs(pos.position),
                         'direction': 1 if pos.position > 0 else -1,
                         'entry': pos.avgCost,
-                        'stop': 0,  # Unknown, will need manual management
-                        'target': 0,  # Unknown
+                        'stop': stop_price,
+                        'target': target_price,
                         'synced': True,
                         'entry_time': datetime.now(),
                         'bars_held': 0,
                         'current_price': pos.avgCost
                     }
                     print(f"  Found open position: {symbol} x {pos.position} @ {pos.avgCost:.4f}")
+                    if stop_price > 0 or target_price > 0:
+                        print(f"    Stop: {stop_price:.4f} | Target: {target_price:.4f}")
             
             if not self.positions:
                 print("  No open positions found")
         except Exception as e:
             print(f"  Error syncing positions: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _refresh_hourly_data(self):
         """Refresh hourly data for all symbols and check for new bars."""

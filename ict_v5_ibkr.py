@@ -974,8 +974,13 @@ def calculate_position_size(symbol, account_value, risk_pct, stop_distance, curr
         # Convert to units (1 lot = 100,000 units)
         qty = max(1000, int(lots * 100000))
         
-        # Cap at reasonable maximum
-        max_units = 5000000  # 50 lots max
+        # Cap at reasonable maximum based on account value (10x leverage max)
+        max_notional = account_value * 10
+        max_units = int(max_notional / current_price)
+        
+        # Also cap at 10 lots (1,000,000 units) absolute max
+        max_units = min(max_units, 1000000)
+        
         qty = min(qty, max_units)
         
         risk_per_unit = risk_per_lot / 100000
