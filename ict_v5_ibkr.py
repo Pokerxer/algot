@@ -1135,10 +1135,20 @@ def place_bracket_order(ib, contract, direction, qty, stop_price, target_price):
         action = 'BUY' if direction == 1 else 'SELL'
         close_action = 'SELL' if direction == 1 else 'BUY'
         
-        # Determine if this is a crypto contract
-        is_crypto = hasattr(contract, 'secType') and contract.secType == 'CRYPTO'
-        if not is_crypto:
-            is_crypto = hasattr(contract, 'exchange') and contract.exchange == 'PAXOS'
+        # Determine if this is a crypto contract - check multiple attributes for robustness
+        is_crypto = False
+        if hasattr(contract, 'secType') and contract.secType == 'CRYPTO':
+            is_crypto = True
+        elif hasattr(contract, 'exchange') and contract.exchange == 'PAXOS':
+            is_crypto = True
+        elif hasattr(contract, 'symbol'):
+            # Fallback: check if symbol matches known crypto symbols
+            crypto_symbols = {'BTC', 'ETH', 'LTC', 'SOL', 'LINK', 'UNI', 'AVAX', 'MATIC', 'ATOM', 'DOT'}
+            if contract.symbol.upper() in crypto_symbols:
+                is_crypto = True
+        # Also check contract's exchange attribute more thoroughly
+        if hasattr(contract, 'exchange'):
+            print(f"[BRACKET] Contract exchange: {contract.exchange}, symbol: {getattr(contract, 'symbol', 'N/A')}")
         
         print(f"[BRACKET] Creating {action} order for {qty} @ market, SL={stop_price}, TP={target_price} (crypto={is_crypto})")
         
