@@ -572,11 +572,16 @@ class TelegramNotifier:
     
     def send_message(self, message: str, reply_markup=None):
         """Send a message to Telegram (thread-safe, uses HTTP directly)"""
+        print(f"[TELEGRAM] TelegramNotifier.send_message called, initialized={self._initialized}")
+        
         if not self._initialized:
+            print(f"[TELEGRAM] Not initialized, attempting init...")
             if not self.init():
+                print(f"[TELEGRAM] Init failed!")
                 return False
         
         if not BOT_SETTINGS.get('notifications_enabled', True):
+            print(f"[TELEGRAM] Notifications disabled in BOT_SETTINGS")
             return True
             
         try:
@@ -594,10 +599,15 @@ class TelegramNotifier:
                 import json
                 payload['reply_markup'] = json.dumps(reply_markup.to_dict()) if hasattr(reply_markup, 'to_dict') else str(reply_markup)
             
+            print(f"[TELEGRAM] Sending HTTP POST to Telegram API (chat_id={TELEGRAM_CHAT_ID})")
             response = requests.post(url, json=payload, timeout=10)
+            print(f"[TELEGRAM] Response status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"[TELEGRAM] Response body: {response.text}")
             return response.status_code == 200
             
         except Exception as e:
+            print(f"[TELEGRAM] Exception in send_message: {e}")
             logger.error(f"Failed to send Telegram message: {e}")
             return False
     
@@ -2989,10 +2999,14 @@ def send_message(message: str):
 
 def send_notification(message: str):
     """Send notification synchronously - more reliable than async"""
+    print(f"[TELEGRAM] send_notification called, message length: {len(message)}")
     notifier = get_notifier()
     if not notifier._initialized:
+        print(f"[TELEGRAM] Notifier not initialized, initializing now...")
         notifier.init()
-    return notifier.send_message(message)
+    result = notifier.send_message(message)
+    print(f"[TELEGRAM] send_message returned: {result}")
+    return result
 
 
 def update_market_data(symbol: str, data: Dict):
@@ -3277,7 +3291,10 @@ def send_signal(symbol, direction, confluence, price, tp, sl, htf, ltf, kz, pp):
 
 def send_trade_entry(symbol, direction, qty, entry_price, confluence, tp, sl, pd_zone=None, rl_action=None, risk_amount=None):
     """Send trade entry notification with V8 details"""
+    print(f"[TELEGRAM] send_trade_entry called: {symbol} {'LONG' if direction == 1 else 'SHORT'} @ {entry_price}")
+    
     if not BOT_SETTINGS.get('trade_alerts', True):
+        print(f"[TELEGRAM] Trade alerts disabled in BOT_SETTINGS, skipping notification")
         return
     
     ds = DesignSystem

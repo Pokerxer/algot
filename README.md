@@ -2,6 +2,96 @@
 
 ## Complete Python Trading System Based on Inner Circle Trader (ICT) Methodology
 
+V6 Now Complete - All Features Added
+V6 now has feature parity with V8 (except for the RL agent). Here's what was added:
+New Features in V6:
+| Feature | Description | Argument |
+|---------|-------------|----------|
+| Auto-reconnection | Handles IBKR nightly restart (~11:45 PM ET) | Automatic |
+| Position sync | Detects existing positions on startup | Automatic |
+| Configurable R:R | Set risk:reward ratio | --rr 2.0 (default 1:2) |
+| Max daily loss | Stops trading if loss exceeds limit | --max-loss -2000 |
+| Hourly refresh | Refreshes data every 5 minutes | Automatic |
+| Confluence threshold | Minimum confluence to trade | --confluence 60 |
+| Shadow logging | Logs shadow trades to JSON | v6_shadow_trades.json |
+| Signal deduplication | Prevents duplicate signals per hour | Automatic |
+| Position updates | Hourly Telegram position updates | Automatic |
+Usage Examples:
+# Shadow mode with 1:4 R:R (observe only)
+python3 ict_v6_ibkr.py --symbols "BTCUSD,ETHUSD,GC,CL" --mode shadow --rr 4.0
+# Paper trading with higher confluence threshold
+python3 ict_v6_ibkr.py --symbols "BTCUSD,ETHUSD" --mode paper --confluence 70
+# Live trading with tight loss limit
+python3 ict_v6_ibkr.py --symbols "BTCUSD" --mode live --port 7496 --max-loss -1000
+# Full options
+python3 ict_v6_ibkr.py \
+  --symbols "BTCUSD,ETHUSD,GC,CL" \
+  --mode paper \
+  --port 7497 \
+  --risk 0.02 \
+  --rr 2.0 \
+  --confluence 60 \
+  --max-loss -2000
+
+
+sudo systemctl daemon-reload
+sudo systemctl start v6-trading
+sudo systemctl status v6-trading
+
+Run this directly on your GCP VM:
+sudo tee /etc/systemd/system/v6-trading.service > /dev/null << 'EOF'
+[Unit]
+Description=ICT V6 Trading Bot
+After=network.target
+[Service]
+Type=simple
+User=jrwaldehzx
+WorkingDirectory=/home/jrwaldehzx/algot
+ExecStart=/usr/bin/python3 /home/jrwaldehzx/algot/ict_v6_ibkr.py --symbols "SOLUSD,ETHUSD,BTCUSD,LINKUSD,LTCUSD,SI,UNIUSD,NG,NQ,GC,CL,ES" --mode paper --port 7497
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/jrwaldehzx/algot/v6_trading.log
+StandardError=append:/home/jrwaldehzx/algot/v6_trading.log
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee /etc/systemd/system/v6-trading.service > /dev/null << 'EOF'
+[Unit]
+Description=ICT V6 Trading Bot
+After=network.target
+[Service]
+Type=simple
+User=jrwaldehzx
+WorkingDirectory=/home/jrwaldehzx/algot
+ExecStart=/usr/bin/python3 /home/jrwaldehzx/algot/ict_v6_ibkr.py --symbols "EURJPY, USDJPY, GBPJPY, GBPUSD, USDCHF, EURUSD, AUDUSD" --mode paper --port 7497
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/jrwaldehzx/algot/v6_trading.log
+StandardError=append:/home/jrwaldehzx/algot/v6_trading.log
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl stop v6-trading
+sudo cp /home/jrwaldehzx/algot/v6_trading.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start v6-trading
+sudo systemctl status v6-trading
+
+# View last 50 lines
+tail -n 50 ~/algot/v6_trading.log
+# Watch logs in real-time
+tail -f ~/algot/v6_trading.log
+# Search for signals
+grep -i "signal\|entry\|exit" ~/algot/v6_trading.log
+# Search for errors
+grep -i "error\|exception\|fail" ~/algot/v6_trading.log
+Quick commands:
+- tail -f ~/algot/v6_trading.log - Watch live
+- grep SHADOW ~/algot/v6_trading.log - See all shadow signals
+
+
 **Version:** 1.0.0  
 **Total Lines of Code:** 32,946  
 **Total Files:** 24 Python modules
