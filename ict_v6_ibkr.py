@@ -286,7 +286,7 @@ class V6SignalGenerator:
             contract_info = get_contract_info(symbol)
             is_forex = contract_info['type'] == 'forex'
             
-            # Calculate ATR for volatility-adjusted stops
+            # Calculate ATR for volatility-adjusted stops (14-period)
             import numpy as np
             highs = data['highs']
             lows = data['lows']
@@ -298,39 +298,67 @@ class V6SignalGenerator:
                 abs(lows[i] - closes[i-1]) if i > 0 else 0
             ) for i in range(max(0, idx-14), idx+1)])
             
-            # Calculate minimum stop distance in pips
+            # Calculate minimum stop distance based on ATR and volatility
+            # Use ATR multiplier of 2.0 for proper risk management
+            atr_multiplier = 2.0
+            min_atr_multiplier = 1.5
+            pip_size = 0.0001  # Default for non-forex
+            
             if is_forex:
-                # For forex, use 20 pips minimum or 1.5x ATR, whichever is larger
                 decimal_places = contract_info.get('decimal_places', 5)
                 if decimal_places == 3:  # JPY pairs
-                    min_stop_pips = 20 * 100  # 20 pips = 2.0 in JPY terms
                     pip_size = 0.01
+                    # For JPY pairs, ATR is already in price terms
+                    atr_pips = atr / pip_size  # Convert to pips for calculation
+                    min_stop_pips = max(25, atr_pips * min_atr_multiplier)  # Min 25 pips or 1.5x ATR
+                    max_stop_pips = max(80, atr_pips * atr_multiplier)  # Max 80 pips or 2x ATR
                 else:
-                    min_stop_pips = 20  # 20 pips
                     pip_size = 0.0001
+                    atr_pips = atr / pip_size
+                    min_stop_pips = max(25, atr_pips * min_atr_multiplier)  # Min 25 pips
+                    max_stop_pips = max(80, atr_pips * atr_multiplier)  # Max 80 pips
                 
-                atr_stop_distance = atr * 1.5  # 1.5x ATR
+                atr_stop_distance = atr * atr_multiplier  # 2x ATR as default
                 min_stop_distance = min_stop_pips * pip_size
-                
-                # Use the larger of min_stop or ATR-based, but cap at reasonable level
-                # For ranging markets, prefer tighter stops
-                stop_distance = max(min_stop_distance, atr_stop_distance)
-                
-                # Don't let stop be wider than 50 pips (too much risk)
-                max_stop_pips = 50 if decimal_places == 5 else 5000
                 max_stop_distance = max_stop_pips * pip_size
-                stop_distance = min(stop_distance, max_stop_distance)
+                
+                # Use ATR-based stop with min/max bounds
+                stop_distance = max(min_stop_distance, min(atr_stop_distance, max_stop_distance))
             else:
-                # For futures/crypto, use 1.5x ATR with minimum
-                stop_distance = max(atr * 1.5, contract_info.get('min_stop', 0))
+                # For futures/crypto, use 2x ATR
+                stop_distance = max(atr * 2.0, contract_info.get('min_stop', 0))
             
-            # Set stop and target with 2:1 R:R
+            # Calculate risk in pips for R:R validation
+            risk_pips = 50  # Default for non-forex
+            if is_forex:
+                decimal_places = contract_info.get('decimal_places', 5)
+                if decimal_places == 3:
+                    risk_pips = stop_distance / pip_size / 100  # Convert to pips
+                else:
+                    risk_pips = stop_distance / pip_size
+            else:
+                # For futures/crypto, approximate in points
+                risk_pips = stop_distance * 10000  # Approximate conversion
+            
+            # Target with configurable R:R (default 2:1)
+            rr = getattr(self, 'rr_ratio', 2.0)
+            
+            # Validate minimum R:R before returning signal
+            # Skip if risk is too small (< 15 pips) or too large (> 100 pips)
+            if risk_pips < 15 or risk_pips > 100:
+                # Return with zero direction to skip this signal
+                signal['direction'] = 0
+                signal['stop_loss'] = entry
+                signal['take_profit'] = entry
+                return signal
+            
+            # Set stop and target with proper R:R
             if signal['direction'] == 1:
                 signal['stop_loss'] = entry - stop_distance
-                signal['take_profit'] = entry + (stop_distance * 2)
+                signal['take_profit'] = entry + (stop_distance * rr)
             else:
                 signal['stop_loss'] = entry + stop_distance
-                signal['take_profit'] = entry - (stop_distance * 2)
+                signal['take_profit'] = entry - (stop_distance * rr)
         
         return signal
 
