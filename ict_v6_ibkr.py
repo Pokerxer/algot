@@ -283,23 +283,51 @@ class V6SignalGenerator:
             
             signal['entry_price'] = entry
             
-            # Set stop based on recent swing (20-bar lookback) for proper risk management
-            # Using single bar high/low results in stops that are too tight
+            # Calculate stop based on ATR for proper volatility-adjusted stops
             import numpy as np
-            lookback = min(20, idx)
-            recent_lows = data['lows'][idx-lookback:idx+1]
-            recent_highs = data['highs'][idx-lookback:idx+1]
+            contract_info = get_contract_info(symbol)
             
-            if signal['direction'] == 1:
-                # For longs, stop below recent swing low
-                signal['stop_loss'] = float(np.min(recent_lows))
-                risk = entry - signal['stop_loss']
-                signal['take_profit'] = entry + (risk * 2)
+            # Calculate ATR for stop distance
+            highs = data['highs']
+            lows = data['lows']
+            closes = data['closes']
+            atr = np.mean([max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]) if i > 0 else 0,
+                abs(lows[i] - closes[i-1]) if i > 0 else 0
+            ) for i in range(max(0, idx-14), idx+1)])
+            
+            # Use ATR-based stop: 2x ATR for Forex, 1.5x for others
+            if contract_info['type'] == 'forex':
+                atr_multiplier = 2.0
             else:
-                # For shorts, stop above recent swing high
-                signal['stop_loss'] = float(np.max(recent_highs))
-                risk = signal['stop_loss'] - entry
-                signal['take_profit'] = entry - (risk * 2)
+                atr_multiplier = 1.5
+            
+            atr_stop_distance = atr * atr_multiplier
+            
+            # Get minimum stop from contract info
+            min_stop = contract_info.get('min_stop', 0)
+            
+            # Calculate swing-based stop
+            lookback = min(20, idx)
+            recent_lows = lows[idx-lookback:idx+1]
+            recent_highs = highs[idx-lookback:idx+1]
+            swing_stop_distance_long = entry - float(np.min(recent_lows))
+            swing_stop_distance_short = float(np.max(recent_highs)) - entry
+            
+            # Use the larger of ATR-based or swing-based stop, but at least min_stop
+            if signal['direction'] == 1:
+                # For longs
+                raw_stop = max(atr_stop_distance, swing_stop_distance_long, min_stop)
+                signal['stop_loss'] = entry - raw_stop
+                # Use 2:1 R:R
+                signal['take_profit'] = entry + (raw_stop * 2)
+            else:
+                # For shorts
+                raw_stop = max(atr_stop_distance, swing_stop_distance_short, min_stop)
+                signal['stop_loss'] = entry + raw_stop
+                # Use 2:1 R:R
+                signal['take_profit'] = entry - (raw_stop * 2)
         
         return signal
 
