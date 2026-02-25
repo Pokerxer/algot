@@ -274,60 +274,63 @@ class V6SignalGenerator:
             # Use FVG CE as entry refinement if available
             entry = current_price
             if signal['fvg_data']:
-                # Blend current price with FVG CE
                 fvg_ce = signal['fvg_data']['ce']
                 if signal['direction'] == 1 and current_price > fvg_ce:
-                    entry = fvg_ce  # Better entry at FVG CE for longs
+                    entry = fvg_ce
                 elif signal['direction'] == -1 and current_price < fvg_ce:
-                    entry = fvg_ce  # Better entry at FVG CE for shorts
+                    entry = fvg_ce
             
             signal['entry_price'] = entry
             
-            # Calculate stop based on ATR for proper volatility-adjusted stops
-            import numpy as np
+            # Get contract info for pip values and minimum stops
             contract_info = get_contract_info(symbol)
+            is_forex = contract_info['type'] == 'forex'
             
-            # Calculate ATR for stop distance
+            # Calculate ATR for volatility-adjusted stops
+            import numpy as np
             highs = data['highs']
             lows = data['lows']
             closes = data['closes']
+            
             atr = np.mean([max(
                 highs[i] - lows[i],
                 abs(highs[i] - closes[i-1]) if i > 0 else 0,
                 abs(lows[i] - closes[i-1]) if i > 0 else 0
             ) for i in range(max(0, idx-14), idx+1)])
             
-            # Use ATR-based stop: 2x ATR for Forex, 1.5x for others
-            if contract_info['type'] == 'forex':
-                atr_multiplier = 2.0
+            # Calculate minimum stop distance in pips
+            if is_forex:
+                # For forex, use 20 pips minimum or 1.5x ATR, whichever is larger
+                decimal_places = contract_info.get('decimal_places', 5)
+                if decimal_places == 3:  # JPY pairs
+                    min_stop_pips = 20 * 100  # 20 pips = 2.0 in JPY terms
+                    pip_size = 0.01
+                else:
+                    min_stop_pips = 20  # 20 pips
+                    pip_size = 0.0001
+                
+                atr_stop_distance = atr * 1.5  # 1.5x ATR
+                min_stop_distance = min_stop_pips * pip_size
+                
+                # Use the larger of min_stop or ATR-based, but cap at reasonable level
+                # For ranging markets, prefer tighter stops
+                stop_distance = max(min_stop_distance, atr_stop_distance)
+                
+                # Don't let stop be wider than 50 pips (too much risk)
+                max_stop_pips = 50 if decimal_places == 5 else 5000
+                max_stop_distance = max_stop_pips * pip_size
+                stop_distance = min(stop_distance, max_stop_distance)
             else:
-                atr_multiplier = 1.5
+                # For futures/crypto, use 1.5x ATR with minimum
+                stop_distance = max(atr * 1.5, contract_info.get('min_stop', 0))
             
-            atr_stop_distance = atr * atr_multiplier
-            
-            # Get minimum stop from contract info
-            min_stop = contract_info.get('min_stop', 0)
-            
-            # Calculate swing-based stop
-            lookback = min(20, idx)
-            recent_lows = lows[idx-lookback:idx+1]
-            recent_highs = highs[idx-lookback:idx+1]
-            swing_stop_distance_long = entry - float(np.min(recent_lows))
-            swing_stop_distance_short = float(np.max(recent_highs)) - entry
-            
-            # Use the larger of ATR-based or swing-based stop, but at least min_stop
+            # Set stop and target with 2:1 R:R
             if signal['direction'] == 1:
-                # For longs
-                raw_stop = max(atr_stop_distance, swing_stop_distance_long, min_stop)
-                signal['stop_loss'] = entry - raw_stop
-                # Use 2:1 R:R
-                signal['take_profit'] = entry + (raw_stop * 2)
+                signal['stop_loss'] = entry - stop_distance
+                signal['take_profit'] = entry + (stop_distance * 2)
             else:
-                # For shorts
-                raw_stop = max(atr_stop_distance, swing_stop_distance_short, min_stop)
-                signal['stop_loss'] = entry + raw_stop
-                # Use 2:1 R:R
-                signal['take_profit'] = entry - (raw_stop * 2)
+                signal['stop_loss'] = entry + stop_distance
+                signal['take_profit'] = entry - (stop_distance * 2)
         
         return signal
 
