@@ -479,23 +479,21 @@ class V6LiveTrader(LiveTrader):
                     
                     self.trade_count += 1
                     
-                    # Send Telegram notification
-                    print(f"[{symbol}] DEBUG: Sending Telegram entry notification (tn={tn is not None})")
+                    # Send Telegram notification (non-blocking, ignore asyncio errors)
                     if tn:
                         try:
-                            print(f"[{symbol}] DEBUG: Calling tn.send_trade_entry()")
                             result = tn.send_trade_entry(
                                 symbol, signal['direction'], filled_qty, 
                                 fill_price, signal['confluence'], target_price, stop_price,
                                 pd_zone=pd_zone
                             )
-                            print(f"[{symbol}] DEBUG: send_trade_entry returned: {result}")
+                        except RuntimeError as e:
+                            if "event loop" in str(e).lower():
+                                print(f"[{symbol}] Telegram notification skipped (asyncio issue)")
+                            else:
+                                print(f"[{symbol}] Telegram notification error: {e}")
                         except Exception as e:
-                            import traceback
                             print(f"[{symbol}] Telegram notification error: {e}")
-                            traceback.print_exc()
-                    else:
-                        print(f"[{symbol}] DEBUG: tn is None, skipping Telegram notification")
         except Exception as e:
             print(f"[{symbol}] V6 Error entering trade: {e}")
     
