@@ -29,6 +29,18 @@ with open(v5_path, 'r') as f:
 from fvg_handler import FVGHandler, FairValueGap, FVGStatus
 from gap_handler import GapHandler, Gap, GapType, GapDirection
 
+# Import MTF Coordinator and Market Structure Handler
+try:
+    from mtf_coordinator import MTFCoordinator, TimeframePurpose, TimeframeRelation
+    from market_structure_handler import (
+        MarketStructureHandler, MarketStructureAnalysis, 
+        StructureBreakType, TrendState, PriceZone
+    )
+    MTF_AVAILABLE = True
+except ImportError as e:
+    MTF_AVAILABLE = False
+    print(f"WARNING: MTF modules not available: {e}")
+
 import json
 import pandas as pd
 import numpy as np
@@ -58,7 +70,7 @@ def is_trading_paused() -> bool:
 
 
 class V6SignalGenerator:
-    """Enhanced signal generator combining V5 ICT with FVG and Gap analysis"""
+    """Enhanced signal generator combining V5 ICT with FVG, Gap, MTF and Market Structure"""
     
     def __init__(self):
         self.fvg_handler = FVGHandler(
@@ -73,16 +85,32 @@ class V6SignalGenerator:
             large_gap_points_indices=50.0,
             keep_gaps_days=3
         )
+        
+        # Initialize MTF Coordinator for multi-timeframe analysis
+        if MTF_AVAILABLE:
+            self.mtf_coordinator = MTFCoordinator()
+        else:
+            self.mtf_coordinator = None
+            
+        # Initialize Market Structure Handler for BOS/CHoCH/MSS detection
+        if MTF_AVAILABLE:
+            self.ms_handler = MarketStructureHandler(
+                swing_lookback=5,
+                min_displacement_pct=0.1
+            )
+        else:
+            self.ms_handler = None
+            
         self.last_analysis = {}
     
     def analyze_symbol(self, symbol: str, data: Dict, current_price: float) -> Dict:
-        """Comprehensive analysis combining V5, FVG, and Gap signals"""
+        """Comprehensive analysis combining V5, FVG, Gap, MTF and Market Structure"""
         
         # Get V5 base signal
         idx = len(data['closes']) - 1
         v5_signal = get_signal(data, idx)
         
-        # Prepare DataFrame for FVG/Gap analysis
+        # Prepare DataFrame for FVG/Gap/MS analysis
         df = pd.DataFrame({
             'open': data['opens'],
             'high': data['highs'],
@@ -97,10 +125,19 @@ class V6SignalGenerator:
         # Gap Analysis
         gap_analysis = self.gap_handler.analyze(df, current_price)
         
+        # Market Structure Analysis (BOS/CHoCH/MSS detection)
+        ms_analysis = None
+        if self.ms_handler is not None:
+            try:
+                ms_analysis = self.ms_handler.analyze(df)
+            except Exception as e:
+                print(f"MS analysis error: {e}")
+                ms_analysis = None
+        
         # Combine signals
         combined_signal = self._combine_signals(
             symbol, v5_signal, fvg_analysis, gap_analysis, 
-            current_price, data, idx
+            current_price, data, idx, ms_analysis
         )
         
         # Store analysis
@@ -117,8 +154,8 @@ class V6SignalGenerator:
     
     def _combine_signals(self, symbol: str, v5_signal: Optional[Dict], 
                         fvg_analysis, gap_analysis, current_price: float,
-                        data: Dict, idx: int) -> Dict:
-        """Combine V5, FVG, and Gap signals into unified trading signal"""
+                        data: Dict, idx: int, ms_analysis=None) -> Dict:
+        """Combine V5, FVG, Gap, MTF and Market Structure signals into unified trading signal"""
         
         signal = {
             'symbol': symbol,
@@ -184,6 +221,49 @@ class V6SignalGenerator:
         if near_bear_fvg and ltf <= 0:
             base_confluence += 15
             signal['reasoning'].append("V5 Bear FVG: +15")
+        
+        # Market Structure Analysis (BOS/CHoCH/MSS)
+        if ms_analysis is not None:
+            try:
+                # Check for recent structure breaks
+                if hasattr(ms_analysis, 'recent_breaks'):
+                    for brk in ms_analysis.recent_breaks[-3:]:  # Last 3 breaks
+                        if brk.break_type == StructureBreakType.MSS:
+                            # MSS is strongest signal - confirmed reversal
+                            if signal['direction'] == 1 and brk.direction == 'bullish':
+                                base_confluence += 20
+                                signal['reasoning'].append("Bullish MSS: +20")
+                            elif signal['direction'] == -1 and brk.direction == 'bearish':
+                                base_confluence += 20
+                                signal['reasoning'].append("Bearish MSS: +20")
+                        elif brk.break_type == StructureBreakType.BOS:
+                            # BOS confirms trend continuation
+                            if signal['direction'] == 1 and brk.direction == 'bullish':
+                                base_confluence += 15
+                                signal['reasoning'].append("Bullish BOS: +15")
+                            elif signal['direction'] == -1 and brk.direction == 'bearish':
+                                base_confluence += 15
+                                signal['reasoning'].append("Bearish BOS: +15")
+                
+                # Check trend state
+                if hasattr(ms_analysis, 'trend_state'):
+                    if ms_analysis.trend_state == TrendState.BULLISH and signal['direction'] == 1:
+                        base_confluence += 10
+                        signal['reasoning'].append("MS Bullish: +10")
+                    elif ms_analysis.trend_state == TrendState.BEARISH and signal['direction'] == -1:
+                        base_confluence += 10
+                        signal['reasoning'].append("MS Bearish: +10")
+                        
+                # Check premium/discount zone
+                if hasattr(ms_analysis, 'current_zone'):
+                    if ms_analysis.current_zone == PriceZone.DISCOUNT and signal['direction'] == 1:
+                        base_confluence += 10
+                        signal['reasoning'].append("Discount Zone: +10")
+                    elif ms_analysis.current_zone == PriceZone.PREMIUM and signal['direction'] == -1:
+                        base_confluence += 10
+                        signal['reasoning'].append("Premium Zone: +10")
+            except Exception as e:
+                pass  # Silently skip MS analysis if it fails
         
         signal['confluence'] = base_confluence
         
