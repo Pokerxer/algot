@@ -283,13 +283,21 @@ class V6SignalGenerator:
             
             signal['entry_price'] = entry
             
-            # Set stop based on data
+            # Set stop based on recent swing (20-bar lookback) for proper risk management
+            # Using single bar high/low results in stops that are too tight
+            import numpy as np
+            lookback = min(20, idx)
+            recent_lows = data['lows'][idx-lookback:idx+1]
+            recent_highs = data['highs'][idx-lookback:idx+1]
+            
             if signal['direction'] == 1:
-                signal['stop_loss'] = data['lows'][idx]
+                # For longs, stop below recent swing low
+                signal['stop_loss'] = float(np.min(recent_lows))
                 risk = entry - signal['stop_loss']
                 signal['take_profit'] = entry + (risk * 2)
             else:
-                signal['stop_loss'] = data['highs'][idx]
+                # For shorts, stop above recent swing high
+                signal['stop_loss'] = float(np.max(recent_highs))
                 risk = signal['stop_loss'] - entry
                 signal['take_profit'] = entry - (risk * 2)
         
