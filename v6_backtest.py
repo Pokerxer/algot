@@ -112,111 +112,6 @@ class V6SignalGenerator:
         return signal
 
 
-def run_v6_backtest_symbol(symbol, df, initial_capital, risk_per_trade):
-    """Run V6 backtest for a single symbol"""
-    
-    signal_gen = V6SignalGenerator()
-    balance = initial_capital
-    position = None
-    trades = []
-    signal_check_interval = 5
-    
-    for idx in range(50, len(df) - 1):
-        current_price = df.iloc[idx]['close']
-        
-        if position is not None:
-            next_bar = df.iloc[idx + 1]
-            next_low = next_bar['low']
-            next_high = next_bar['high']
-            
-            exit_price = None
-            if position['direction'] == 1:
-                if next_low <= position['stop']:
-                    exit_price = position['stop']
-                elif next_high >= position['target']:
-                    exit_price = position['target']
-            else:
-                if next_high >= position['stop']:
-                    exit_price = position['stop']
-                elif next_low <= position['target']:
-                    exit_price = position['target']
-            
-            if exit_price:
-                contract_info = get_contract_info(symbol)
-                
-                if position['direction'] == 1:
-                    price_change = exit_price - position['entry']
-                else:
-                    price_change = position['entry'] - exit_price
-                
-                if contract_info['type'] == 'futures':
-                    pnl = price_change * position['qty'] * contract_info['multiplier']
-                else:
-                    pnl = price_change * position['qty']
-                
-                balance += pnl
-                
-                trades.append({
-                    'symbol': symbol,
-                    'direction': 'LONG' if position['direction'] == 1 else 'SHORT',
-                    'entry_price': position['entry'],
-                    'exit_price': exit_price,
-                    'qty': position['qty'],
-                    'pnl': pnl,
-                    'v5_confluence': position.get('v5_confluence', 0),
-                    'fvg_boost': position.get('fvg_boost', 0)
-                })
-                position = None
-        
-        if position is None and idx % signal_check_interval == 0:
-            data = {
-                'opens': df['open'].values,
-                'highs': df['high'].values,
-                'lows': df['low'].values,
-                'closes': df['close'].values,
-                'htf_trend': df['htf_trend'].values,
-                'ltf_trend': df['ltf_trend'].values,
-                'kill_zone': df['kill_zone'].values,
-                'price_position': df['price_position'].values,
-                'bullish_fvgs': df.attrs['bullish_fvgs'],
-                'bearish_fvgs': df.attrs['bearish_fvgs']
-            }
-            
-            signal = signal_gen.generate_signal(data, idx)
-            
-            if signal and signal['confluence'] >= 60:
-                if signal['direction'] == 1:
-                    stop = data['lows'][idx]
-                    target = current_price + (current_price - stop) * 2
-                else:
-                    stop = data['highs'][idx]
-                    target = current_price - (stop - current_price) * 2
-                
-                stop_distance = abs(current_price - stop)
-                if stop_distance > 0:
-                    qty, _ = calculate_position_size(
-                        symbol, initial_capital, risk_per_trade, stop_distance, current_price
-                    )
-                    
-                    if qty > 0:
-                        position = {
-                            'entry': current_price,
-                            'stop': stop,
-                            'target': target,
-                            'direction': signal['direction'],
-                            'qty': qty,
-                            'v5_confluence': signal.get('v5_confluence', 0),
-                            'fvg_boost': signal.get('fvg_boost', 0),
-                            'fvg_info': signal.get('fvg_info', '')
-                        }
-    
-    return {
-        'balance': balance,
-        'trades': trades,
-        'initial_balance': initial_capital
-    }
-
-
 def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02, use_ibkr=True):
     """Run V6 backtest with FVG + Gap analysis"""
     
@@ -227,8 +122,10 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
     print(f"Symbols: {', '.join(symbols)}")
     print(f"{'='*80}\n")
     
-    per_symbol_capital = initial_capital / len(symbols)
+    # Initialize signal generator
+    signal_gen = V6SignalGenerator()
     
+    # Load data for all symbols
     all_data = {}
     for symbol in symbols:
         print(f"Loading {symbol}...", end=' ')
@@ -262,39 +159,139 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
         print("No data loaded!")
         return None
     
-    print(f"\nProcessing {len(all_data)} symbols...")
+    # Combine all timestamps
+    all_timestamps = sorted(set().union(*[set(df.index) for df in all_data.values()]))
+    print(f"\nProcessing {len(all_timestamps)} timestamps across {len(all_data)} symbols...")
     
-    total_trades = []
-    total_pnl = 0
+    # Portfolio state
+    balance = initial_capital
+    positions = {}
+    active_trades = []
+    
+    for i, timestamp in enumerate(all_timestamps):
+        if i % 1000 == 0 and i > 0:
+            print(f"  [{i}/{len(all_timestamps)}] Balance: ${balance:,.2f}")
+        
+        for symbol, df in all_data.items():
+            if timestamp not in df.index:
+                continue
+            
+            idx = df.index.get_loc(timestamp)
+            if idx < 50 or idx >= len(df) - 1:
+                continue
+            
+            current_price = df.iloc[idx]['close']
+            
+            # Check position exits
+            if symbol in positions:
+                pos = positions[symbol]
+                next_bar = df.iloc[idx + 1]
+                next_low = next_bar['low']
+                next_high = next_bar['high']
+                
+                exit_price = None
+                if pos['direction'] == 1:
+                    if next_low <= pos['stop']:
+                        exit_price = pos['stop']
+                    elif next_high >= pos['target']:
+                        exit_price = pos['target']
+                else:
+                    if next_high >= pos['stop']:
+                        exit_price = pos['stop']
+                    elif next_low <= pos['target']:
+                        exit_price = pos['target']
+                
+                if exit_price:
+                    contract_info = get_contract_info(symbol)
+                    
+                    if pos['direction'] == 1:
+                        price_change = exit_price - pos['entry']
+                    else:
+                        price_change = pos['entry'] - exit_price
+                    
+                    if contract_info['type'] == 'futures':
+                        pnl = price_change * pos['qty'] * contract_info['multiplier']
+                    else:
+                        pnl = price_change * pos['qty']
+                    
+                    balance += pnl
+                    
+                    active_trades.append({
+                        'symbol': symbol,
+                        'direction': 'LONG' if pos['direction'] == 1 else 'SHORT',
+                        'entry_price': pos['entry'],
+                        'exit_price': exit_price,
+                        'qty': pos['qty'],
+                        'pnl': pnl,
+                        'v5_confluence': pos.get('v5_confluence', 0),
+                        'fvg_boost': pos.get('fvg_boost', 0)
+                    })
+                    del positions[symbol]
+            
+            # Check for entries
+            elif symbol not in positions:
+                # Prepare data for V6 signal
+                data = {
+                    'opens': df['open'].values,
+                    'highs': df['high'].values,
+                    'lows': df['low'].values,
+                    'closes': df['close'].values,
+                    'htf_trend': df['htf_trend'].values,
+                    'ltf_trend': df['ltf_trend'].values,
+                    'kill_zone': df['kill_zone'].values,
+                    'price_position': df['price_position'].values,
+                    'bullish_fvgs': df.attrs['bullish_fvgs'],
+                    'bearish_fvgs': df.attrs['bearish_fvgs']
+                }
+                
+                signal = signal_gen.generate_signal(data, idx)
+                
+                if signal and signal['confluence'] >= 60:
+                    if signal['direction'] == 1:
+                        stop = data['lows'][idx]
+                        target = current_price + (current_price - stop) * 2
+                    else:
+                        stop = data['highs'][idx]
+                        target = current_price - (stop - current_price) * 2
+                    
+                    stop_distance = abs(current_price - stop)
+                    if stop_distance > 0:
+                        qty, _ = calculate_position_size(
+                            symbol, initial_capital, risk_per_trade, stop_distance, current_price
+                        )
+                        
+                        if qty > 0:
+                            positions[symbol] = {
+                                'entry': current_price,
+                                'stop': stop,
+                                'target': target,
+                                'direction': signal['direction'],
+                                'qty': qty,
+                                'v5_confluence': signal.get('v5_confluence', 0),
+                                'fvg_boost': signal.get('fvg_boost', 0),
+                                'fvg_info': signal.get('fvg_info', '')
+                            }
+    
+    # Calculate statistics
+    total_trades = len(active_trades)
+    wins = len([t for t in active_trades if t['pnl'] > 0])
+    losses = total_trades - wins
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    total_pnl = balance - initial_capital
+    total_return_pct = (total_pnl / initial_capital) * 100
+    
+    # Symbol stats
     symbol_stats = {}
-    
-    for symbol, df in all_data.items():
-        print(f"  Backtesting {symbol}...", end=' ')
-        
-        result = run_v6_backtest_symbol(symbol, df, per_symbol_capital, risk_per_trade)
-        
-        symbol_pnl = result['balance'] - result['initial_balance']
-        total_pnl += symbol_pnl
-        total_trades.extend(result['trades'])
-        
-        symbol_wins = len([t for t in result['trades'] if t['pnl'] > 0])
+    for symbol in all_data.keys():
+        symbol_trades = [t for t in active_trades if t['symbol'] == symbol]
+        symbol_wins = len([t for t in symbol_trades if t['pnl'] > 0])
         symbol_stats[symbol] = {
-            'trades': len(result['trades']),
+            'trades': len(symbol_trades),
             'wins': symbol_wins,
-            'losses': len(result['trades']) - symbol_wins,
-            'win_rate': (symbol_wins / len(result['trades']) * 100) if result['trades'] else 0,
-            'pnl': symbol_pnl
+            'losses': len(symbol_trades) - symbol_wins,
+            'win_rate': (symbol_wins / len(symbol_trades) * 100) if symbol_trades else 0,
+            'pnl': sum(t['pnl'] for t in symbol_trades)
         }
-        print(f"{len(result['trades'])} trades, ${symbol_pnl:.2f}")
-    
-    balance = initial_capital + total_pnl
-    
-    all_trades = total_trades
-    wins = len([t for t in all_trades if t['pnl'] > 0])
-    losses = len(all_trades) - wins
-    win_rate = (wins / len(all_trades) * 100) if all_trades else 0
-    final_pnl = balance - initial_capital
-    total_return_pct = (final_pnl / initial_capital) * 100
     
     results = {
         'backtest_config': {
@@ -309,16 +306,16 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
         'summary': {
             'initial_capital': initial_capital,
             'final_capital': round(balance, 2),
-            'total_pnl': round(final_pnl, 2),
+            'total_pnl': round(total_pnl, 2),
             'total_return_pct': round(total_return_pct, 2),
-            'total_trades': len(all_trades),
+            'total_trades': total_trades,
             'wins': wins,
             'losses': losses,
             'win_rate': round(win_rate, 2),
-            'avg_trade_pnl': round(final_pnl / len(all_trades), 2) if all_trades else 0
+            'avg_trade_pnl': round(total_pnl / total_trades, 2) if total_trades > 0 else 0
         },
         'symbol_stats': symbol_stats,
-        'trades': all_trades
+        'trades': active_trades
     }
     
     return results

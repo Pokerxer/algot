@@ -19,7 +19,7 @@ Author: ICT Signal Engine
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Callable
+from typing import List, Dict, Optional, Tuple, Callable, Any
 from enum import Enum
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
