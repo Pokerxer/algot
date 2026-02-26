@@ -537,6 +537,27 @@ class V6LiveTrader(LiveTrader):
             print(f"[{symbol}] Daily loss limit reached (${self.daily_pnl:.2f}), skipping trade")
             return
         
+        # Check for existing position in IBKR before placing new order
+        ibkr_positions = self.ib.positions()
+        for pos in ibkr_positions:
+            pos_symbol = pos.contract.symbol
+            if pos.contract.secType == 'CASH':
+                pos_symbol = f"{pos.contract.symbol}{pos.contract.currency}"
+            elif pos.contract.secType == 'CRYPTO':
+                pos_symbol = f"{pos.contract.symbol}USD"
+            
+            if pos_symbol.upper() == symbol.upper() and abs(pos.position) > 0:
+                print(f"[{symbol}] Already has open position ({pos.position}), skipping entry")
+                # Sync position to local tracker
+                if symbol not in self.positions:
+                    self.positions[symbol] = {
+                        'entry': pos.avgCost,
+                        'direction': 1 if pos.position > 0 else -1,
+                        'qty': abs(pos.position),
+                        'bars_held': 0
+                    }
+                return
+        
         try:
             entry_price = signal['entry_price']
             stop_price = signal['stop_loss']
