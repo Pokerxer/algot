@@ -539,12 +539,15 @@ class V6LiveTrader(LiveTrader):
         
         # Check for existing position in IBKR before placing new order
         ibkr_positions = self.ib.positions()
+        print(f"[{symbol}] Checking {len(ibkr_positions)} IBKR positions...")
         for pos in ibkr_positions:
             pos_symbol = pos.contract.symbol
             if pos.contract.secType == 'CASH':
                 pos_symbol = f"{pos.contract.symbol}{pos.contract.currency}"
             elif pos.contract.secType == 'CRYPTO':
                 pos_symbol = f"{pos.contract.symbol}USD"
+            
+            print(f"  - {pos_symbol} (secType={pos.contract.secType}, position={pos.position})")
             
             if pos_symbol.upper() == symbol.upper() and abs(pos.position) > 0:
                 print(f"[{symbol}] Already has open position ({pos.position}), skipping entry")
