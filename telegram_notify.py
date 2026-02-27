@@ -521,6 +521,7 @@ class TelegramNotifier:
             self.app.add_handler(CommandHandler("positions", self._positions_command))
             self.app.add_handler(CommandHandler("trades", self._trades_command))
             self.app.add_handler(CommandHandler("pnl", self._pnl_command))
+            self.app.add_handler(CommandHandler("orders", self._orders_command))
             self.app.add_handler(CommandHandler("bias", self._bias_command))
             self.app.add_handler(CommandHandler("confluence", self._confluence_command))
             self.app.add_handler(CommandHandler("settings", self._settings_command))
@@ -632,6 +633,7 @@ class TelegramNotifier:
             [
                 InlineKeyboardButton("📊 Dashboard", callback_data="status"),
                 InlineKeyboardButton("📈 Positions", callback_data="positions"),
+                InlineKeyboardButton("📋 Orders", callback_data="orders"),
             ],
             # Row 2: Category submenus
             [
@@ -764,6 +766,7 @@ class TelegramNotifier:
             [
                 InlineKeyboardButton("🔄 Refresh", callback_data="status"),
                 InlineKeyboardButton("📈 Positions", callback_data="positions"),
+                InlineKeyboardButton("📋 Orders", callback_data="orders"),
             ],
             [
                 InlineKeyboardButton("🏠 Home", callback_data="start"),
@@ -811,7 +814,22 @@ class TelegramNotifier:
         
         ds = DesignSystem
         
-        if not CURRENT_POSITIONS:
+        # Get real IBKR positions
+        ibkr_positions = get_ibkr_positions()
+        
+        # Merge with local tracking
+        all_positions = dict(CURRENT_POSITIONS)
+        for symbol, ib_pos in ibkr_positions.items():
+            if symbol not in all_positions:
+                all_positions[symbol] = {
+                    'entry': ib_pos.get('avgCost', 0),
+                    'direction': 1 if ib_pos.get('position', 0) > 0 else -1,
+                    'qty': abs(ib_pos.get('position', 0)),
+                    'bars_held': 0,
+                    'from_ibkr': True
+                }
+        
+        if not all_positions:
             keyboard = [
                 [InlineKeyboardButton("🔄 Refresh", callback_data="positions")],
                 [InlineKeyboardButton("🏠 Home", callback_data="start")]
@@ -836,7 +854,7 @@ Waiting for signals...
         cards = []
         total_unrealized = 0
         
-        for symbol, pos in CURRENT_POSITIONS.items():
+        for symbol, pos in all_positions.items():
             direction = pos.get('direction', 0)
             entry = pos.get('entry', 0)
             stop = pos.get('stop', 0)
@@ -903,7 +921,7 @@ Waiting for signals...
         
         # Build action buttons for each position
         keyboard = []
-        for symbol in list(CURRENT_POSITIONS.keys())[:3]:  # Max 3 positions shown
+        for symbol in list(all_positions.keys())[:3]:  # Max 3 positions shown
             keyboard.append([
                 InlineKeyboardButton(f"🎯 Close {symbol}", callback_data=f"close_{symbol}"),
                 InlineKeyboardButton(f"✏️ Modify", callback_data=f"modify_{symbol}")
@@ -1001,6 +1019,10 @@ Waiting for signals...
         total_emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
         win_rate = (DAILY_STATS['wins'] / max(DAILY_STATS['trades'], 1)) * 100
         
+        # Get real IBKR daily PnL
+        ibkr_daily_pnl = get_ibkr_daily_pnl()
+        ibkr_pnl_emoji = "🟢" if ibkr_daily_pnl > 0 else "🔴" if ibkr_daily_pnl < 0 else "⚪"
+        
         # Calculate profit factor
         gross_profit = sum(t['pnl'] for t in TRADE_HISTORY if t.get('pnl', 0) > 0)
         gross_loss = abs(sum(t['pnl'] for t in TRADE_HISTORY if t.get('pnl', 0) < 0))
@@ -1025,9 +1047,125 @@ Waiting for signals...
 │  Gross Loss:    ${gross_loss:>10,.2f}       │
 └─────────────────────────────────────┘
 
+<b>IBKR Real-time:</b>
+ {ibkr_pnl_emoji} Daily P&L: ${ibkr_daily_pnl:+,.2f}
+
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
         await message_obj.reply_text(message, parse_mode='HTML')
+    
+    async def _orders_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /orders command - show open orders from IBKR"""
+        message_obj = update.message or (update.callback_query.message if update.callback_query else None)
+        if not message_obj:
+            return
+        
+        ds = DesignSystem
+        
+        # Get real IBKR orders
+        ibkr_orders = get_ibkr_orders()
+        
+        # Also get pending positions
+        ibkr_positions = get_ibkr_positions()
+        
+        if not ibkr_orders and not ibkr_positions:
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="orders")],
+                [InlineKeyboardButton("🏠 Home", callback_data="start")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = f"""
+{ds.ICON_CHART} <b>OPEN ORDERS & POSITIONS</b>
+{ds.SEP_THICK}
+
+{ds.STATUS_INFO} <i>No open orders or positions</i>
+
+{ds.SEP_THIN}
+Trading is {"⏸️ PAUSED" if _trading_paused else "▶️ ACTIVE"}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
+"""
+            await message_obj.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+            return
+        
+        cards = []
+        
+        # Show positions
+        for symbol, pos in ibkr_positions.items():
+            direction = "LONG" if pos.get('position', 0) > 0 else "SHORT"
+            dir_icon = ds.ICON_BULL if pos.get('position', 0) > 0 else ds.ICON_BEAR
+            entry = pos.get('avgCost', 0)
+            qty = abs(pos.get('position', 0))
+            
+            card = f"""
+{ds.SEP_THICK}
+{dir_icon} <b>{symbol}</b> {direction} (FILLED)
+{ds.SEP_THIN}
+
+<code>
+ Entry: {ds.format_price(entry)}
+ Qty:   {qty:,.0f}
+</code>
+"""
+            cards.append(card)
+        
+        # Show open orders
+        for order in ibkr_orders:
+            symbol = order.get('symbol', 'N/A')
+            action = order.get('action', 'N/A')
+            order_type = order.get('orderType', 'N/A')
+            qty = order.get('quantity', 0)
+            status = order.get('status', 'Unknown')
+            parentId = order.get('parentId', 0)
+            
+            action_icon = ds.ICON_BULL if action == 'BUY' else ds.ICON_BEAR
+            
+            price_info = ""
+            if order.get('stop_price'):
+                price_info = f"\n Stop: {ds.format_price(order['stop_price'])}"
+            if order.get('limit_price'):
+                price_info += f"\n Limit: {ds.format_price(order['limit_price'])}"
+            
+            parent_info = " (TP/SL)" if parentId > 0 else ""
+            
+            card = f"""
+{ds.SEP_THICK}
+{action_icon} <b>{symbol}</b> {action} {order_type}{parent_info}
+{ds.SEP_THIN}
+
+<code>
+ Status: {status}
+ Qty:    {qty:,.0f}{price_info}
+</code>
+"""
+            cards.append(card)
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh", callback_data="orders")],
+            [InlineKeyboardButton("🏠 Home", callback_data="start")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Get account info
+        account_info = get_ibkr_account_info()
+        net_liq = account_info.get('NetLiquidation', {}).get('value', 'N/A')
+        cash = account_info.get('CashBalance', {}).get('value', 'N/A')
+        
+        message = f"""
+{ds.ICON_CHART} <b>OPEN ORDERS & POSITIONS</b>
+{"".join(cards)}
+
+{ds.SEP_THICK}
+<b>Account:</b>
+ Net Liq: ${net_liq}
+ Cash: ${cash}
+
+{ds.SEP_DOT}
+{ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')} | {datetime.now().strftime('%b %d')}
+"""
+        await message_obj.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
     
     async def _bias_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /bias command - fetches live prices from IBKR"""
@@ -2665,6 +2803,7 @@ Start the bot with --rl-model to enable.
             "start": self._start_command,
             "status": self._status_command,
             "positions": self._positions_command,
+            "orders": self._orders_command,
             "trades": self._trades_command,
             "pnl": self._pnl_command,
             "risk": self._risk_command,
@@ -3064,6 +3203,88 @@ def get_total_unrealized_pnl() -> float:
     for symbol in CURRENT_POSITIONS:
         total += get_position_pnl(symbol)
     return total
+
+
+def get_ibkr_positions() -> Dict:
+    """Get real positions from IBKR"""
+    positions = {}
+    trader = get_live_trader()
+    if trader and hasattr(trader, 'ib'):
+        try:
+            ibkr_positions = trader.ib.positions()
+            for pos in ibkr_positions:
+                symbol = pos.contract.symbol
+                if pos.contract.secType == 'CASH':
+                    symbol = f"{pos.contract.symbol}{pos.contract.currency}"
+                elif pos.contract.secType == 'CRYPTO':
+                    symbol = f"{pos.contract.symbol}USD"
+                elif pos.contract.secType == 'FUT':
+                    symbol = pos.contract.symbol
+                
+                if abs(pos.position) > 0:
+                    positions[symbol] = {
+                        'position': pos.position,
+                        'avgCost': pos.avgCost,
+                        'secType': pos.contract.secType,
+                        'symbol': symbol
+                    }
+        except Exception as e:
+            print(f"Error getting IBKR positions: {e}")
+    return positions
+
+
+def get_ibkr_orders() -> List[Dict]:
+    """Get real open orders from IBKR"""
+    orders = []
+    trader = get_live_trader()
+    if trader and hasattr(trader, 'ib'):
+        try:
+            open_trades = trader.ib.openTrades()
+            for trade in open_trades:
+                if trade.contract and trade.order:
+                    symbol = trade.contract.symbol
+                    if trade.contract.secType == 'CASH':
+                        symbol = f"{trade.contract.symbol}{trade.contract.currency}"
+                    
+                    orders.append({
+                        'symbol': symbol,
+                        'orderId': trade.order.orderId,
+                        'action': trade.order.action,
+                        'quantity': trade.order.totalQuantity,
+                        'orderType': trade.order.orderType,
+                        'status': trade.orderStatus.status if trade.orderStatus else 'Unknown',
+                        'parentId': trade.order.parentId,
+                        'stop_price': trade.order.auxPrice if trade.order.orderType == 'STP' else None,
+                        'limit_price': trade.order.lmtPrice if trade.order.orderType == 'LMT' else None
+                    })
+        except Exception as e:
+            print(f"Error getting IBKR orders: {e}")
+    return orders
+
+
+def get_ibkr_account_info() -> Dict:
+    """Get account info from IBKR"""
+    account_info = {}
+    trader = get_live_trader()
+    if trader and hasattr(trader, 'ib'):
+        try:
+            account_summary = trader.ib.accountSummary()
+            for item in account_summary:
+                account_info[item.tag] = {
+                    'value': item.value,
+                    'currency': item.currency
+                }
+        except Exception as e:
+            print(f"Error getting IBKR account info: {e}")
+    return account_info
+
+
+def get_ibkr_daily_pnl() -> float:
+    """Get daily P&L from IBKR"""
+    trader = get_live_trader()
+    if trader and hasattr(trader, 'daily_pnl'):
+        return trader.daily_pnl
+    return 0.0
 
 
 def check_price_alerts(current_prices: Optional[Dict[str, float]] = None):
