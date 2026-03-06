@@ -159,8 +159,14 @@ class V6BinanceTrader:
     def _init_data(self):
         """Fetch initial data for all symbols"""
         print(f"\nFetching initial data for {len(self.symbols)} symbols...")
-        for symbol in self.symbols:
+        for i, symbol in enumerate(self.symbols):
             bn_symbol = to_binance_symbol(symbol)
+            
+            # Add delay between requests to avoid rate limiting
+            if i > 0:
+                import time
+                time.sleep(1)
+            
             data = fetch_binance_data(bn_symbol, '1h', 200, testnet=self.testnet)
             if data:
                 self.historical_data[symbol] = data
