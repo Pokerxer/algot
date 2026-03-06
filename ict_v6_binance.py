@@ -588,13 +588,13 @@ if __name__ == "__main__":
                        choices=['paper', 'live', 'shadow'],
                        help='Trading mode')
     parser.add_argument('--risk', type=float, default=0.02,
-                       help='Risk per trade (default 0.02 = 2%)')
+                       help='Risk per trade')
     parser.add_argument('--rr', type=float, default=3.0,
-                       help='Risk:Reward ratio (default 3.0)')
+                       help='Risk:Reward ratio')
     parser.add_argument('--confluence', type=int, default=60,
-                       help='Minimum confluence (default 60)')
+                       help='Minimum confluence')
     parser.add_argument('--max-loss', type=float, default=-2000,
-                       help='Maximum daily loss')
+                       help='Max daily loss')
     
     args = parser.parse_args()
     
