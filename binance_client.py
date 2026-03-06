@@ -328,7 +328,8 @@ def fetch_binance_data(
         return result
         
     except Exception as e:
-        print(f"Error fetching Binance data: {e}")
+        print(f"Error fetching Binance data {symbol}: {e}")
+        # Return cached test data if needed
         return None
 
 
