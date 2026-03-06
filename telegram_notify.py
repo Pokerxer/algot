@@ -4707,7 +4707,7 @@ def send_signal_alert(symbol: str, direction: int, confluence: int, pd_zone: str
     send_notification(message)
 
 
-def send_position_update(positions: Dict, total_pnl: float):
+def send_position_update(positions: Dict, daily_pnl: float):
     """Send hourly position update with P&L"""
     if not positions:
         return
@@ -4715,15 +4715,15 @@ def send_position_update(positions: Dict, total_pnl: float):
     ds = DesignSystem
     
     lines = []
+    total_unrealized = 0
+    
     for symbol, pos in positions.items():
         direction = pos.get('direction', 0)
         entry = pos.get('entry', 0)
         current = pos.get('current_price', entry)
         qty = pos.get('qty', 0)
         
-        # Debug logging
-        print(f"[DEBUG] {symbol}: dir={direction}, entry={entry}, current={current}, qty={qty}")
-        
+        # Calculate unrealized P&L
         if direction == 1:
             pnl = (current - entry) * qty
             pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
@@ -4731,12 +4731,14 @@ def send_position_update(positions: Dict, total_pnl: float):
             pnl = (entry - current) * qty
             pnl_pct = ((entry - current) / entry * 100) if entry > 0 else 0
         
+        total_unrealized += pnl
+        
         dir_icon = ds.ICON_BULL if direction == 1 else ds.ICON_BEAR
         pnl_icon = ds.STATUS_SUCCESS if pnl >= 0 else ds.STATUS_ERROR
         
         lines.append(f"{dir_icon} <b>{symbol}</b>: {pnl_icon} ${pnl:+,.2f} ({pnl_pct:+.2f}%)")
     
-    pnl_icon = ds.STATUS_SUCCESS if total_pnl >= 0 else ds.STATUS_ERROR
+    pnl_icon = ds.STATUS_SUCCESS if total_unrealized >= 0 else ds.STATUS_ERROR
     
     message = f"""
 {ds.ICON_CHART} <b>POSITION UPDATE</b>
@@ -4745,7 +4747,8 @@ def send_position_update(positions: Dict, total_pnl: float):
 {chr(10).join(lines)}
 
 {ds.SEP_THIN}
-{pnl_icon} <b>Total Unrealized: ${total_pnl:+,.2f}</b>
+{pnl_icon} <b>Total Unrealized: ${total_unrealized:+,.2f}</b>
+{daily_pnl_icon} <b>Daily P&L: ${daily_pnl:+,.2f}</b>
 
 {ds.SEP_DOT}
 {ds.ICON_CLOCK} {datetime.now().strftime('%H:%M:%S')}
