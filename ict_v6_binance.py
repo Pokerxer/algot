@@ -289,6 +289,7 @@ class V6BinanceTrader:
                     'qty': qty,
                     'direction': signal['direction'],
                     'entry': current_price,
+                    'current_price': current_price,
                     'stop': stop_price,
                     'target': target_price,
                     'entry_time': datetime.now(),
@@ -312,6 +313,7 @@ class V6BinanceTrader:
                 'qty': qty,
                 'direction': signal['direction'],
                 'entry': current_price,
+                'current_price': current_price,
                 'stop': stop_price,
                 'target': target_price,
                 'entry_time': datetime.now(),
@@ -334,6 +336,8 @@ class V6BinanceTrader:
         current_price = data['closes'][-1]
         
         pos = self.positions[symbol]
+        # Update position with current price for Telegram notifications
+        pos['current_price'] = current_price
         
         # Check SL/TP
         exited = False
