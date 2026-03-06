@@ -13,8 +13,9 @@ sys.path.insert(0, '/Users/mac/Documents/Algot')
 import json
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Dict, List
+import pytz
 
 # Import V5 base functions
 import importlib.util
@@ -33,6 +34,18 @@ prepare_data = ict_v5.prepare_data
 get_signal = ict_v5.get_signal
 calculate_position_size = ict_v5.calculate_position_size
 get_contract_info = ict_v5.get_contract_info
+
+
+def is_forex_ny_session(timestamp) -> bool:
+    """Check if timestamp is within NY forex session (7:00 AM - 11:00 AM ET)"""
+    et_tz = pytz.timezone('US/Eastern')
+    ts_aware = timestamp.tz_localize(et_tz) if timestamp.tzinfo is None else timestamp.astimezone(et_tz)
+    current_time = ts_aware.time()
+    
+    forex_open = dt_time(7, 0)   # 7:00 AM ET
+    forex_close = dt_time(11, 0) # 11:00 AM ET
+    
+    return forex_open <= current_time <= forex_close
 
 
 class V6SignalGenerator:
@@ -246,13 +259,16 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
                 
                 signal = signal_gen.generate_signal(data, idx)
                 
-                if signal and signal['confluence'] >= 60:
+                # Session filter for forex: only trade during NY session 7AM-11AM ET
+                in_session = is_forex_ny_session(timestamp)
+                
+                if signal and signal['confluence'] >= 60 and in_session:
                     if signal['direction'] == 1:
                         stop = data['lows'][idx]
-                        target = current_price + (current_price - stop) * 2
+                        target = current_price + (current_price - stop) * 3  # 3:1 R:R
                     else:
                         stop = data['highs'][idx]
-                        target = current_price - (stop - current_price) * 2
+                        target = current_price - (stop - current_price) * 3  # 3:1 R:R
                     
                     stop_distance = abs(current_price - stop)
                     if stop_distance > 0:
@@ -301,7 +317,9 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
             'risk_per_trade': risk_per_trade,
             'data_source': 'IBKR' if use_ibkr else 'Yahoo',
             'timestamp': datetime.now().isoformat(),
-            'version': 'V6'
+            'version': 'V6',
+            'session_filter': 'NY Forex 7AM-11AM ET',
+            'rr_ratio': 3.0
         },
         'summary': {
             'initial_capital': initial_capital,
@@ -322,8 +340,8 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
 
 
 if __name__ == "__main__":
-    # Use fewer symbols for faster backtest
-    symbols = ['SOLUSD','ETHUSD','BTCUSD','LINKUSD','LTCUSD','SI','UNIUSD','NG','NQ','GC','CL','ES']
+    # Forex symbols for NY session backtest - reduced for speed
+    symbols = ['GBPUSD', 'GBPEUR', 'GBPJPY', 'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPNZD']
     
     print("="*80)
     print("ICT V6 - FVG + Gap Backtest")
@@ -331,8 +349,8 @@ if __name__ == "__main__":
     
     results = run_v6_backtest(
         symbols=symbols,
-        days=6,
-        initial_capital=5000,
+        days=30,
+        initial_capital=10000,
         risk_per_trade=0.02,
         use_ibkr=True
     )

@@ -69,6 +69,139 @@ def is_trading_paused() -> bool:
     return False
 
 
+def is_valid_trading_session(is_forex: bool = False) -> Tuple[bool, str]:
+    """
+    Check if current time is within valid trading sessions.
+    London session: 2:00 AM - 5:00 PM ET
+    New York session: 9:30 AM - 4:15 PM ET
+    NY Forex session: 7:00 AM - 11:00 AM ET
+    
+    Args:
+        is_forex: If True, use forex-specific hours
+    
+    Returns:
+        (is_valid, session_name): Whether time is valid and which session
+    """
+    import pytz
+    from datetime import time as dt_time
+    
+    et_tz = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et_tz)
+    current_time = now_et.time()
+    
+    # Forex specific hours
+    if is_forex:
+        forex_open = dt_time(7, 0)   # 7:00 AM ET
+        forex_close = dt_time(11, 0) # 11:00 AM ET
+        if forex_open <= current_time <= forex_close:
+            return True, "NY_FOREX"
+        return False, "CLOSED"
+    
+    # General sessions
+    london_open = dt_time(2, 0)   # 2:00 AM ET
+    london_close = dt_time(17, 0) # 5:00 PM ET
+    
+    ny_open = dt_time(9, 30)     # 9:30 AM ET
+    ny_close = dt_time(16, 15)   # 4:15 PM ET
+    
+    # Check London session
+    if london_open <= current_time <= london_close:
+        return True, "LONDON"
+    
+    # Check NY session
+    if ny_open <= current_time <= ny_close:
+        return True, "NY"
+    
+    return False, "CLOSED"
+
+
+# Forex symbols list
+FOREX_SYMBOLS = {'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'GBPJPY'}
+
+# Currency conversion threshold (GBP)
+CONVERT_THRESHOLD_GBP = 500
+
+
+def get_quote_currency(symbol: str) -> str:
+    """Get the quote currency from a forex pair (e.g., EURUSD -> USD)"""
+    if len(symbol) >= 6:
+        return symbol[-3:]
+    return ''
+
+
+def convert_to_gbp(ib, amount: float, from_currency: str) -> bool:
+    """
+    Convert foreign currency balance to GBP to reduce FX translation risk.
+    Returns True if conversion was executed, False otherwise.
+    """
+    from ib_insync import Forex
+    
+    if from_currency == 'GBP' or abs(amount) < CONVERT_THRESHOLD_GBP:
+        return False
+    
+    try:
+        # For conversion, we sell the foreign currency and buy GBP
+        # EURUSD -> sell EUR, buy USD (then USD would need conversion too)
+        # Actually, IBKR doesn't have direct GBP conversion for all pairs
+        # We need to convert through USD as intermediate
+        
+        if from_currency == 'USD':
+            # Direct USD to GBP conversion
+            contract = Forex('GBPUSD')
+            order_quantity = abs(amount)
+        elif from_currency == 'EUR':
+            # EUR -> USD -> GBP
+            contract = Forex('EURUSD')
+            order_quantity = abs(amount)
+        elif from_currency == 'JPY':
+            contract = Forex('USDJPY')
+            order_quantity = abs(amount) * 100  # JPY pairs typically need 100x
+        elif from_currency == 'CHF':
+            contract = Forex('USDCHF')
+            order_quantity = abs(amount)
+        elif from_currency == 'CAD':
+            contract = Forex('USDCAD')
+            order_quantity = abs(amount)
+        elif from_currency == 'AUD':
+            contract = Forex('AUDUSD')
+            order_quantity = abs(amount)
+        elif from_currency == 'NZD':
+            contract = Forex('NZDUSD')
+            order_quantity = abs(amount)
+        else:
+            print(f"Unsupported currency for conversion: {from_currency}")
+            return False
+        
+        # Place market order to convert
+        order = ib.marketOrder('SELL', order_quantity)
+        trade = ib.placeOrder(contract, order)
+        
+        # Wait briefly for execution
+        import time
+        time.sleep(1)
+        
+        if trade.orderStatus.status == 'Filled':
+            print(f"  [AUTO-CONVERT] Converted {order_quantity:.2f} {from_currency} to GBP")
+            return True
+        else:
+            print(f"  [AUTO-CONVERT] Conversion order status: {trade.orderStatus.status}")
+            return False
+            
+    except Exception as e:
+        print(f"  [AUTO-CONVERT] Error converting {from_currency}: {e}")
+        return False
+
+
+def check_and_convert_profits(ib, currency_pnl: dict) -> None:
+    """
+    Check if any currency balance exceeds threshold and convert to GBP.
+    """
+    for currency, total_pnl in currency_pnl.items():
+        if currency != 'GBP' and abs(total_pnl) >= CONVERT_THRESHOLD_GBP:
+            print(f"  [AUTO-CONVERT] {currency} P&L {total_pnl:.2f} exceeds threshold, converting...")
+            convert_to_gbp(ib, total_pnl, currency)
+
+
 class V6SignalGenerator:
     """Enhanced signal generator combining V5 ICT with FVG, Gap, MTF and Market Structure"""
     
@@ -447,7 +580,7 @@ class V6LiveTrader(LiveTrader):
     """V6 Live Trader with FVG and Gap analysis and Telegram integration"""
     
     def __init__(self, ib, symbols, risk_pct=0.02, poll_interval=30, 
-                 rr_ratio=2.0, confluence_threshold=60, max_daily_loss=-2000):
+                 rr_ratio=3.0, confluence_threshold=60, max_daily_loss=-2000):
         super().__init__(ib, symbols, risk_pct, poll_interval)
         self.signal_generator = V6SignalGenerator()
         self.mode = 'paper'  # Default mode, can be 'shadow', 'paper', 'live'
@@ -463,6 +596,9 @@ class V6LiveTrader(LiveTrader):
         
         # Signal deduplication - prevent duplicate signals within same hour
         self.last_signal_time = {}
+        
+        # Currency P&L tracking for auto-conversion to GBP
+        self.currency_pnl = {}  # {'USD': 500.0, 'EUR': -200.0, ...}
         
         # Sync existing positions on startup
         self._sync_positions()
@@ -535,6 +671,13 @@ class V6LiveTrader(LiveTrader):
         # Check daily loss limit
         if self.daily_pnl <= self.max_daily_loss:
             print(f"[{symbol}] Daily loss limit reached (${self.daily_pnl:.2f}), skipping trade")
+            return
+        
+        # Check trading session (use forex hours for forex symbols)
+        is_forex = symbol.upper() in FOREX_SYMBOLS
+        in_session, session_name = is_valid_trading_session(is_forex=is_forex)
+        if not in_session:
+            print(f"[{symbol}] Outside trading hours ({session_name}), skipping")
             return
         
         # Check for existing position in IBKR before placing new order
@@ -745,6 +888,23 @@ class V6LiveTrader(LiveTrader):
                     )
                 except:
                     pass
+            
+            # Track P&L per currency for auto-conversion
+            quote_currency = get_quote_currency(symbol)
+            if quote_currency:
+                if quote_currency not in self.currency_pnl:
+                    self.currency_pnl[quote_currency] = 0.0
+                self.currency_pnl[quote_currency] += pnl
+                
+                # Check if we should convert to GBP
+                if abs(self.currency_pnl.get(quote_currency, 0)) >= CONVERT_THRESHOLD_GBP:
+                    print(f"  [AUTO-CONVERT] {quote_currency} balance: {self.currency_pnl[quote_currency]:.2f}, checking conversion...")
+                    try:
+                        convert_to_gbp(self.ib, self.currency_pnl[quote_currency], quote_currency)
+                        # Reset after conversion attempt
+                        self.currency_pnl[quote_currency] = 0.0
+                    except Exception as e:
+                        print(f"  [AUTO-CONVERT] Error: {e}")
             
             # Clean up
             del self.positions[symbol]
