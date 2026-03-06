@@ -309,17 +309,17 @@ class V6BinanceTrader:
         
         elif self.mode in ['paper', 'shadow']:
             # Simulate
-                self.positions[symbol] = {
-                    'qty': qty,
-                    'direction': signal['direction'],
-                    'entry': current_price,
-                    'current_price': current_price,
-                    'stop': stop_price,
-                    'target': target_price,
-                    'entry_time': datetime.now(),
-                    'bars_held': 0
-                }
-                print(f"  [{self.mode.upper()}] Trade simulated - qty={qty:.6f}")
+            self.positions[symbol] = {
+                'qty': qty,
+                'direction': signal['direction'],
+                'entry': current_price,
+                'current_price': current_price,
+                'stop': stop_price,
+                'target': target_price,
+                'entry_time': datetime.now(),
+                'bars_held': 0
+            }
+            print(f"  [{self.mode.upper()}] Trade simulated - qty={qty:.6f}")
             return True
         
         return False
