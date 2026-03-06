@@ -290,8 +290,14 @@ def fetch_binance_data(
     
     try:
         url = f"{base_url}{endpoint}"
-        response = requests.get(url, params=params)
-        response.raise_for_status()
+        try:
+            # Try with SSL verification
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+        except Exception:
+            # If SSL fails, try without verification
+            response = requests.get(url, params=params, verify=False)
+            response.raise_for_status()
         data = response.json()
         
         if not data:
