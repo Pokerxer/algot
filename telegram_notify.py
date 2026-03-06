@@ -4723,6 +4723,10 @@ def send_position_update(positions: Dict, daily_pnl: float):
         current = pos.get('current_price', entry)
         qty = pos.get('qty', 0)
         
+        # Log if qty is missing
+        if qty == 0:
+            print(f"[WARNING] {symbol} has qty=0 in position update")
+        
         # Calculate unrealized P&L
         if direction == 1:
             pnl = (current - entry) * qty
