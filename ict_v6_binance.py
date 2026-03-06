@@ -22,6 +22,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import threading
 
+# Environment variables for API keys (more secure)
+BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
+BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
+
 # Import V5 components
 import importlib.util
 v5_path = os.path.join(os.path.dirname(__file__), 'ict_v5_ibkr.py')
@@ -572,12 +576,12 @@ def run_binance_trading(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ICT V6 - Binance Trading')
-    parser.add_argument('--symbols', type=str, default='BTCUSDT,ETHUSDT',
+    parser.add_argument('--symbols', type=str, default='BTCUSDT,SOLUSDT,DOTUSDT,MATICUSDT,ETHUSDT',
                        help='Comma-separated symbols (use USDT format)')
-    parser.add_argument('--api-key', type=str, default='',
-                       help='Binance API Key')
-    parser.add_argument('--api-secret', type=str, default='',
-                       help='Binance API Secret')
+    parser.add_argument('--api-key', type=str, default=BINANCE_API_KEY,
+                       help='Binance API Key (or use BINANCE_API_KEY env var)')
+    parser.add_argument('--api-secret', type=str, default=BINANCE_API_SECRET,
+                       help='Binance API Secret (or use BINANCE_API_SECRET env var)')
     parser.add_argument('--testnet', action='store_true',
                        help='Use Binance testnet')
     parser.add_argument('--mode', type=str, default='paper',
