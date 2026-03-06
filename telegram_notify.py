@@ -4719,12 +4719,16 @@ def send_position_update(positions: Dict, total_pnl: float):
         direction = pos.get('direction', 0)
         entry = pos.get('entry', 0)
         current = pos.get('current_price', entry)
+        qty = pos.get('qty', 0)
+        
+        # Debug logging
+        print(f"[DEBUG] {symbol}: dir={direction}, entry={entry}, current={current}, qty={qty}")
         
         if direction == 1:
-            pnl = (current - entry) * pos.get('qty', 0)
+            pnl = (current - entry) * qty
             pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
         else:
-            pnl = (entry - current) * pos.get('qty', 0)
+            pnl = (entry - current) * qty
             pnl_pct = ((entry - current) / entry * 100) if entry > 0 else 0
         
         dir_icon = ds.ICON_BULL if direction == 1 else ds.ICON_BEAR

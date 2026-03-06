@@ -319,6 +319,7 @@ class V6BinanceTrader:
                 'entry_time': datetime.now(),
                 'bars_held': 0
             }
+            print(f"  [DEBUG] Created position: {symbol} - qty={qty:.6f}, entry={current_price}")
             print(f"  [{self.mode.upper()}] Trade simulated")
             return True
         
@@ -438,9 +439,12 @@ class V6BinanceTrader:
                 # Update Telegram
                 if tn and iteration % 60 == 0:
                     try:
+                        print(f"[DEBUG] Sending positions: {list(self.positions.keys())}")
+                        for sym, pos in self.positions.items():
+                            print(f"[DEBUG] {sym}: {pos}")
                         tn.send_position_update(self.positions, self.daily_pnl)
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"[ERROR] Telegram update failed: {e}")
                 
                 time.sleep(interval)
                 
