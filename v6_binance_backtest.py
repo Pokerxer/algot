@@ -23,7 +23,7 @@ SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'LTCUSDT', 'LINKUSDT',
            'AVAXUSDT', 'MATICUSDT']
 
 RR_RATIO = 3.0
-CONF_THRESHOLD = 40
+CONF_THRESHOLD = 50
 RISK_PCT = 0.02
 DAYS = 90
 
@@ -40,6 +40,11 @@ def generate_signal(closes, highs, lows, idx: int) -> Optional[Dict]:
     past_highs = highs[:idx+1]
     past_lows = lows[:idx+1]
     
+    # EMA alignment (9 > 21 > 50 for bullish)
+    ema_9 = np.mean(past_closes[-9:])
+    ema_21 = np.mean(past_closes[-21:])
+    ema_50 = np.mean(past_closes[-50:]) if len(past_closes) >= 50 else ema_21
+    
     # SMA trends (only past data)
     sma_20 = np.mean(past_closes[-20:])
     sma_50 = np.mean(past_closes[-50:]) if len(past_closes) >= 50 else sma_20
@@ -50,22 +55,48 @@ def generate_signal(closes, highs, lows, idx: int) -> Optional[Dict]:
     low_50 = np.min(past_lows[-lookback:])
     price_pos = (current_price - low_50) / (high_50 - low_50) if high_50 != low_50 else 0.5
     
+    # RSI (14 period)
+    if len(past_closes) >= 15:
+        deltas = np.diff(past_closes[-15:])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        rs = avg_gain / avg_loss if avg_loss > 0 else 100
+        rsi = 100 - (100 / (1 + rs))
+    else:
+        rsi = 50
+    
     confluence = 0
     direction = 0
     
-    # Trend
-    if sma_20 > sma_50:
-        confluence += 25
+    # Trend: EMA alignment (+15)
+    if ema_9 > ema_21 > ema_50:
+        confluence += 15
         direction = 1
-    elif sma_20 < sma_50:
-        confluence += 25
+    elif ema_9 < ema_21 < ema_50:
+        confluence += 15
         direction = -1
     
-    # Price position
+    # Trend: SMA crossover (+15)
+    if sma_20 > sma_50:
+        confluence += 15
+        direction = 1
+    elif sma_20 < sma_50:
+        confluence += 15
+        direction = -1
+    
+    # Price position (+20)
     if price_pos < 0.25:
         confluence += 20
     elif price_pos > 0.75:
         confluence += 20
+    
+    # RSI extreme (+10)
+    if rsi < 35 and direction == 1:
+        confluence += 10
+    elif rsi > 65 and direction == -1:
+        confluence += 10
     
     # ATR for stops (past data only)
     atr_lookback = min(14, len(past_lows) - 1)
