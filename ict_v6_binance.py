@@ -454,8 +454,8 @@ class V6SignalGenerator:
             detect_suspension_blocks=False
         )
         self.gap_handler = GapHandler(
-            large_gap_pips_forex=0.5,  # Crypto uses percentages
-            large_ggap_points_indices=0.5,
+            large_gap_pips_forex=0.5,
+            large_gap_points_indices=0.5,
             keep_gaps_days=1
         )
     
