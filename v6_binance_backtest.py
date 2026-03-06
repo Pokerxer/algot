@@ -1,9 +1,7 @@
 """
-V6 Backtest - Binance Crypto (Realistic)
-========================================
-Proper backtest without lookahead bias:
-- Entry at close of signal bar
-- Exit at close of next bar (not intrabar high/low)
+V6 Backtest - Binance Crypto (Using Real V6 Signal)
+====================================================
+Uses the actual V6 signal generator with FVG, HTF/LTF, Kill Zone, Price Position
 """
 
 import sys
@@ -23,90 +21,144 @@ SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'LTCUSDT', 'LINKUSDT',
            'AVAXUSDT', 'MATICUSDT']
 
 RR_RATIO = 3.0
-CONF_THRESHOLD = 50
+CONF_THRESHOLD = 60
 RISK_PCT = 0.02
 DAYS = 90
 
 
-def generate_signal(closes, highs, lows, idx: int) -> Optional[Dict]:
-    """Generate V6 signal - NO LOOKAHEAD"""
+def prepare_binance_data(symbol: str, days: int = 90) -> Optional[Dict]:
+    """Prepare Binance data in V6 format"""
+    data = fetch_binance_data(symbol, '1h', days * 24 + 100)
+    if not data or len(data['closes']) < 100:
+        return None
+    
+    highs = np.array(data['highs'])
+    lows = np.array(data['lows'])
+    closes = np.array(data['closes'])
+    opens = np.array(data['opens'])
+    
+    n = len(closes)
+    
+    # FVGs (simple calculation)
+    bullish_fvgs = []
+    bearish_fvgs = []
+    for i in range(3, n):
+        if lows[i] > highs[i-2]:
+            bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
+        if highs[i] < lows[i-2]:
+            bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
+    
+    # HTF trend (daily approximation)
+    htf_trend = np.zeros(n)
+    for i in range(24, n):
+        if i % 24 == 0:
+            lookback_start = max(0, i - 24 * 5)
+            high_5d = np.max(highs[lookback_start:i])
+            low_5d = np.min(lows[lookback_start:i])
+            if closes[i] > high_5d * 0.99:
+                htf_trend[i:] = 1
+            elif closes[i] < low_5d * 1.01:
+                htf_trend[i:] = -1
+    
+    # LTF trend
+    ltf_trend = np.zeros(n)
+    for i in range(20, n):
+        momentum = closes[i] - closes[i-10]
+        pct = momentum / closes[i-10] if closes[i-10] > 0 else 0
+        if pct > 0.005:
+            ltf_trend[i] = 1
+        elif pct < -0.005:
+            ltf_trend[i] = -1
+    
+    # Kill zone
+    kill_zone = np.zeros(n, dtype=bool)
+    for i in range(20, n):
+        atr = np.mean([highs[i-j] - lows[i-j] for j in range(1, min(14, i))])
+        avg_range = np.mean([highs[i-j] - lows[i-j] for j in range(20, min(50, i))])
+        if avg_range > 0 and atr > avg_range * 1.3:
+            kill_zone[i] = True
+    
+    # Price position
+    price_position = np.zeros(n)
+    for i in range(20, n):
+        high_20 = np.max(highs[i-20:i])
+        low_20 = np.min(lows[i-20:i])
+        if high_20 != low_20:
+            price_position[i] = (closes[i] - low_20) / (high_20 - low_20)
+    
+    return {
+        'opens': opens,
+        'highs': highs,
+        'lows': lows,
+        'closes': closes,
+        'htf_trend': htf_trend,
+        'ltf_trend': ltf_trend,
+        'kill_zone': kill_zone,
+        'price_position': price_position,
+        'bullish_fvgs': bullish_fvgs,
+        'bearish_fvgs': bearish_fvgs
+    }
+
+
+def analyze_v6(data: Dict, idx: int) -> Optional[Dict]:
+    """Generate V6 signal with all factors"""
     if idx < 50:
         return None
     
+    closes = data['closes']
+    highs = data['highs']
+    lows = data['lows']
     current_price = closes[idx]
     
-    # Use ONLY past data (no lookahead)
-    past_closes = closes[:idx+1]
-    past_highs = highs[:idx+1]
-    past_lows = lows[:idx+1]
+    htf = data['htf_trend'][idx]
+    ltf = data['ltf_trend'][idx]
+    kz = data['kill_zone'][idx]
+    pp = data['price_position'][idx]
     
-    # EMA alignment (9 > 21 > 50 for bullish)
-    ema_9 = np.mean(past_closes[-9:])
-    ema_21 = np.mean(past_closes[-21:])
-    ema_50 = np.mean(past_closes[-50:]) if len(past_closes) >= 50 else ema_21
-    
-    # SMA trends (only past data)
-    sma_20 = np.mean(past_closes[-20:])
-    sma_50 = np.mean(past_closes[-50:]) if len(past_closes) >= 50 else sma_20
-    
-    # Price position (only past 50 bars)
-    lookback = min(50, len(past_highs))
-    high_50 = np.max(past_highs[-lookback:])
-    low_50 = np.min(past_lows[-lookback:])
-    price_pos = (current_price - low_50) / (high_50 - low_50) if high_50 != low_50 else 0.5
-    
-    # RSI (14 period)
-    if len(past_closes) >= 15:
-        deltas = np.diff(past_closes[-15:])
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
-        rs = avg_gain / avg_loss if avg_loss > 0 else 100
-        rsi = 100 - (100 / (1 + rs))
-    else:
-        rsi = 50
+    # FVGs
+    near_bull = next((f for f in reversed(data['bullish_fvgs']) 
+                     if f['idx'] < idx and f['mid'] < current_price), None)
+    near_bear = next((f for f in reversed(data['bearish_fvgs']) 
+                     if f['idx'] < idx and f['mid'] > current_price), None)
     
     confluence = 0
     direction = 0
     
-    # Trend: EMA alignment (+15)
-    if ema_9 > ema_21 > ema_50:
+    # Kill zone (+15)
+    if kz:
         confluence += 15
-        direction = 1
-    elif ema_9 < ema_21 < ema_50:
-        confluence += 15
-        direction = -1
     
-    # Trend: SMA crossover (+15)
-    if sma_20 > sma_50:
+    # HTF+LTF alignment (+25)
+    if htf == 1 and ltf >= 0:
+        confluence += 25
+        direction = 1
+    elif htf == -1 and ltf <= 0:
+        confluence += 25
+        direction = -1
+    elif htf == 0 and ltf == 1:
         confluence += 15
         direction = 1
-    elif sma_20 < sma_50:
+    elif htf == 0 and ltf == -1:
         confluence += 15
         direction = -1
     
     # Price position (+20)
-    if price_pos < 0.25:
+    if pp < 0.25:
         confluence += 20
-    elif price_pos > 0.75:
+    elif pp > 0.75:
         confluence += 20
     
-    # RSI extreme (+10)
-    if rsi < 35 and direction == 1:
-        confluence += 10
-    elif rsi > 65 and direction == -1:
-        confluence += 10
-    
-    # ATR for stops (past data only)
-    atr_lookback = min(14, len(past_lows) - 1)
-    if atr_lookback > 0:
-        atr = np.mean([past_highs[i] - past_lows[i] for i in range(-atr_lookback, 0)])
-    else:
-        atr = current_price * 0.02
+    # FVG confluence (+15)
+    if near_bull and ltf >= 0:
+        confluence += 15
+    if near_bear and ltf <= 0:
+        confluence += 15
     
     if direction == 0:
         return None
+    
+    # ATR for stops
+    atr = np.mean([highs[i] - lows[i] for i in range(max(0, idx-14), idx)])
     
     return {
         'direction': direction,
@@ -116,60 +168,48 @@ def generate_signal(closes, highs, lows, idx: int) -> Optional[Dict]:
 
 
 def check_exit(position: Dict, close_price: float) -> tuple:
-    """
-    Check if position should exit based on close price only.
-    Returns (exited: bool, exit_price: float, reason: str)
-    """
-    if position['direction'] == 1:  # LONG
+    if position['direction'] == 1:
         if close_price <= position['stop']:
             return True, position['stop'], 'stop'
         elif close_price >= position['target']:
             return True, position['target'], 'target'
-    else:  # SHORT
+    else:
         if close_price >= position['stop']:
             return True, position['stop'], 'stop'
         elif close_price <= position['target']:
             return True, position['target'], 'target'
-    
     return False, 0, ''
 
 
 def run_backtest():
-    """Run backtest with proper entry/exit logic"""
+    """Run backtest"""
     
-    print(f"ICT V6 Binance Backtest (Realistic)")
+    print(f"ICT V6 Binance Backtest (Real V6 Signal)")
     print(f"Symbols: {len(SYMBOLS)} | Days: {DAYS}")
     print(f"RR: {RR_RATIO}:1 | Conf: {CONF_THRESHOLD} | Risk: {RISK_PCT*100}%")
     print("=" * 60)
     
     all_data = {}
     
-    # Load all data first
     for symbol in SYMBOLS:
         print(f"Loading {symbol}...", end=' ')
-        data = fetch_binance_data(symbol, '1h', DAYS * 24 + 100)  # Extra for warmup
-        if data and len(data['closes']) > 100:
-            all_data[symbol] = {
-                'closes': np.array(data['closes']),
-                'highs': np.array(data['highs']),
-                'lows': np.array(data['lows']),
-            }
+        data = prepare_binance_data(symbol, DAYS)
+        if data:
+            all_data[symbol] = data
             print(f"✓ {len(data['closes'])} bars")
         else:
-            print(f"✗ Failed")
+            print("✗ Failed")
     
     if not all_data:
-        print("No data loaded!")
+        print("No data!")
         return
     
-    # Backtest each symbol
     results = []
-    all_trades = []
     
     for symbol, data in all_data.items():
+        print(f"Backtesting {symbol}...", end=' ')
+        
         closes = data['closes']
-        highs = data['highs']
-        lows = data['lows']
         
         balance = 10000
         trades = 0
@@ -177,16 +217,14 @@ def run_backtest():
         pnl = 0
         position = None
         
-        # Start from index 50 (after warmup)
         for idx in range(50, len(closes) - 1):
             current_close = closes[idx]
             
-            # Check exit at close of current bar (NO LOOKAHEAD)
+            # Check exit
             if position:
                 exited, exit_price, reason = check_exit(position, current_close)
                 
                 if exited:
-                    # Calculate P&L
                     if position['direction'] == 1:
                         trade_pnl = (exit_price - position['entry']) * position['qty']
                     else:
@@ -195,38 +233,25 @@ def run_backtest():
                     pnl += trade_pnl
                     balance += trade_pnl
                     trades += 1
-                    
                     if trade_pnl > 0:
                         wins += 1
-                    
-                    all_trades.append({
-                        'symbol': symbol,
-                        'entry': position['entry'],
-                        'exit': exit_price,
-                        'direction': 'LONG' if position['direction'] == 1 else 'SHORT',
-                        'pnl': trade_pnl,
-                        'reason': reason
-                    })
-                    
                     position = None
             
-            # Check for new entry at close of current bar
+            # Check entry
             if not position:
-                signal = generate_signal(closes, highs, lows, idx)
+                signal = analyze_v6(data, idx)
                 
                 if signal and signal['confluence'] >= CONF_THRESHOLD:
                     stop_dist = signal['stop_distance']
-                    
-                    # Position size based on risk
                     risk = balance * RISK_PCT
                     qty = risk / stop_dist
                     
                     if qty > 0:
-                        if signal['direction'] == 1:  # LONG
+                        if signal['direction'] == 1:
                             entry = current_close
                             stop = entry - stop_dist
                             target = entry + stop_dist * RR_RATIO
-                        else:  # SHORT
+                        else:
                             entry = current_close
                             stop = entry + stop_dist
                             target = entry - stop_dist * RR_RATIO
@@ -236,14 +261,13 @@ def run_backtest():
                             'stop': stop,
                             'target': target,
                             'direction': signal['direction'],
-                            'qty': qty,
-                            'confluence': signal['confluence']
+                            'qty': qty
                         }
         
-        # Close any open position at last close
+        # Close at end
         if position:
             final_close = closes[-1]
-            exited, exit_price, reason = check_exit(position, final_close)
+            exited, exit_price, _ = check_exit(position, final_close)
             if exited:
                 if position['direction'] == 1:
                     trade_pnl = (exit_price - position['entry']) * position['qty']
@@ -260,13 +284,11 @@ def run_backtest():
             'symbol': symbol,
             'trades': trades,
             'wins': wins,
-            'losses': trades - wins,
             'win_rate': round(win_rate, 1),
-            'pnl': round(pnl, 2),
-            'return_pct': round((pnl / 10000) * 100, 1)
+            'pnl': round(pnl, 2)
         })
         
-        print(f"{symbol:10} {trades:3} trades | WR: {win_rate:5.1f}% | P&L: ${pnl:>8,.2f} ({pnl/10000*100:>6.1f}%)")
+        print(f"{trades} trades, WR {win_rate:.1f}%, P&L ${pnl:,.2f}")
     
     # Summary
     total_trades = sum(r['trades'] for r in results)
@@ -277,52 +299,17 @@ def run_backtest():
     print("=" * 60)
     print(f"TOTAL: {total_trades} trades | WR: {wr:.1f}%")
     print(f"P&L: ${total_pnl:,.2f} ({total_pnl/10000*100:.1f}%)")
-    print("=" * 60)
     
-    # Best/worst
-    best = max(results, key=lambda x: x['pnl'])
-    worst = min(results, key=lambda x: x['pnl'])
-    print(f"Best: {best['symbol']} +${best['pnl']:.2f}")
-    print(f"Worst: {worst['symbol']} ${worst['pnl']:.2f}")
-    
-    # Save results
-    output = {
-        'config': {
-            'symbols': SYMBOLS,
-            'days': DAYS,
-            'rr_ratio': RR_RATIO,
-            'confluence': CONF_THRESHOLD,
-            'risk_pct': RISK_PCT,
-            'entry': 'close',
-            'exit': 'close_next_bar'
-        },
-        'summary': {
-            'trades': total_trades,
-            'wins': total_wins,
-            'losses': total_trades - total_wins,
-            'win_rate': round(wr, 1),
-            'pnl': round(total_pnl, 2),
-            'return_pct': round((total_pnl / 10000) * 100, 1)
-        },
-        'results': results,
-        'timestamp': datetime.now().isoformat()
-    }
-    
+    # Save
     with open('v6_binance_backtest_results.json', 'w') as f:
-        json.dump(output, f, indent=2)
-    
-    print(f"\nResults saved to v6_binance_backtest_results.json")
+        json.dump({
+            'config': {'rr': RR_RATIO, 'conf': CONF_THRESHOLD, 'days': DAYS},
+            'summary': {'trades': total_trades, 'wr': wr, 'pnl': total_pnl},
+            'results': results
+        }, f, indent=2)
     
     return results
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--days', type=int, default=DAYS)
-    args = parser.parse_args()
-    
-    if args.days != DAYS:
-        DAYS = args.days
-    
     run_backtest()
