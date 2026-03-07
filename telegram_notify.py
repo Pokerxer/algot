@@ -4739,6 +4739,7 @@ def send_position_update(positions: Dict, daily_pnl: float):
         lines.append(f"{dir_icon} <b>{symbol}</b>: {pnl_icon} ${pnl:+,.2f} ({pnl_pct:+.2f}%)")
     
     pnl_icon = ds.STATUS_SUCCESS if total_unrealized >= 0 else ds.STATUS_ERROR
+    daily_pnl_icon = ds.STATUS_SUCCESS if daily_pnl >= 0 else ds.STATUS_ERROR
     
     message = f"""
 {ds.ICON_CHART} <b>POSITION UPDATE</b>
