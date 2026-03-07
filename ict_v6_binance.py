@@ -319,7 +319,7 @@ class V6BinanceTrader:
                 'entry_time': datetime.now(),
                 'bars_held': 0
             }
-            print(f"  [{self.mode.upper()}] Trade simulated - qty={qty:.6f}")
+            print(f"  [{self.mode.upper()}] Trade simulated")
             return True
         
         return False
