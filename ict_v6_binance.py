@@ -30,8 +30,11 @@ BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 import importlib.util
 v5_path = os.path.join(os.path.dirname(__file__), 'ict_v5_ibkr.py')
 spec = importlib.util.spec_from_file_location("ict_v5", v5_path)
-ict_v5 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ict_v5)
+if spec:
+    ict_v5 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ict_v5)
+else:
+    print("⚠️ Could not load ict_v5 module")
 
 # Import Binance client
 from binance_client import (
@@ -43,55 +46,38 @@ from binance_client import (
 from fvg_handler import FVGHandler
 from gap_handler import GapHandler
 
+# Security check
+def security_check():
+    """Check API key security settings"""
+    if BINANCE_API_KEY:
+        print("✅ API key loaded from environment")
+        
+        # Warn about IP restrictions
+        print("⚠️  Ensure IP restrictions are set in Binance account")
+        print("   Login -> API Management -> Restrict IPs")
+    else:
+        print("🔑 No API key set - paper trading mode")
+
 # Telegram notifications
-try:
-    import telegram_notify as tn
-    if tn and hasattr(tn, 'init_bot'):
-        try:
-            tn.init_bot()
-        except:
-            pass
-except ImportError:
-    tn = None
+tn = None
 
-
-# Crypto symbols that use Binance
-CRYPTO_SYMBOLS = {
-    'BTCUSD': 'BTCUSDT',
-    'ETHUSD': 'ETHUSDT', 
-    'SOLUSD': 'SOLUSDT',
-    'LTCUSD': 'LTCUSDT',
-    'LINKUSD': 'LINKUSDT',
-    'UNIUSD': 'UNIUSDT',
-    'XRPUSD': 'XRPUSDT',
-    'ADAUSD': 'ADAUSDT',
-    'DOGEUSD': 'DOGEUSDT',
-    'DOTUSD': 'DOTUSDT',
-    'AVAXUSD': 'AVAXUSDT',
-    'MATICUSD': 'MATICUSDT',
-}
-
-# Session filter - crypto trades 24/7 but best during these hours
-def is_valid_crypto_session() -> Tuple[bool, str]:
-    """Crypto is 24/7 but best liquidity during NY/London overlap"""
-    from datetime import time as dt_time
-    import pytz
-    
-    et_tz = pytz.timezone('US/Eastern')
-    now_et = datetime.now(et_tz)
-    current_time = now_et.time()
-    
-    # Best session: 8 AM - 8 PM ET (NY + London overlap)
-    session_start = dt_time(8, 0)
-    session_end = dt_time(20, 0)
-    
-    if session_start <= current_time <= session_end:
-        return True, "HIGH_LIQUIDITY"
-    
-    return True, "LOW_LIQUIDITY"  # Crypto is 24/7
-
+# Initialize telegram
+def init_telegram():
+    global tn
+    try:
+        import telegram_notify as tn_module
+        tn = tn_module
+        if tn and hasattr(tn, 'init_bot'):
+            try:
+                tn.init_bot()
+                print("✅ Telegram bot initialized successfully")
+            except Exception as e:
+                print(f"Telegram init failed: {e}")
+    except ImportError:
+        print("⚠️ Telegram module not available")
 
 def is_trading_paused() -> bool:
+    """Check if trading is paused via Telegram."""
     if tn and hasattr(tn, 'is_trading_paused'):
         return tn.is_trading_paused()
     return False
@@ -609,6 +595,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     symbols = [s.strip().upper() for s in args.symbols.split(',')]
+    
+    # Run security check
+    security_check()
     
     run_binance_trading(
         symbols=symbols,
