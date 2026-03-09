@@ -1,6 +1,6 @@
 """
 Binance Client for Crypto Trading
-================================
+===============================
 Fetch data and place trades via Binance API.
 
 Usage:
@@ -10,6 +10,10 @@ Usage:
     data = fetch_binance_data('BTCUSDT', '1h', 500)
     client.place_order('BTCUSDT', 'BUY', 0.001, stop_loss=65000, take_profit=75000)
 """
+
+# Suppress SSL warnings
+import warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 import time
 import hmac
