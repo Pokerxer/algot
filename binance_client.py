@@ -64,9 +64,16 @@ class BinanceClient:
             params['signature'] = self._sign(urlencode(params))
             kwargs['params'] = params
         
-        response = self.session.request(method, url, **kwargs)
-        response.raise_for_status()
-        return response.json()
+        # Disable SSL verification
+        try:
+            response = self.session.request(method, url, verify=False, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            # Fallback to regular request
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response.json()
     
     def get_account(self) -> Dict:
         """Get account information"""
