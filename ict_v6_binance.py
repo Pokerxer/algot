@@ -1,12 +1,16 @@
 """
 ICT V6 Binance Trading - Crypto Trading via Binance
-===================================================
+==================================================
 Use Binance API for crypto data and trading.
 
 Usage:
     python3 ict_v6_binance.py --symbols "BTCUSDT,ETHUSDT" --mode paper
     python3 ict_v6_binance.py --symbols "BTCUSDT,ETHUSDT" --mode live --api-key XXX --api-secret YYY
 """
+
+# Suppress SSL warnings
+import warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 import sys
 import os
