@@ -918,6 +918,7 @@ class V7MT5LiveTrader:
         self.historical_data = {}
         self.last_poll_time = {}
         self.last_signal_time = {}
+        self.last_signals = {}
         
         self.daily_pnl = 0.0
         self.trade_count = 0
