@@ -488,15 +488,36 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
     if stop_loss:
         # Round to symbol's digit precision
         stop_loss = round(stop_loss / point) * point
+        # Ensure SL is at least 1 point away from current price
+        if order_type.upper() == "BUY":
+            min_sl = symbol_info.bid + point
+            max_tp = symbol_info.bid - point
+        else:
+            min_sl = symbol_info.ask - point
+            max_tp = symbol_info.ask + point
+        
+        if order_type.upper() == "BUY" and stop_loss >= symbol_info.bid:
+            stop_loss = min_sl
+        elif order_type.upper() == "SELL" and stop_loss <= symbol_info.ask:
+            stop_loss = min_sl
+            
         request["sl"] = stop_loss
+        
     if take_profit:
         take_profit = round(take_profit / point) * point
+        if order_type.upper() == "BUY" and take_profit <= symbol_info.ask:
+            take_profit = max_tp
+        elif order_type.upper() == "SELL" and take_profit >= symbol_info.bid:
+            take_profit = max_tp
         request["tp"] = take_profit
     
     # Ensure volume is valid
     volume = round(volume / symbol_info.volume_step) * symbol_info.volume_step
     volume = max(symbol_info.volume_min, min(volume, symbol_info.volume_max))
     request["volume"] = volume
+    
+    # Debug output
+    print(f"  Order: {order_type} {symbol_info.name} vol={volume} @ {price} SL={request.get('sl')} TP={request.get('tp')}")
     
     result = mt5.order_send(request)
     
