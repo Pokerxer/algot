@@ -401,45 +401,66 @@ def get_signal(data: Dict, idx: int) -> Dict:
 
 def calculate_position_size(symbol: str, account_value: float, risk_pct: float, 
                            stop_distance: float, current_price: float) -> Tuple[float, float]:
-    """Calculate position size for MT5."""
+    """Calculate lot size for MT5 based on 3% risk per trade."""
     contract_info = get_contract_info(symbol)
     symbol_type = contract_info['type']
     
-    # Calculate risk amount - use risk_pct (default 2%, can be set up to 3%)
+    # Calculate risk amount (3% of account)
     risk_amount = account_value * risk_pct
     
     if stop_distance <= 0:
         return 0, 0
     
-    # Calculate quantity based on instrument type
+    qty = 0
+    
+    # Calculate lot size based on instrument type
     if symbol_type == 'forex':
-        # For forex, calculate based on pip value
         decimal_places = contract_info.get('decimal_places', 5)
-        pip_size = 0.0001 if decimal_places == 5 else 0.01
+        
+        if decimal_places == 3:
+            # JPY pairs - pip = 0.01
+            pip_size = 0.01
+            # For JPY pairs: 1 lot (100,000) = $1000 per pip
+            pip_value_per_lot = 1000
+        else:
+            # Non-JPY pairs - pip = 0.0001
+            pip_size = 0.0001
+            # For non-JPY pairs: 1 lot (100,000) = $10 per pip
+            pip_value_per_lot = 10
+        
+        # Calculate stop in pips
         stop_pips = stop_distance / pip_size
         
-        # Pip value: 1 pip = $10 per standard lot for major pairs
-        pip_value = contract_info.get('pip_value', 10)
-        qty = risk_amount / (stop_pips * pip_value) if stop_pips > 0 else 0
+        # Lots = Risk / (Stop pips * $ per pip per lot)
+        if stop_pips > 0:
+            qty = risk_amount / (stop_pips * pip_value_per_lot)
         
     elif symbol_type == 'indices':
-        # For indices: risk / stop_distance
+        # For indices: 1 lot = 1 index point
+        # Risk = Stop points * Lots * $1
         qty = risk_amount / stop_distance if stop_distance > 0 else 0
         
     elif symbol_type == 'futures':
-        # Metals/Oil
+        # For metals/oil
         multiplier = contract_info.get('multiplier', 100)
+        # Risk = Stop * Lots * Multiplier
         qty = risk_amount / (stop_distance * multiplier) if stop_distance > 0 else 0
         
     else:
-        # Default
+        # Default fallback
         qty = risk_amount / stop_distance if stop_distance > 0 else 0
     
-    # Enforce limits
+    # Enforce MT5 limits
     qty = max(qty, 0.01)  # Min 0.01 lots
     qty = round(qty / 0.01) * 0.01  # Round to 0.01
     
-    return qty, risk_amount
+    # Calculate actual risk with rounded lot size
+    if symbol_type == 'forex' and stop_pips > 0:
+        actual_risk = qty * stop_pips * pip_value_per_lot
+    else:
+        actual_risk = qty * stop_distance * contract_info.get('multiplier', 1)
+    
+    return qty, actual_risk
 
 
 def place_mt5_order(symbol: str, order_type: str, volume: float, 
@@ -1106,7 +1127,10 @@ class V7MT5LiveTrader:
                 stop_distance, entry_price
             )
             if qty <= 0:
+                print(f"[{symbol}] Failed: qty={qty}, stop_dist={stop_distance}")
                 return
+            
+            print(f"[{symbol}] Lot calc: Risk=${risk_amount:.2f}, Stop={stop_distance}, Lots={qty}")
             
             direction_str = 'LONG' if signal['direction'] == 1 else 'SHORT'
             
