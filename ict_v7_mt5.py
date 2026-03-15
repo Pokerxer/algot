@@ -1314,7 +1314,9 @@ class V7MT5LiveTrader:
                         self.historical_data[symbol] = data
                 
                 idx = len(data['closes']) - 1
-                current_price = data['closes'][idx]
+                candle_close = data['closes'][idx]
+                live_price = self.get_current_price(symbol)
+                current_price = live_price if live_price else candle_close
                 
                 try:
                     signal = self.signal_generator.analyze_symbol(symbol, data, current_price)
