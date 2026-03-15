@@ -511,10 +511,12 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
         market_price = symbol_info.bid
     
     # If requested price is at or beyond market, use market order
-    if order_type.upper() == "BUY" and requested_price >= market_price:
+    # BUY: limit if requesting lower than ask, market if at/above ask
+    # SELL: limit if requesting higher than bid, market if at/below bid
+    if order_type.upper() == "BUY" and requested_price <= market_price:
         order_type_enum = mt5.ORDER_TYPE_BUY
         use_limit = False
-    elif order_type.upper() == "SELL" and requested_price <= market_price:
+    elif order_type.upper() == "SELL" and requested_price >= market_price:
         order_type_enum = mt5.ORDER_TYPE_SELL
         use_limit = False
     
