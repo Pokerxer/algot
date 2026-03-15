@@ -939,10 +939,14 @@ class V7MT5LiveTrader:
         try:
             positions = get_mt5_positions()
             for pos in positions:
-                symbol = pos['symbol'].upper()
-                if symbol in [s.upper() for s in self.symbols]:
+                mt5_symbol = pos['symbol'].upper()
+                # Try to match with our symbols (with or without suffix)
+                symbol = mt5_symbol.replace('M', '')  # Remove 'm' suffix
+                if symbol in [s.upper() for s in self.symbols] or mt5_symbol in [get_mt5_symbol(s).upper() for s in self.symbols]:
                     direction = 1 if pos['type'] == 0 else -1
-                    self.positions[symbol] = {
+                    # Also check without suffix for tracking
+                    symbol_key = symbol if symbol in [s.upper() for s in self.symbols] else mt5_symbol
+                    self.positions[symbol_key] = {
                         'ticket': pos['ticket'],
                         'entry': pos['price_open'],
                         'direction': direction,
@@ -950,12 +954,15 @@ class V7MT5LiveTrader:
                         'stop': pos['sl'],
                         'target': pos['tp'],
                         'bars_held': 0,
-                        'current_price': pos['price_current']
+                        'current_price': pos['price_current'],
+                        'pnl': pos['profit']
                     }
-                    print(f"  Found open position: {symbol} x {pos['volume']} @ {pos['price_open']:.4f}")
+                    print(f"  Found open position: {mt5_symbol} x {pos['volume']} @ {pos['price_open']:.4f} P&L: ${pos['profit']:.2f}")
             
             if not self.positions:
                 print("  No open positions found")
+            else:
+                print(f"  Total open positions: {len(self.positions)}")
         except Exception as e:
             print(f"  Error syncing positions: {e}")
     
@@ -973,11 +980,15 @@ class V7MT5LiveTrader:
     
     def _check_position_exit(self, symbol: str, current_price: float):
         """Check if position hit stop/target."""
-        if symbol not in self.positions:
+        # Try both plain symbol and MT5 symbol
+        mt5_sym = get_mt5_symbol(symbol)
+        pos_key = symbol if symbol in self.positions else (mt5_sym if mt5_sym in self.positions else None)
+        
+        if pos_key is None:
             return
         
         try:
-            pos = self.positions[symbol]
+            pos = self.positions[pos_key]
             pos['bars_held'] = pos.get('bars_held', 0) + 1
             pos['current_price'] = current_price
             
@@ -1009,10 +1020,11 @@ class V7MT5LiveTrader:
                     pnl = (entry - current_price) * pos['volume']
             
             if exit_reason:
-                self._handle_position_closed(symbol, current_price, pnl, exit_reason)
+                self._handle_position_closed(pos_key, current_price, pnl, exit_reason)
             else:
                 self.daily_pnl = self.daily_pnl - (pos.get('pnl', 0) or 0) + pnl
                 pos['pnl'] = pnl
+                print(f"  [{symbol}] P&L: ${pnl:.2f} (Total: ${self.daily_pnl:.2f})")
                 
         except Exception as e:
             print(f"[{symbol}] Error checking position: {e}")
@@ -1056,7 +1068,9 @@ class V7MT5LiveTrader:
             print(f"[{symbol}] Outside trading hours ({session_name}), skipping")
             return
         
-        if symbol in self.positions:
+        # Check if position exists (either with plain symbol or MT5 symbol)
+        mt5_sym = get_mt5_symbol(symbol)
+        if symbol in self.positions or mt5_sym in self.positions:
             print(f"[{symbol}] Already has open position, skipping entry")
             return
         
@@ -1255,7 +1269,9 @@ class V7MT5LiveTrader:
                     except:
                         pass
                 
-                if symbol in self.positions:
+                # Check if position exists (either with plain symbol or MT5 symbol)
+                mt5_sym = get_mt5_symbol(symbol)
+                if symbol in self.positions or mt5_sym in self.positions:
                     self._check_position_exit(symbol, current_price)
                 else:
                     current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
