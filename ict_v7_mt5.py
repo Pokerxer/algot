@@ -405,11 +405,8 @@ def calculate_position_size(symbol: str, account_value: float, risk_pct: float,
     contract_info = get_contract_info(symbol)
     symbol_type = contract_info['type']
     
-    # Calculate risk amount
-    risk_amount = account_value * risk_pct  # Default: 2% of account
-    
-    # Cap risk for safety
-    risk_amount = min(risk_amount, 500)  # Max $500 risk per trade
+    # Calculate risk amount - use risk_pct (default 2%, can be set up to 3%)
+    risk_amount = account_value * risk_pct
     
     if stop_distance <= 0:
         return 0, 0
@@ -421,9 +418,9 @@ def calculate_position_size(symbol: str, account_value: float, risk_pct: float,
         pip_size = 0.0001 if decimal_places == 5 else 0.01
         stop_pips = stop_distance / pip_size
         
-        # Use pip_value for calculation
+        # Pip value: 1 pip = $10 per standard lot for major pairs
         pip_value = contract_info.get('pip_value', 10)
-        qty = risk_amount / (stop_pips * pip_value / pip_size) if stop_pips > 0 else 0
+        qty = risk_amount / (stop_pips * pip_value) if stop_pips > 0 else 0
         
     elif symbol_type == 'indices':
         # For indices: risk / stop_distance
@@ -441,10 +438,6 @@ def calculate_position_size(symbol: str, account_value: float, risk_pct: float,
     # Enforce limits
     qty = max(qty, 0.01)  # Min 0.01 lots
     qty = round(qty / 0.01) * 0.01  # Round to 0.01
-    
-    # Cap at reasonable max for safety
-    max_qty = 5.0  # Max 5 lots
-    qty = min(qty, max_qty)
     
     return qty, risk_amount
 
@@ -1449,7 +1442,7 @@ if __name__ == "__main__":
                         help="Comma-separated symbols")
     parser.add_argument("--interval", type=int, default=30,
                         help="Poll interval in seconds")
-    parser.add_argument("--risk", type=float, default=0.02,
+    parser.add_argument("--risk", type=float, default=0.03,
                         help="Risk per trade (e.g., 0.02 for 2%%)")
     parser.add_argument("--login", type=int, default=None,
                         help="MT5 login (account number)")
@@ -1460,7 +1453,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="paper",
                         choices=["shadow", "paper", "live"],
                         help="Trading mode")
-    parser.add_argument("--rr", type=float, default=2.0,
+    parser.add_argument("--rr", type=float, default=3.0,
                         help="Risk:Reward ratio (e.g., 2.0 for 1:2, 4.0 for 1:4)")
     parser.add_argument("--confluence", type=int, default=60,
                         help="Minimum confluence threshold (0-100)")
