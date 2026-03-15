@@ -918,11 +918,13 @@ class V7MT5LiveTrader:
         self.historical_data = {}
         self.last_poll_time = {}
         self.last_signal_time = {}
-        self.last_signals = {}
         
         self.daily_pnl = 0.0
         self.trade_count = 0
         self.account_value = 100000
+        
+        # Fetch real account balance immediately
+        self.update_account()
         
         self.currency_pnl = {}
         self.running = False
@@ -1277,6 +1279,7 @@ class V7MT5LiveTrader:
             account_info = mt5.account_info()
             if account_info:
                 self.account_value = account_info.balance
+                print(f"Account balance: ${self.account_value:,.2f}")
         except Exception as e:
             print(f"Error updating account: {e}")
     
@@ -1345,6 +1348,7 @@ def run_v7_trading(symbols: List[str], interval: int = 30, risk_pct: float = 0.0
         rr_ratio=rr_ratio, confluence_threshold=confluence_threshold,
         max_daily_loss=max_daily_loss
     )
+    print(f"Trader account value: ${trader.account_value:,.2f}")
     trader.mode = mode
     
     if tn and hasattr(tn, 'set_live_trader'):
@@ -1393,6 +1397,7 @@ def run_v7_trading(symbols: List[str], interval: int = 30, risk_pct: float = 0.0
         print("\n\nShutdown...")
     finally:
         trader.stop()
+        trader.update_account()  # Get final balance
         if MT5_AVAILABLE:
             mt5.shutdown()
         print(f"\nTrades: {trader.trade_count} | Daily P&L: ${trader.daily_pnl:.2f} | Final: ${trader.account_value:,.2f}")
