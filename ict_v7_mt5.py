@@ -1095,7 +1095,7 @@ class V7MT5LiveTrader:
                         tn.send_trade_entry(
                             symbol, signal['direction'], qty, 
                             entry_price, signal['confluence'], target_price, stop_price,
-                            pd_zone=pd_zone
+                            pd_zone=pd_zone, risk_amount=risk_amount
                         )
                     except RuntimeError as e:
                         if "event loop" in str(e).lower():
