@@ -413,52 +413,66 @@ def calculate_position_size(symbol: str, account_value: float, risk_pct: float,
     
     qty = 0
     
-    # Calculate lot size based on instrument type
+    # Use pip/point value based on instrument type
     if symbol_type == 'forex':
         decimal_places = contract_info.get('decimal_places', 5)
         
         if decimal_places == 3:
             # JPY pairs - pip = 0.01
             pip_size = 0.01
-            # For JPY pairs: 1 lot (100,000) = $1000 per pip
-            pip_value_per_lot = 1000
+            # For JPY pairs: 1 lot = $1000 per pip
+            pip_value = 1000
         else:
             # Non-JPY pairs - pip = 0.0001
             pip_size = 0.0001
-            # For non-JPY pairs: 1 lot (100,000) = $10 per pip
-            pip_value_per_lot = 10
+            # For non-JPY pairs: 1 lot = $10 per pip
+            pip_value = 10
         
-        # Calculate stop in pips
+        # Stop in pips
         stop_pips = stop_distance / pip_size
-        
-        # Lots = Risk / (Stop pips * $ per pip per lot)
         if stop_pips > 0:
-            qty = risk_amount / (stop_pips * pip_value_per_lot)
+            # Lots = Risk / (Pips * $ per pip per lot)
+            qty = risk_amount / (stop_pips * pip_value)
+        
+        actual_risk = qty * stop_pips * pip_value
         
     elif symbol_type == 'indices':
-        # For indices: 1 lot = 1 index point
-        # Risk = Stop points * Lots * $1
-        qty = risk_amount / stop_distance if stop_distance > 0 else 0
+        # Indices: treat 1 point like 1 pip
+        # 1 lot = 1 index point = $1 per point
+        point_value = 1
+        stop_points = stop_distance  # Already in points
+        if stop_points > 0:
+            qty = risk_amount / (stop_points * point_value)
+        
+        actual_risk = qty * stop_distance * point_value
         
     elif symbol_type == 'futures':
-        # For metals/oil
+        # Metals: treat 0.01 (for XAU) or 0.001 (for XAG) like pip
+        # Oil: treat 0.01 like pip
+        tick_size = contract_info.get('tick_size', 0.01)
+        
+        # For XAUUSD: 1 lot = 100 oz, $100 per $1 move
+        # For XAGUSD: 1 lot = 5000 oz, $50 per $1 move
+        # For USOIL: 1 lot = 1000 barrels, $1000 per $1 move
         multiplier = contract_info.get('multiplier', 100)
-        # Risk = Stop * Lots * Multiplier
-        qty = risk_amount / (stop_distance * multiplier) if stop_distance > 0 else 0
+        
+        # Value per point
+        point_value = multiplier  # $1 per point per lot
+        
+        stop_points = stop_distance / tick_size  # Convert to "pips"
+        if stop_points > 0:
+            qty = risk_amount / (stop_points * point_value)
+        
+        actual_risk = qty * (stop_distance / tick_size) * point_value
         
     else:
-        # Default fallback
-        qty = risk_amount / stop_distance if stop_distance > 0 else 0
+        # Default: simple calculation
+        qty = risk_amount / stop_distance
+        actual_risk = qty * stop_distance
     
     # Enforce MT5 limits
     qty = max(qty, 0.01)  # Min 0.01 lots
     qty = round(qty / 0.01) * 0.01  # Round to 0.01
-    
-    # Calculate actual risk with rounded lot size
-    if symbol_type == 'forex' and stop_pips > 0:
-        actual_risk = qty * stop_pips * pip_value_per_lot
-    else:
-        actual_risk = qty * stop_distance * contract_info.get('multiplier', 1)
     
     return qty, actual_risk
 
