@@ -367,6 +367,40 @@ class V8LiveTrader:
             filled, fill_price, filled_qty = wait_for_fill(self.ib, parent_trade, timeout=10)
             
             if filled:
+                # Recalculate stop/target based on actual fill price to maintain R:R
+                rr = getattr(self, 'rr_ratio', 3.0)
+                if signal['direction'] == 1:  # LONG
+                    stop_distance = entry_price - stop
+                    stop = fill_price - stop_distance
+                    target = fill_price + (stop_distance * rr)
+                else:  # SHORT
+                    stop_distance = stop - entry_price
+                    stop = fill_price + stop_distance
+                    target = fill_price - (stop_distance * rr)
+                
+                # Update the bracket orders with correct prices
+                try:
+                    if sl_trade:
+                        self.ib.qualifyOrders(sl_trade)
+                        self.ib.cancelOrder(sl_trade.order)
+                        new_sl = sl_trade.Order()
+                        new_sl.action = 'SELL' if signal['direction'] == 1 else 'BUY'
+                        new_sl.auxPrice = stop
+                        new_sl.orderType = 'STP'
+                        new_sl.totalQuantity = filled_qty
+                        self.ib.placeOrder(sl_trade.contract, new_sl)
+                    if tp_trade:
+                        self.ib.qualifyOrders(tp_trade)
+                        self.ib.cancelOrder(tp_trade.order)
+                        new_tp = tp_trade.Order()
+                        new_tp.action = 'SELL' if signal['direction'] == 1 else 'BUY'
+                        new_tp.auxPrice = target
+                        new_tp.orderType = 'LMT'
+                        new_tp.totalQuantity = filled_qty
+                        self.ib.placeOrder(tp_trade.contract, new_tp)
+                except Exception as e:
+                    print(f"[{symbol}] Could not update SL/TP orders: {e}")
+                
                 self.positions[symbol] = {
                     'entry': fill_price,
                     'stop': stop,
