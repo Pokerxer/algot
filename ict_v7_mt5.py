@@ -1186,9 +1186,11 @@ class V7MT5LiveTrader:
             )
             
             if result:
+                actual_entry = result['price']
+                
                 self.positions[symbol] = {
                     'ticket': result['order_id'],
-                    'entry': entry_price,
+                    'entry': actual_entry,
                     'stop': stop_price,
                     'target': target_price,
                     'direction': signal['direction'],
@@ -1198,12 +1200,12 @@ class V7MT5LiveTrader:
                     'entry_time': datetime.now(),
                     'reasoning': signal['reasoning'],
                     'bars_held': 0,
-                    'current_price': entry_price
+                    'current_price': actual_entry
                 }
                 
                 self.trade_count += 1
                 
-                print(f"[{symbol}] V7 ENTRY: {direction_str} x {qty} @ {entry_price:.4f}")
+                print(f"[{symbol}] V7 ENTRY: {direction_str} x {qty} @ {actual_entry:.4f}")
                 print(f"  Confidence: {signal['confidence']} | Confluence: {signal['confluence']}/100")
                 print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f}")
                 if signal['reasoning']:
@@ -1213,7 +1215,7 @@ class V7MT5LiveTrader:
                     try:
                         tn.send_trade_entry(
                             symbol, signal['direction'], qty, 
-                            entry_price, signal['confluence'], target_price, stop_price,
+                            actual_entry, signal['confluence'], target_price, stop_price,
                             pd_zone=pd_zone, risk_amount=risk_amount
                         )
                     except RuntimeError as e:
