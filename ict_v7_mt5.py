@@ -405,40 +405,46 @@ def calculate_position_size(symbol: str, account_value: float, risk_pct: float,
     contract_info = get_contract_info(symbol)
     symbol_type = contract_info['type']
     
-    if symbol_type == 'crypto':
-        risk_amount = 2000
-    elif symbol.upper() in ['XAUUSD', 'GOLD']:
-        risk_amount = 2000
-    elif symbol_type == 'futures':
-        risk_amount = 1000
-    elif symbol_type == 'indices':
-        risk_amount = account_value * risk_pct  # Use percentage for indices
-    else:
-        risk_amount = account_value * risk_pct
+    # Calculate risk amount
+    risk_amount = account_value * risk_pct  # Default: 2% of account
     
-    if symbol_type in ['forex', 'crypto']:
-        if symbol_type == 'forex':
-            decimal_places = contract_info.get('decimal_places', 5)
-            pip_size = 0.0001 if decimal_places == 5 else 0.01
-            stop_pips = stop_distance / pip_size
-            if stop_pips > 0:
-                risk_amount = min(risk_amount, stop_pips * contract_info.get('pip_value', 10))
-        else:
-            risk_amount = min(risk_amount, stop_distance * contract_info.get('multiplier', 1))
+    # Cap risk for safety
+    risk_amount = min(risk_amount, 500)  # Max $500 risk per trade
     
     if stop_distance <= 0:
         return 0, 0
     
-    if symbol_type == 'futures':
-        qty = risk_amount / (stop_distance * contract_info.get('multiplier', 1))
+    # Calculate quantity based on instrument type
+    if symbol_type == 'forex':
+        # For forex, calculate based on pip value
+        decimal_places = contract_info.get('decimal_places', 5)
+        pip_size = 0.0001 if decimal_places == 5 else 0.01
+        stop_pips = stop_distance / pip_size
+        
+        # Use pip_value for calculation
+        pip_value = contract_info.get('pip_value', 10)
+        qty = risk_amount / (stop_pips * pip_value / pip_size) if stop_pips > 0 else 0
+        
     elif symbol_type == 'indices':
-        # For indices, qty = risk_amount / stop_distance (1 point = $1 typically)
-        qty = risk_amount / stop_distance
+        # For indices: risk / stop_distance
+        qty = risk_amount / stop_distance if stop_distance > 0 else 0
+        
+    elif symbol_type == 'futures':
+        # Metals/Oil
+        multiplier = contract_info.get('multiplier', 100)
+        qty = risk_amount / (stop_distance * multiplier) if stop_distance > 0 else 0
+        
     else:
-        qty = risk_amount / stop_distance
+        # Default
+        qty = risk_amount / stop_distance if stop_distance > 0 else 0
     
+    # Enforce limits
     qty = max(qty, 0.01)  # Min 0.01 lots
     qty = round(qty / 0.01) * 0.01  # Round to 0.01
+    
+    # Cap at reasonable max for safety
+    max_qty = 5.0  # Max 5 lots
+    qty = min(qty, max_qty)
     
     return qty, risk_amount
 
@@ -993,32 +999,46 @@ class V7MT5LiveTrader:
             pos['bars_held'] = pos.get('bars_held', 0) + 1
             pos['current_price'] = current_price
             
+            # Get real-time P&L from MT5
+            contract_info = get_contract_info(symbol)
+            symbol_type = contract_info['type']
+            
             direction = pos['direction']
             entry = pos['entry']
             stop = pos.get('stop', 0)
             target = pos.get('target', 0)
+            volume = pos['volume']
             
             exit_reason = None
             pnl = 0
             
+            # Calculate P&L based on instrument type
+            price_diff = current_price - entry if direction == 1 else entry - current_price
+            
+            if symbol_type == 'forex':
+                # Forex: need contract size
+                pnl = price_diff * volume * 100000
+            elif symbol_type == 'indices':
+                # Indices: price * volume
+                pnl = price_diff * volume
+            elif symbol_type == 'futures':
+                # Metals/Oil: multiplier
+                multiplier = contract_info.get('multiplier', 100)
+                pnl = price_diff * volume * multiplier
+            else:
+                pnl = price_diff * volume
+            
+            # Check exits
             if direction == 1:
                 if stop and current_price <= stop:
                     exit_reason = 'stop'
-                    pnl = (stop - entry) * pos['volume']
                 elif target and current_price >= target:
                     exit_reason = 'target'
-                    pnl = (target - entry) * pos['volume']
-                else:
-                    pnl = (current_price - entry) * pos['volume']
             else:
                 if stop and current_price >= stop:
                     exit_reason = 'stop'
-                    pnl = (entry - stop) * pos['volume']
                 elif target and current_price <= target:
                     exit_reason = 'target'
-                    pnl = (entry - target) * pos['volume']
-                else:
-                    pnl = (entry - current_price) * pos['volume']
             
             if exit_reason:
                 self._handle_position_closed(pos_key, current_price, pnl, exit_reason)
