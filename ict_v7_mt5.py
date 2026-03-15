@@ -63,27 +63,23 @@ FOREX_SYMBOLS = {'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF', 'NZ
 MT5_SYMBOLS = {
     # Crypto
     'BTCUSD': 'BTCUSDm', 'ETHUSD': 'ETHUSDm', 'SOLUSD': 'SOLUSDm',
-    # Metals
+    # Metals (Gold & Silver)
     'XAUUSD': 'XAUUSDm', 'XAGUSD': 'XAGUSDm',
     # Oil
-    'XTIUSD': 'USOILm',
+    'XTIUSD': 'USOILm', 'XBRUSD': 'UKOILm', 'XNGUSD': 'XNGUSDm',
     # Major Forex
     'EURUSD': 'EURUSDm', 'GBPUSD': 'GBPUSDm', 'USDJPY': 'USDJPYm',
-    'USDCAD': 'USDCADm', 'AUDUSD': 'AUDUSDm', 'USDCHF': 'USDCHFm',
+    'USDCAD': 'USDCADm', 'AUDUSD': 'AUDUSDm', 'USDCHF': 'USDCHFm', 'NZDUSD': 'NZDUSDm',
+    # Forex Crosses
     'EURGBP': 'EURGBPm', 'EURJPY': 'EURJPYm', 'GBPJPY': 'GBPJPYm',
+    'EURAUD': 'EURAUDm', 'EURCAD': 'EURCADm', 'GBPAUD': 'GBPAUDm',
+    'AUDJPY': 'AUDJPYm', 'CADJPY': 'CADJPYm', 'CHFJPY': 'CHFJPYm',
     # Indices
-    'US30': 'US30m', 'USTEC': 'USTECm', 'US500': 'US500m', 'UK100': 'UK100m',
+    'US30': 'US30m', 'USTEC': 'USTECm', 'US500': 'US500m', 'UK100': 'UK100m', 'AUS200': 'AUS200m',
 }
 
-# Exness-specific mapping (for when symbols not found)
-EXNESS_SYMBOLS = {
-    'XAUUSD': 'XAUUSDm',
-    'XAGUSD': 'XAGUSDm', 
-    'US30': 'US30m',
-    'USTEC': 'USTECm',
-    'US500': 'US500m',
-    'UK100': 'UK100m',
-}
+# Exness-specific mapping (fallback)
+EXNESS_SYMBOLS = MT5_SYMBOLS.copy()
 
 def get_mt5_symbol(symbol: str) -> str:
     """Convert symbol to MT5 format with suffix"""
