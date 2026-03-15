@@ -437,9 +437,10 @@ def calculate_position_size(symbol: str, account_value: float, risk_pct: float,
     else:
         qty = risk_amount / stop_distance
     
-    qty = max(qty, contract_info.get('volume_min', 0.01))
+    qty = max(qty, 0.01)  # Min 0.01 lots
+    qty = round(qty / 0.01) * 0.01  # Round to 0.01
     
-    return round(qty, 2), risk_amount
+    return qty, risk_amount
 
 
 def place_mt5_order(symbol: str, order_type: str, volume: float, 
@@ -485,9 +486,17 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
     }
     
     if stop_loss:
+        # Round to symbol's digit precision
+        stop_loss = round(stop_loss / point) * point
         request["sl"] = stop_loss
     if take_profit:
+        take_profit = round(take_profit / point) * point
         request["tp"] = take_profit
+    
+    # Ensure volume is valid
+    volume = round(volume / symbol_info.volume_step) * symbol_info.volume_step
+    volume = max(symbol_info.volume_min, min(volume, symbol_info.volume_max))
+    request["volume"] = volume
     
     result = mt5.order_send(request)
     
