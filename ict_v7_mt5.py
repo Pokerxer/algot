@@ -488,27 +488,28 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
     if stop_loss:
         # Round to symbol's digit precision
         stop_loss = round(stop_loss / point) * point
-        # Ensure SL is at least 1 point away from current price
+        # Validate SL is on correct side
         if order_type.upper() == "BUY":
-            min_sl = symbol_info.bid + point
-            max_tp = symbol_info.bid - point
+            # For BUY: SL must be below ask
+            if stop_loss >= symbol_info.ask:
+                stop_loss = symbol_info.ask - point
         else:
-            min_sl = symbol_info.ask - point
-            max_tp = symbol_info.ask + point
-        
-        if order_type.upper() == "BUY" and stop_loss >= symbol_info.bid:
-            stop_loss = min_sl
-        elif order_type.upper() == "SELL" and stop_loss <= symbol_info.ask:
-            stop_loss = min_sl
-            
+            # For SELL: SL must be above bid
+            if stop_loss <= symbol_info.bid:
+                stop_loss = symbol_info.bid + point
         request["sl"] = stop_loss
         
     if take_profit:
         take_profit = round(take_profit / point) * point
-        if order_type.upper() == "BUY" and take_profit <= symbol_info.ask:
-            take_profit = max_tp
-        elif order_type.upper() == "SELL" and take_profit >= symbol_info.bid:
-            take_profit = max_tp
+        # Validate TP is on correct side
+        if order_type.upper() == "BUY":
+            # For BUY: TP must be above ask
+            if take_profit <= symbol_info.ask:
+                take_profit = symbol_info.ask + point
+        else:
+            # For SELL: TP must be below bid
+            if take_profit >= symbol_info.bid:
+                take_profit = symbol_info.bid - point
         request["tp"] = take_profit
     
     # Ensure volume is valid
