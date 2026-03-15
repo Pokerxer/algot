@@ -496,15 +496,34 @@ def run_v7_backtest(symbols, days=30, initial_capital=10000, risk_per_trade=0.02
                         price_change = pos['entry'] - exit_price
                     
                     # Calculate PnL based on instrument type
-                    if contract_info['type'] == 'futures':
-                        # Metals (XAU, XAG) and Oil
-                        multiplier = contract_info.get('multiplier', 1)
-                        pnl = price_change * pos['qty'] * multiplier
-                    elif contract_info['type'] == 'indices':
-                        # Indices - price change is in points
+                    symbol_type = contract_info['type']
+                    
+                    if symbol_type == 'forex':
+                        decimal_places = contract_info.get('decimal_places', 5)
+                        pip_size = 0.0001 if decimal_places == 5 else 0.01
+                        pips = abs(price_change / pip_size)
+                        
+                        if decimal_places == 3:
+                            # JPY pairs: $10 per pip per lot
+                            pip_value = 10
+                        else:
+                            # Non-JPY: $10 per pip per lot
+                            pip_value = 10
+                        
+                        pnl = pips * pos['qty'] * pip_value
+                        if price_change < 0:
+                            pnl = -pnl
+                            
+                    elif symbol_type == 'indices':
+                        # Indices: $1 per point per lot
                         pnl = price_change * pos['qty']
+                        
+                    elif symbol_type == 'futures':
+                        # Metals/Oil
+                        multiplier = contract_info.get('multiplier', 100)
+                        pnl = price_change * pos['qty'] * multiplier
                     else:
-                        # Forex, Crypto
+                        # Default
                         pnl = price_change * pos['qty']
                     
                     balance += pnl
@@ -620,15 +639,15 @@ if __name__ == "__main__":
     # Symbols to test
     symbols = [
         # Major Forex
-        'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF',
-        'EURGBP', 'EURJPY', 'GBPJPY',
+        # 'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF',
+        # 'EURGBP', 'EURJPY', 'GBPJPY',
         # # Metals
         'XAUUSD', 'XAGUSD',
         # Oil
         # 'XTIUSD',
         # # Indices
-        'US30', 'USTEC', 'US500', 'UK100',
-        'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
+        # 'US30', 'USTEC', 'US500', 'UK100',
+        # 'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
     ]
     
     try:
