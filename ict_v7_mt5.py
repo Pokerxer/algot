@@ -1071,9 +1071,9 @@ class V7MT5LiveTrader:
             if exit_reason:
                 self._handle_position_closed(pos_key, current_price, pnl, exit_reason)
             else:
-                self.daily_pnl = self.daily_pnl - (pos.get('pnl', 0) or 0) + pnl
                 pos['pnl'] = pnl
-                print(f"  [{symbol}] P&L: ${pnl:.2f} (Total: ${self.daily_pnl:.2f})")
+                # Show current unrealized P&L (not added to daily total)
+                print(f"  [{symbol}] P&L: ${pnl:.2f}")
                 
         except Exception as e:
             print(f"[{symbol}] Error checking position: {e}")

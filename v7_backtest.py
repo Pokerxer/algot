@@ -642,11 +642,13 @@ if __name__ == "__main__":
         # 'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF',
         # 'EURGBP', 'EURJPY', 'GBPJPY',
         # # Metals
-        'XAUUSD', 'XAGUSD',
+        # 'XAUUSD',
+        # 'XAGUSD',
         # Oil
         # 'XTIUSD',
         # # Indices
-        # 'US30', 'USTEC', 'US500', 'UK100',
+        'US30',
+        # 'USTEC', 'US500', 'UK100',
         # 'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
     ]
     
