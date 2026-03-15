@@ -499,25 +499,50 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
     
     point = symbol_info.point
     
-    if order_type.upper() == "BUY":
-        order_type_enum = mt5.ORDER_TYPE_BUY
-        price = symbol_info.ask
-    else:
-        order_type_enum = mt5.ORDER_TYPE_SELL
-        price = symbol_info.bid
+    # Use limit order if requested price differs from current market
+    requested_price = price
+    use_limit = True
     
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": mt5_symbol,
-        "volume": volume,
-        "type": order_type_enum,
-        "price": price,
-        "deviation": 20,
-        "magic": magic,
-        "comment": "ICT V7",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
+    if order_type.upper() == "BUY":
+        order_type_enum = mt5.ORDER_TYPE_BUY_LIMIT
+        market_price = symbol_info.ask
+    else:
+        order_type_enum = mt5.ORDER_TYPE_SELL_LIMIT
+        market_price = symbol_info.bid
+    
+    # If requested price is at or beyond market, use market order
+    if order_type.upper() == "BUY" and requested_price >= market_price:
+        order_type_enum = mt5.ORDER_TYPE_BUY
+        use_limit = False
+    elif order_type.upper() == "SELL" and requested_price <= market_price:
+        order_type_enum = mt5.ORDER_TYPE_SELL
+        use_limit = False
+    
+    if use_limit:
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": mt5_symbol,
+            "volume": volume,
+            "type": order_type_enum,
+            "price": requested_price,
+            "magic": magic,
+            "comment": "ICT V7",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+    else:
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": mt5_symbol,
+            "volume": volume,
+            "type": order_type_enum,
+            "price": market_price,
+            "deviation": 20,
+            "magic": magic,
+            "comment": "ICT V7",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
     
     if stop_loss:
         # Round to symbol's digit precision
@@ -1186,11 +1211,9 @@ class V7MT5LiveTrader:
             )
             
             if result:
-                actual_entry = result['price']
-                
                 self.positions[symbol] = {
                     'ticket': result['order_id'],
-                    'entry': actual_entry,
+                    'entry': entry_price,
                     'stop': stop_price,
                     'target': target_price,
                     'direction': signal['direction'],
@@ -1200,12 +1223,12 @@ class V7MT5LiveTrader:
                     'entry_time': datetime.now(),
                     'reasoning': signal['reasoning'],
                     'bars_held': 0,
-                    'current_price': actual_entry
+                    'current_price': entry_price
                 }
                 
                 self.trade_count += 1
                 
-                print(f"[{symbol}] V7 ENTRY: {direction_str} x {qty} @ {actual_entry:.4f}")
+                print(f"[{symbol}] V7 ENTRY: {direction_str} x {qty} @ {entry_price:.4f}")
                 print(f"  Confidence: {signal['confidence']} | Confluence: {signal['confluence']}/100")
                 print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f}")
                 if signal['reasoning']:
@@ -1215,7 +1238,7 @@ class V7MT5LiveTrader:
                     try:
                         tn.send_trade_entry(
                             symbol, signal['direction'], qty, 
-                            actual_entry, signal['confluence'], target_price, stop_price,
+                            entry_price, signal['confluence'], target_price, stop_price,
                             pd_zone=pd_zone, risk_amount=risk_amount
                         )
                     except RuntimeError as e:
