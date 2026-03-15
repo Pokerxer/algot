@@ -1,333 +1,479 @@
 """
-ICT V7 - With Premium/Discount Arrays
-======================================
-Combines V6 + PD Array analysis for optimal trade entries
+V7 Backtest - MT5 Version
+==========================
+Backtest the V7 strategy with FVG + Gap analysis using MT5 data
 """
 
 import asyncio
 asyncio.set_event_loop(asyncio.new_event_loop())
 
 import sys
-sys.path.insert(0, '.')
+import os
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
 import json
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, time as dt_time
+from typing import Dict, List
+import pytz
+import time
+
 import importlib.util
+spec = importlib.util.spec_from_file_location("ict_v7_mt5", os.path.join(SCRIPT_DIR, "ict_v7_mt5.py"))
+ict_v7 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ict_v7)
 
-# Import V5 base
-spec = importlib.util.spec_from_file_location("ict_v5", "./ict_v5_ibkr.py")
-ict_v5 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ict_v5)
+from fvg_handler import FVGHandler
+from gap_handler import GapHandler
 
-fetch_ibkr_data = ict_v5.fetch_ibkr_data
-prepare_data_ibkr = ict_v5.prepare_data_ibkr
-get_signal = ict_v5.get_signal
-calculate_position_size = ict_v5.calculate_position_size
-get_contract_info = ict_v5.get_contract_info
+try:
+    from mtf_coordinator import MTFCoordinator
+    from market_structure_handler import MarketStructureHandler, StructureBreakType, TrendState, PriceZone
+    MTF_AVAILABLE = True
+except ImportError:
+    MTF_AVAILABLE = False
+    print("WARNING: MTF modules not available")
+
+fetch_mt5_rates = ict_v7.fetch_mt5_rates
+prepare_data_mt5 = ict_v7.prepare_data_mt5
+get_contract_info = ict_v7.get_contract_info
+calculate_position_size = ict_v7.calculate_position_size
+
+
+MT5_SYMBOLS = {
+    # Crypto
+    'BTCUSD': 'BTCUSDm',
+    'ETHUSD': 'ETHUSDm',
+    'SOLUSD': 'SOLUSDm',
+    # Metals
+    'XAUUSD': 'XAUUSDm',
+    'XAGUSD': 'XAGUSDm',
+    # Oil
+    'XTIUSD': 'USOILm',
+    # Major Forex
+    'EURUSD': 'EURUSDm',
+    'GBPUSD': 'GBPUSDm',
+    'USDJPY': 'USDJPYm',
+    'USDCAD': 'USDCADm',
+    'AUDUSD': 'AUDUSDm',
+    'USDCHF': 'USDCHFm',
+    'EURGBP': 'EURGBPm',
+    'EURJPY': 'EURJPYm',
+    'GBPJPY': 'GBPJPYm',
+    # Indices
+    'US30': 'US30m',
+    'USTEC': 'USTECm',  # Nasdaq
+    'US500': 'US500m',
+    'UK100': 'UK100m',
+}
+
+
+def is_valid_trading_session(timestamp, is_forex: bool = False) -> bool:
+    """Check if timestamp is within valid trading sessions"""
+    et_tz = pytz.timezone('US/Eastern')
+    ts_aware = timestamp.tz_localize(et_tz) if timestamp.tzinfo is None else timestamp.astimezone(et_tz)
+    current_time = ts_aware.time()
+    
+    if is_forex:
+        forex_open = dt_time(7, 0)
+        forex_close = dt_time(11, 0)
+        return forex_open <= current_time <= forex_close
+    
+    london_open = dt_time(2, 0)
+    london_close = dt_time(17, 0)
+    ny_open = dt_time(9, 30)
+    ny_close = dt_time(16, 15)
+    
+    return (london_open <= current_time <= london_close) or (ny_open <= current_time <= ny_close)
 
 
 class V7SignalGenerator:
-    """V7 Signal Generator with PD Array analysis"""
+    """V7 Signal Generator for backtesting with MT5"""
     
-    def __init__(self):
-        self.min_fvg_size = 0.0
-    
-    def calculate_daily_quadrants(self, highs, lows, lookback=24):
-        """Calculate daily range quadrants (ICT: Grade everything)"""
-        if len(highs) < lookback:
-            lookback = len(highs)
+    def __init__(self, rr_ratio: float = 3.0, confluence_threshold: int = 60):
+        self.fvg_handler = FVGHandler(
+            sensitivity=0.0001,
+            min_gap_size=0.0,
+            track_body_respect=False,
+            detect_volume_imbalances=False,
+            detect_suspension_blocks=False
+        )
+        self.gap_handler = GapHandler(
+            large_gap_pips_forex=40.0,
+            large_gap_points_indices=50.0,
+            keep_gaps_days=3
+        )
+        self.rr_ratio = rr_ratio
+        self.confluence_threshold = confluence_threshold
         
-        recent_highs = highs[-lookback:]
-        recent_lows = lows[-lookback:]
-        
-        daily_high = np.max(recent_highs)
-        daily_low = np.min(recent_lows)
-        range_size = daily_high - daily_low
-        
-        return {
-            'high': daily_high,
-            'low': daily_low,
-            'ce': daily_low + (range_size * 0.5),  # 50%
-            'upper_quad': daily_low + (range_size * 0.75),  # 75%
-            'lower_quad': daily_low + (range_size * 0.25),  # 25%
-            'ote_high': daily_low + (range_size * 0.79),  # 79% - OTE
-            'ote_low': daily_low + (range_size * 0.62),  # 62% - OTE
-            'range_size': range_size
-        }
-    
-    def get_pd_zone(self, price, quadrants):
-        """Determine Premium/Discount zone for price"""
-        if price >= quadrants['upper_quad']:
-            return 'extreme_premium'  # 75-100% - Sell zone
-        elif price >= quadrants['ce']:
-            return 'premium'  # 50-75% - Sell zone
-        elif price <= quadrants['lower_quad']:
-            return 'extreme_discount'  # 0-25% - Buy zone
-        elif price <= quadrants['ce']:
-            return 'discount'  # 25-50% - Buy zone
+        if MTF_AVAILABLE:
+            self.ms_handler = MarketStructureHandler(
+                swing_lookback=5,
+                min_displacement_pct=0.1
+            )
         else:
-            return 'equilibrium'
+            self.ms_handler = None
     
-    def is_in_ote(self, price, quadrants, direction):
-        """Check if price is in Optimal Trade Entry zone (62-79%)"""
-        if direction == 1:  # Long
-            # For longs, OTE is in discount (62-79% of range from bottom)
-            return quadrants['ote_low'] <= price <= quadrants['ote_high']
-        else:  # Short
-            # For shorts, OTE is in premium (21-38% from top, or 62-79% from bottom)
-            ote_short_high = quadrants['high'] - (quadrants['range_size'] * 0.62)
-            ote_short_low = quadrants['high'] - (quadrants['range_size'] * 0.79)
-            return ote_short_low <= price <= ote_short_high
-    
-    def detect_fvgs_fast(self, highs, lows, closes, lookback=20):
-        """Fast FVG detection"""
-        fvgs = []
-        n = len(closes)
-        start = max(0, n - lookback)
-        
-        for i in range(max(2, start), n):
-            # Bullish FVG
-            if lows[i] > highs[i-2]:
-                gap_size = lows[i] - highs[i-2]
-                if gap_size >= self.min_fvg_size:
-                    fvgs.append({
-                        'type': 'bullish',
-                        'high': lows[i],
-                        'low': highs[i-2],
-                        'ce': (lows[i] + highs[i-2]) / 2,
-                        'idx': i
-                    })
-            
-            # Bearish FVG
-            if highs[i] < lows[i-2]:
-                gap_size = lows[i-2] - highs[i]
-                if gap_size >= self.min_fvg_size:
-                    fvgs.append({
-                        'type': 'bearish',
-                        'high': lows[i-2],
-                        'low': highs[i],
-                        'ce': (lows[i-2] + highs[i]) / 2,
-                        'idx': i
-                    })
-        
-        return fvgs
-    
-    def find_liquidity_levels(self, highs, lows, window=5):
-        """Find equal highs/lows"""
-        n = len(highs)
-        if n < window * 2:
-            return [], []
-        
-        buy_side = []
-        sell_side = []
-        tolerance = 0.001
-        
-        for i in range(window, n - window):
-            recent_highs = highs[i-window:i+window]
-            max_high = np.max(recent_highs)
-            touches = np.sum(np.abs(recent_highs - max_high) / max_high < tolerance)
-            if touches >= 2:
-                buy_side.append(max_high)
-            
-            recent_lows = lows[i-window:i+window]
-            min_low = np.min(recent_lows)
-            touches = np.sum(np.abs(recent_lows - min_low) / min_low < tolerance)
-            if touches >= 2:
-                sell_side.append(min_low)
-        
-        return list(set(buy_side))[:3], list(set(sell_side))[:3]
-    
-    def generate_signal(self, data: Dict, idx: int) -> Optional[Dict]:
-        """Generate V7 signal with PD Array analysis"""
-        # Base V5 signal
-        v5_signal = get_signal(data, idx)
-        if not v5_signal:
-            return None
-        
-        # Only process if V5 confluence >= 50
-        if v5_signal['confluence'] < 50:
-            return None
+    def generate_signal(self, data: Dict, idx: int) -> Dict:
+        """Generate V7 signal with FVG + Gap + MS analysis"""
         
         current_price = data['closes'][idx]
         
-        # Calculate daily quadrants
-        quadrants = self.calculate_daily_quadrants(
-            data['highs'][:idx+1],
-            data['lows'][:idx+1],
-            lookback=24
-        )
+        htf = data['htf_trend'][idx]
+        ltf = data['ltf_trend'][idx]
+        kz = data['kill_zone'][idx]
+        pp = data['price_position'][idx]
+        closes = data['closes'][idx]
         
-        # Get PD zone
-        pd_zone = self.get_pd_zone(current_price, quadrants)
+        df = pd.DataFrame({
+            'open': data['opens'][:idx+1],
+            'high': data['highs'][:idx+1],
+            'low': data['lows'][:idx+1],
+            'close': data['closes'][:idx+1]
+        })
         
-        # ICT Rule: When bullish, ONLY buy from discount
-        # When bearish, ONLY sell from premium
-        pd_boost = 0
-        pd_valid = False
+        fvg_analysis = self.fvg_handler.analyze_fvgs(df)
+        gap_analysis = self.gap_handler.analyze(df, current_price)
         
-        if v5_signal['direction'] == 1:  # Long
-            if pd_zone in ['discount', 'extreme_discount']:
-                pd_boost = 20
-                pd_valid = True
-                # Extra boost if in OTE
-                if self.is_in_ote(current_price, quadrants, 1):
-                    pd_boost += 10
-            elif pd_zone == 'equilibrium':
-                pd_boost = 5  # Neutral
-                pd_valid = True
-            else:
-                pd_boost = -10  # Wrong zone for longs
-                pd_valid = False
+        ms_analysis = None
+        if self.ms_handler:
+            try:
+                ms_analysis = self.ms_handler.analyze(df)
+            except:
+                pass
         
-        else:  # Short
-            if pd_zone in ['premium', 'extreme_premium']:
-                pd_boost = 20
-                pd_valid = True
-                if self.is_in_ote(current_price, quadrants, -1):
-                    pd_boost += 10
-            elif pd_zone == 'equilibrium':
-                pd_boost = 5
-                pd_valid = True
-            else:
-                pd_boost = -10
-                pd_valid = False
-        
-        # Fast FVG detection
-        fvgs = self.detect_fvgs_fast(
-            data['highs'][:idx+1],
-            data['lows'][:idx+1],
-            data['closes'][:idx+1],
-            lookback=20
-        )
-        
-        # Check FVG alignment
-        fvg_boost = 0
-        fvg_info = None
-        for fvg in reversed(fvgs):
-            if fvg['type'] == 'bullish' and v5_signal['direction'] == 1:
-                if abs(current_price - fvg['ce']) < fvg['high'] - fvg['low']:
-                    fvg_boost = 10
-                    fvg_info = f"BISI@{fvg['ce']:.2f}"
-                    break
-            elif fvg['type'] == 'bearish' and v5_signal['direction'] == -1:
-                if abs(current_price - fvg['ce']) < fvg['high'] - fvg['low']:
-                    fvg_boost = 10
-                    fvg_info = f"SIBI@{fvg['ce']:.2f}"
-                    break
-        
-        # Find liquidity levels
-        buy_side, sell_side = self.find_liquidity_levels(
-            data['highs'][:idx+1],
-            data['lows'][:idx+1],
-            window=5
-        )
-        
-        liquidity_info = None
-        if v5_signal['direction'] == 1 and sell_side:
-            for level in sell_side:
-                if abs(current_price - level) / level < 0.005:
-                    liquidity_info = f"SSL@{level:.2f}"
-                    fvg_boost += 5
-                    break
-        elif v5_signal['direction'] == -1 and buy_side:
-            for level in buy_side:
-                if abs(current_price - level) / level < 0.005:
-                    liquidity_info = f"BSL@{level:.2f}"
-                    fvg_boost += 5
-                    break
-        
-        # Combine confluence
-        total_confluence = v5_signal['confluence'] + pd_boost + fvg_boost
-        total_confluence = max(0, min(total_confluence, 100))
-        
-        # Determine confidence (require PD zone validity for HIGH)
-        if total_confluence >= 75 and pd_valid:
-            confidence = 'HIGH'
-        elif total_confluence >= 60:
-            confidence = 'MEDIUM'
-        elif total_confluence >= 45:
-            confidence = 'LOW'
-        else:
-            confidence = 'LOW'
-            if not pd_valid:
-                return None  # Skip if in wrong PD zone
-        
-        return {
-            'direction': v5_signal['direction'],
-            'confluence': total_confluence,
-            'v5_confluence': v5_signal['confluence'],
-            'pd_boost': pd_boost,
-            'fvg_boost': fvg_boost,
-            'confidence': confidence,
-            'pd_zone': pd_zone,
-            'daily_ce': quadrants['ce'],
-            'fvg_info': fvg_info,
-            'liquidity_info': liquidity_info,
-            'in_ote': self.is_in_ote(current_price, quadrants, v5_signal['direction'])
+        signal = {
+            'direction': 0,
+            'confluence': 0,
+            'entry_price': current_price,
+            'stop_loss': None,
+            'take_profit': None,
+            'confidence': 'LOW',
+            'reasoning': [],
+            'fvg_data': None,
+            'gap_data': None
         }
+        
+        near_bull_fvg = next((f for f in reversed(data['bullish_fvgs']) if f['idx'] < idx and f['mid'] < closes), None)
+        near_bear_fvg = next((f for f in reversed(data['bearish_fvgs']) if f['idx'] < idx and f['mid'] > closes), None)
+        
+        base_confluence = 0
+        
+        if kz:
+            base_confluence += 15
+            signal['reasoning'].append("Kill Zone: +15")
+        
+        if htf == 1 and ltf >= 0:
+            base_confluence += 25
+            signal['direction'] = 1
+            signal['reasoning'].append("HTF+LTF Bullish: +25")
+        elif htf == -1 and ltf <= 0:
+            base_confluence += 25
+            signal['direction'] = -1
+            signal['reasoning'].append("HTF+LTF Bearish: +25")
+        elif htf == 0 and ltf == 1:
+            base_confluence += 15
+            signal['direction'] = 1
+            signal['reasoning'].append("LTF Bullish: +15")
+        elif htf == 0 and ltf == -1:
+            base_confluence += 15
+            signal['direction'] = -1
+            signal['reasoning'].append("LTF Bearish: +15")
+        
+        if pp < 0.25:
+            base_confluence += 20
+            signal['reasoning'].append("Price near lows: +20")
+        elif pp > 0.75:
+            base_confluence += 20
+            signal['reasoning'].append("Price near highs: +20")
+        
+        if near_bull_fvg and ltf >= 0:
+            base_confluence += 15
+            signal['reasoning'].append("V5 Bull FVG: +15")
+        if near_bear_fvg and ltf <= 0:
+            base_confluence += 15
+            signal['reasoning'].append("V5 Bear FVG: +15")
+        
+        if ms_analysis:
+            try:
+                if hasattr(ms_analysis, 'trend_state'):
+                    if ms_analysis.trend_state == TrendState.BULLISH and signal['direction'] == 1:
+                        base_confluence += 10
+                    elif ms_analysis.trend_state == TrendState.BEARISH and signal['direction'] == -1:
+                        base_confluence += 10
+                        
+                if hasattr(ms_analysis, 'current_zone'):
+                    if ms_analysis.current_zone == PriceZone.DISCOUNT and signal['direction'] == 1:
+                        base_confluence += 10
+                    elif ms_analysis.current_zone == PriceZone.PREMIUM and signal['direction'] == -1:
+                        base_confluence += 10
+            except:
+                pass
+        
+        fvg_confluence = 0
+        if fvg_analysis.best_bisi_fvg and signal['direction'] == 1:
+            fvg = fvg_analysis.best_bisi_fvg
+            distance = abs(current_price - fvg.consequent_encroachment)
+            if distance < fvg.size * 2:
+                fvg_confluence += 20
+                signal['fvg_data'] = {
+                    'type': 'BISI',
+                    'ce': fvg.consequent_encroachment,
+                    'distance': distance
+                }
+                if fvg.is_high_probability:
+                    fvg_confluence += 15
+        
+        elif fvg_analysis.best_sibi_fvg and signal['direction'] == -1:
+            fvg = fvg_analysis.best_sibi_fvg
+            distance = abs(current_price - fvg.consequent_encroachment)
+            if distance < fvg.size * 2:
+                fvg_confluence += 20
+                signal['fvg_data'] = {
+                    'type': 'SIBI',
+                    'ce': fvg.consequent_encroachment,
+                    'distance': distance
+                }
+                if fvg.is_high_probability:
+                    fvg_confluence += 15
+        
+        gap_confluence = 0
+        if gap_analysis.current_gap and gap_analysis.in_gap_zone:
+            gap_confluence += 10
+            if gap_analysis.nearest_level:
+                level_price, level_name = gap_analysis.nearest_level
+                distance_pct = abs(current_price - level_price) / current_price * 100
+                if distance_pct < 0.5:
+                    gap_confluence += 10
+        
+        total_confluence = base_confluence + fvg_confluence + gap_confluence
+        signal['confluence'] = min(total_confluence, 100)
+        
+        if total_confluence >= 80:
+            signal['confidence'] = 'HIGH'
+        elif total_confluence >= 60:
+            signal['confidence'] = 'MEDIUM'
+        elif total_confluence >= 50:
+            signal['confidence'] = 'LOW'
+        else:
+            signal['direction'] = 0
+        
+        if signal['direction'] != 0:
+            entry = current_price
+            
+            highs = data['highs']
+            lows = data['lows']
+            closes_arr = data['closes']
+            
+            atr = np.mean([max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes_arr[i-1]) if i > 0 else 0,
+                abs(lows[i] - closes_arr[i-1]) if i > 0 else 0
+            ) for i in range(max(0, idx-14), idx+1)])
+            
+            contract_info = get_contract_info(data.get('symbol', ''))
+            symbol_type = contract_info['type']
+            
+            atr_multiplier = 2.0
+            min_atr_multiplier = 1.5
+            
+            # Calculate stop distance based on instrument type
+            if symbol_type == 'forex':
+                decimal_places = contract_info.get('decimal_places', 5)
+                pip_size = 0.01 if decimal_places == 3 else 0.0001  # JPY = 0.01, others = 0.0001
+                atr_pips = atr / pip_size
+                min_stop_pips = max(25, atr_pips * min_atr_multiplier)
+                max_stop_pips = max(80, atr_pips * atr_multiplier)
+                atr_stop_distance = atr * atr_multiplier
+                min_stop_distance = min_stop_pips * pip_size
+                max_stop_distance = max_stop_pips * pip_size
+                stop_distance = max(min_stop_distance, min(atr_stop_distance, max_stop_distance))
+                
+                # Validate pips
+                risk_pips = stop_distance / pip_size
+                if risk_pips < 15 or risk_pips > 100:
+                    signal['direction'] = 0
+                    return signal
+                    
+            elif symbol_type == 'futures':
+                # Metals (XAU, XAG) and Oil
+                min_stop = contract_info.get('min_stop', 10)
+                stop_distance = max(atr * atr_multiplier, min_stop)
+                
+            elif symbol_type == 'indices':
+                # Indices (US30, USTEC, US500, UK100)
+                min_stop = contract_info.get('min_stop', 20)
+                stop_distance = max(atr * atr_multiplier, min_stop)
+                
+            elif symbol_type == 'crypto':
+                # Crypto - use percentage-based stops
+                stop_distance = current_price * 0.02  # 2% stop
+            else:
+                # Default
+                stop_distance = atr * atr_multiplier
+            
+            signal['entry_price'] = entry
+            signal['stop_loss'] = entry - stop_distance if signal['direction'] == 1 else entry + stop_distance
+            signal['take_profit'] = entry + (stop_distance * self.rr_ratio) if signal['direction'] == 1 else entry - (stop_distance * self.rr_ratio)
+        
+        return signal
 
 
-def run_v7_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02):
-    """Run V7 backtest with PD Array analysis"""
+def run_v7_backtest(symbols, days=30, initial_capital=10000, risk_per_trade=0.02, 
+                   rr_ratio=3.0, confluence_threshold=40, timeframe="M15"):
+    """Run V7 backtest using MT5 data"""
     
     print(f"\n{'='*80}")
-    print(f"V7 Backtest - Premium/Discount Arrays + FVG + Liquidity")
+    print(f"ICT V7 Backtest - MT5 Data")
+    print(f"Initial Capital: ${initial_capital:,}")
+    print(f"Timeframe: {timeframe}")
+    print(f"Risk per Trade: {risk_per_trade*100}%")
+    print(f"RR Ratio: 1:{rr_ratio}")
+    print(f"Confluence Threshold: {confluence_threshold}")
     print(f"Symbols: {', '.join(symbols)}")
-    print(f"Capital: ${initial_capital:,} | Risk: {risk_per_trade*100}%")
     print(f"{'='*80}\n")
     
-    signal_gen = V7SignalGenerator()
+    signal_gen = V7SignalGenerator(rr_ratio=rr_ratio, confluence_threshold=confluence_threshold)
     
-    # Load data
     all_data = {}
+    
     for symbol in symbols:
-        print(f"Loading {symbol}...", end=' ')
-        data = prepare_data_ibkr(symbol)
-        if data and len(data.get('closes', [])) >= 50:
-            all_data[symbol] = data
-            print(f"✓ {len(data['closes'])} bars")
-        else:
-            print(f"✗")
+        mt5_symbol = MT5_SYMBOLS.get(symbol, symbol)
+        print(f"Loading {mt5_symbol}...", end=' ')
+        
+        try:
+            df = fetch_mt5_rates(mt5_symbol, timeframe, num_bars=500)
+            
+            if df is None or len(df) < 50:
+                print(f"X No data from MT5")
+                continue
+            
+            highs = df['high'].values
+            lows = df['low'].values
+            closes = df['close'].values
+            opens = df['open'].values
+            
+            bullish_fvgs = []
+            bearish_fvgs = []
+            for i in range(3, len(df)):
+                if lows[i] > highs[i-2]:
+                    bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
+                if highs[i] < lows[i-2]:
+                    bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
+            
+            daily_df = fetch_mt5_rates(mt5_symbol, "D1", num_bars=60)  # Keep D1 for HTF
+            if daily_df is None or len(daily_df) < 5:
+                htf_trend = np.zeros(len(df))
+            else:
+                daily_highs = daily_df['high'].values
+                daily_lows = daily_df['low'].values
+                htf = []
+                for i in range(1, len(daily_df)):
+                    if daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] > np.min(daily_lows[max(0,i-5):i]):
+                        htf.append(1)
+                    elif daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] < np.min(daily_lows[max(0,i-5):i]):
+                        htf.append(-1)
+                    else:
+                        htf.append(0)
+                
+                htf_trend = np.zeros(len(df))
+                for i in range(len(df)):
+                    bar_time = df.index[i]
+                    for j in range(len(daily_df) - 1, -1, -1):
+                        if daily_df.index[j] <= bar_time:
+                            htf_trend[i] = htf[j] if j < len(htf) else 0
+                            break
+            
+            trend = np.zeros(len(df))
+            for i in range(20, len(df)):
+                momentum = closes[i] - closes[i-10]
+                pct_change = momentum / closes[i-10] if closes[i-10] > 0 else 0
+                ema_fast = np.mean(closes[max(0,i-5):i+1])
+                ema_slow = np.mean(closes[max(0,i-13):i+1])
+                
+                if pct_change > 0.005 or (pct_change > 0.001 and ema_fast > ema_slow):
+                    trend[i] = 1
+                elif pct_change < -0.005 or (pct_change < -0.001 and ema_fast < ema_slow):
+                    trend[i] = -1
+            
+            price_position = np.zeros(len(df))
+            for i in range(20, len(df)):
+                ph = np.max(highs[i-20:i])
+                pl = np.min(lows[i-20:i])
+                rng = ph - pl
+                if rng < 0.001:
+                    rng = 0.001
+                price_position[i] = (closes[i] - pl) / rng
+            
+            hours = df.index.hour.values
+            kill_zone = np.zeros(len(df), dtype=bool)
+            for i in range(len(hours)):
+                h = hours[i]
+                kill_zone[i] = (1 <= h < 5) or (7 <= h < 12) or (13.5 <= h < 16)
+            
+            data = {
+                'opens': opens,
+                'highs': highs,
+                'lows': lows,
+                'closes': closes,
+                'htf_trend': htf_trend,
+                'ltf_trend': trend,
+                'price_position': price_position,
+                'kill_zone': kill_zone,
+                'bullish_fvgs': bullish_fvgs,
+                'bearish_fvgs': bearish_fvgs,
+                'symbol': symbol,
+                'df': df
+            }
+            
+            all_data[symbol] = {'df': df, 'data': data}
+            
+            print(f"OK {len(df)} bars")
+            
+        except Exception as e:
+            print(f"X Error: {e}")
     
     if not all_data:
-        print("No data loaded!")
+        print("No data loaded! Make sure MT5 is running with opened charts.")
         return None
     
-    # Get all timestamps
-    all_timestamps = sorted(set().union(*[set(data['df'].index) for data in all_data.values()]))
-    print(f"\nProcessing {len(all_timestamps)} timestamps...")
-    
-    # Trading state
     balance = initial_capital
     positions = {}
-    trades = []
+    active_trades = []
+    is_forex = lambda s: s in {
+        'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'NZDUSD', 
+        'EURGBP', 'EURJPY', 'GBPJPY', 'USDCHF', 'XAUUSD', 'XAGUSD'
+    }
+    is_index = lambda s: s in {
+        'US30', 'US100', 'US500', 'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
+    }
     
-    # Process each timestamp
-    for i, timestamp in enumerate(all_timestamps):
-        if i % 1000 == 0 and i > 0:
-            print(f"  [{i}/{len(all_timestamps)}] Balance: ${balance:,.2f} | Trades: {len(trades)}")
+    # Simplified: Process each symbol independently
+    for symbol, item in all_data.items():
+        df = item['df']
+        data = item['data']
         
-        for symbol, data in all_data.items():
-            if timestamp not in data['df'].index:
-                continue
+        print(f"Processing {symbol} ({len(df)} bars)...")
+        
+        start_time = time.time()
+        for idx in range(50, len(df) - 10, 5):  # Check every 5th bar
+            if idx % 50 == 0:
+                elapsed = time.time() - start_time
+                print(f"  [{symbol}] Bar {idx}/{len(df)} ({elapsed:.1f}s)")
             
-            idx = data['df'].index.get_loc(timestamp)
-            if idx < 50 or idx >= len(data['closes']) - 1:
-                continue
+            current_price = df.iloc[idx]['close']
             
-            current_price = data['closes'][idx]
+            # Generate signal
+            signal = signal_gen.generate_signal(data, idx)
             
             # Check exits
             if symbol in positions:
                 pos = positions[symbol]
-                next_bar = data['df'].iloc[idx + 1]
-                
-                # Handle both Yahoo (capitalized) and IBKR (lowercase) column names
-                next_high = next_bar.get('high', next_bar.get('High', 0))
-                next_low = next_bar.get('low', next_bar.get('Low', 0))
+                next_bar = df.iloc[idx + 1]
+                next_low = next_bar['low']
+                next_high = next_bar['high']
                 
                 exit_price = None
                 if pos['direction'] == 1:
@@ -349,20 +495,29 @@ def run_v7_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
                     else:
                         price_change = pos['entry'] - exit_price
                     
+                    # Calculate PnL based on instrument type
                     if contract_info['type'] == 'futures':
-                        pnl = price_change * pos['qty'] * contract_info['multiplier']
+                        # Metals (XAU, XAG) and Oil
+                        multiplier = contract_info.get('multiplier', 1)
+                        pnl = price_change * pos['qty'] * multiplier
+                    elif contract_info['type'] == 'indices':
+                        # Indices - price change is in points
+                        pnl = price_change * pos['qty']
                     else:
+                        # Forex, Crypto
                         pnl = price_change * pos['qty']
                     
                     balance += pnl
-                    trades.append({
+                    
+                    active_trades.append({
                         'symbol': symbol,
                         'direction': 'LONG' if pos['direction'] == 1 else 'SHORT',
-                        'entry': pos['entry'],
-                        'exit': exit_price,
+                        'entry_price': pos['entry'],
+                        'exit_price': exit_price,
+                        'qty': pos['qty'],
                         'pnl': pnl,
-                        'confidence': pos.get('confidence', 'MEDIUM'),
-                        'pd_zone': pos.get('pd_zone')
+                        'confluence': pos.get('confluence', 0),
+                        'fvg_info': pos.get('fvg_info', '')
                     })
                     del positions[symbol]
             
@@ -370,47 +525,37 @@ def run_v7_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
             elif symbol not in positions:
                 signal = signal_gen.generate_signal(data, idx)
                 
-                if signal and signal['confluence'] >= 55:  # Slightly lower threshold for V7
-                    # Calculate stops/targets
-                    if signal['direction'] == 1:
-                        stop = data['lows'][idx]
-                        target = current_price + (current_price - stop) * 2
-                    else:
-                        stop = data['highs'][idx]
-                        target = current_price - (stop - current_price) * 2
-                    
-                    stop_distance = abs(current_price - stop)
+                # Session filter - disabled for backtest (timestamps may be UTC)
+                in_session = True
+                
+                if signal and signal['direction'] != 0 and signal['confluence'] >= confluence_threshold and in_session:
+                    stop_distance = abs(current_price - signal['stop_loss'])
                     if stop_distance > 0:
                         qty, _ = calculate_position_size(
-                            symbol, initial_capital, risk_per_trade, 
-                            stop_distance, current_price
+                            symbol, initial_capital, risk_per_trade, stop_distance, current_price
                         )
                         
                         if qty > 0:
                             positions[symbol] = {
                                 'entry': current_price,
-                                'stop': stop,
-                                'target': target,
+                                'stop': signal['stop_loss'],
+                                'target': signal['take_profit'],
                                 'direction': signal['direction'],
                                 'qty': qty,
-                                'confidence': signal['confidence'],
-                                'pd_zone': signal['pd_zone'],
-                                'fvg_info': signal.get('fvg_info'),
-                                'in_ote': signal.get('in_ote')
+                                'confluence': signal['confluence'],
+                                'fvg_info': signal.get('fvg_data', {}).get('type', '') if signal.get('fvg_data') else ''
                             }
     
-    # Results
-    total_trades = len(trades)
-    wins = len([t for t in trades if t['pnl'] > 0])
+    total_trades = len(active_trades)
+    wins = len([t for t in active_trades if t['pnl'] > 0])
     losses = total_trades - wins
     win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
     total_pnl = balance - initial_capital
-    return_pct = (total_pnl / initial_capital) * 100
+    total_return_pct = (total_pnl / initial_capital) * 100
     
-    # Symbol stats
     symbol_stats = {}
     for symbol in all_data.keys():
-        symbol_trades = [t for t in trades if t['symbol'] == symbol]
+        symbol_trades = [t for t in active_trades if t['symbol'] == symbol]
         symbol_wins = len([t for t in symbol_trades if t['pnl'] > 0])
         symbol_stats[symbol] = {
             'trades': len(symbol_trades),
@@ -420,47 +565,112 @@ def run_v7_backtest(symbols, days=30, initial_capital=50000, risk_per_trade=0.02
             'pnl': sum(t['pnl'] for t in symbol_trades)
         }
     
-    print(f"\n{'='*80}")
-    print("V7 BACKTEST RESULTS")
-    print(f"{'='*80}")
-    print(f"Initial: ${initial_capital:,}")
-    print(f"Final: ${balance:,.2f}")
-    print(f"Return: {return_pct:.2f}%")
-    print(f"\nTrades: {total_trades} | Win Rate: {win_rate:.1f}%")
-    print(f"Wins: {wins} | Losses: {losses}")
-    print(f"Avg Trade: ${total_pnl/total_trades:.2f}" if total_trades > 0 else "N/A")
-    print(f"\nSymbol Performance:")
-    for symbol, stats in sorted(symbol_stats.items(), key=lambda x: x[1]['pnl'], reverse=True):
-        print(f"  {symbol}: {stats['trades']}T {stats['win_rate']:.0f}%WR ${stats['pnl']:,.0f}")
-    print(f"{'='*80}\n")
-    
-    return {
+    results = {
+        'backtest_config': {
+            'symbols': list(all_data.keys()),
+            'days': days,
+            'initial_capital': initial_capital,
+            'risk_per_trade': risk_per_trade,
+            'data_source': 'MT5',
+            'timestamp': datetime.now().isoformat(),
+            'version': 'V7',
+            'session_filter': 'London/NY sessions',
+            'rr_ratio': rr_ratio,
+            'confluence_threshold': confluence_threshold
+        },
         'summary': {
-            'initial': initial_capital,
-            'final': balance,
-            'return_pct': return_pct,
-            'trades': total_trades,
-            'win_rate': win_rate,
+            'initial_capital': initial_capital,
+            'final_capital': round(balance, 2),
+            'total_pnl': round(total_pnl, 2),
+            'total_return_pct': round(total_return_pct, 2),
+            'total_trades': total_trades,
             'wins': wins,
-            'losses': losses
+            'losses': losses,
+            'win_rate': round(win_rate, 2),
+            'avg_trade_pnl': round(total_pnl / total_trades, 2) if total_trades > 0 else 0
         },
         'symbol_stats': symbol_stats,
-        'trades': trades
+        'trades': active_trades
     }
+    
+    # Log trades to file
+    if active_trades:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"v7_trades_{timestamp}.json"
+        with open(log_file, 'w') as f:
+            json.dump({
+                'config': results['backtest_config'],
+                'trades': active_trades
+            }, f, indent=2, default=str)
+        print(f"\nTrades logged to: {log_file}")
+    
+    return results
 
 
 if __name__ == "__main__":
-    symbols = ['BTCUSD', 'ETHUSD', 'ES', 'NQ', 'GC', 'SOLUSD', 'LINKUSD', 'LTCUSD', 'SI', 'UNIUSD', 'NG', 'CL']
+    symbols = ['XAUUSD', 'XTIUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'BTCUSD', 'ETHUSD']
     
-    results = run_v7_backtest(
-        symbols=symbols,
-        days=30,
-        initial_capital=50000,
-        risk_per_trade=0.02
-    )
+    print("="*80)
+    print("ICT V7 - MT5 Backtest")
+    print("="*80)
     
-    if results:
-        with open('v7_results.json', 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        print("Results saved to v7_results.json")
-1
+    # Test with M5 timeframe
+    timeframe = "M5"
+    
+    # Symbols to test
+    symbols = [
+        # Major Forex
+        'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF',
+        'EURGBP', 'EURJPY', 'GBPJPY',
+        # # Metals
+        'XAUUSD', 'XAGUSD',
+        # Oil
+        # 'XTIUSD',
+        # # Indices
+        'US30', 'USTEC', 'US500', 'UK100',
+        'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
+    ]
+    
+    try:
+        import MetaTrader5 as mt5
+        if not mt5.initialize(login=0):  # Initialize without login for local terminal
+            print(f"ERROR: MT5 initialize failed: {mt5.last_error()}")
+            exit(1)
+        
+        # Check MT5 terminal info
+        terminal_info = mt5.terminal_info()
+        print(f"MT5 Terminal connected: {terminal_info.connected}")
+        
+        results = run_v7_backtest(
+            symbols=symbols,
+            days=30,
+            initial_capital=10000,
+            risk_per_trade=0.02,
+            rr_ratio=3.0,
+            confluence_threshold=40,
+            timeframe=timeframe
+        )
+        
+        if results:
+            print(f"\n{'='*80}")
+            print("V7 BACKTEST RESULTS (MT5)")
+            print(f"{'='*80}")
+            print(f"Initial Capital: ${results['summary']['initial_capital']:,}")
+            print(f"Final Capital: ${results['summary']['final_capital']:,}")
+            print(f"Total PnL: ${results['summary']['total_pnl']:,.2f}")
+            print(f"Total Return: {results['summary']['total_return_pct']:.2f}%")
+            print(f"\nTotal Trades: {results['summary']['total_trades']}")
+            print(f"Win Rate: {results['summary']['win_rate']:.1f}%")
+            print(f"Wins: {results['summary']['wins']} | Losses: {results['summary']['losses']}")
+            print(f"Avg Trade: ${results['summary']['avg_trade_pnl']:.2f}")
+
+            print(f"\n{'='*80}")
+            print("\nSymbol Performance:")
+            for symbol, stats in sorted(results['symbol_stats'].items(), key=lambda x: x[1]['pnl'], reverse=True):
+                print(f"  {symbol}: {stats['trades']} trades, {stats['win_rate']:.1f}% WR, ${stats['pnl']:,.2f}")
+        
+        mt5.shutdown()
+        
+    except ImportError:
+        print("ERROR: MetaTrader5 package not installed")
+        print("Run: pip install MetaTrader5")
