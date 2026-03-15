@@ -61,18 +61,39 @@ except (ImportError, NameError, Exception) as e:
 FOREX_SYMBOLS = {'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF', 'NZDUSD', 'EURGBP', 'EURJPY', 'GBPJPY', 'XAUUSD', 'XAGUSD'}
 
 MT5_SYMBOLS = {
+    # Crypto
     'BTCUSD': 'BTCUSDm', 'ETHUSD': 'ETHUSDm', 'SOLUSD': 'SOLUSDm',
+    # Metals
     'XAUUSD': 'XAUUSDm', 'XAGUSD': 'XAGUSDm',
+    # Oil
     'XTIUSD': 'USOILm',
+    # Major Forex
     'EURUSD': 'EURUSDm', 'GBPUSD': 'GBPUSDm', 'USDJPY': 'USDJPYm',
     'USDCAD': 'USDCADm', 'AUDUSD': 'AUDUSDm', 'USDCHF': 'USDCHFm',
     'EURGBP': 'EURGBPm', 'EURJPY': 'EURJPYm', 'GBPJPY': 'GBPJPYm',
+    # Indices
     'US30': 'US30m', 'USTEC': 'USTECm', 'US500': 'US500m', 'UK100': 'UK100m',
+}
+
+# Exness-specific mapping (for when symbols not found)
+EXNESS_SYMBOLS = {
+    'XAUUSD': 'XAUUSDm',
+    'XAGUSD': 'XAGUSDm', 
+    'US30': 'US30m',
+    'USTEC': 'USTECm',
+    'US500': 'US500m',
+    'UK100': 'UK100m',
 }
 
 def get_mt5_symbol(symbol: str) -> str:
     """Convert symbol to MT5 format with suffix"""
-    return MT5_SYMBOLS.get(symbol.upper(), symbol.upper() + 'm')
+    s = symbol.upper()
+    if s in MT5_SYMBOLS:
+        return MT5_SYMBOLS[s]
+    # Try Exness-specific
+    if s in EXNESS_SYMBOLS:
+        return EXNESS_SYMBOLS[s]
+    return s + 'm'
 CONVERT_THRESHOLD_GBP = 500
 
 
@@ -433,14 +454,17 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
         return None
     
     symbol = symbol.upper()
+    mt5_symbol = get_mt5_symbol(symbol)  # Convert to MT5 format
     
-    symbol_info = mt5.symbol_info(symbol)
+    symbol_info = mt5.symbol_info(mt5_symbol)
     if symbol_info is None:
-        print(f"Symbol {symbol} not found")
+        print(f"Symbol {mt5_symbol} not found")
         return None
     
     if not symbol_info.visible:
-        mt5.symbol_select(symbol, True)
+        if not mt5.symbol_select(mt5_symbol, True):
+            print(f"Could not select symbol: {mt5_symbol}")
+            return None
     
     point = symbol_info.point
     
@@ -453,7 +477,7 @@ def place_mt5_order(symbol: str, order_type: str, volume: float,
     
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
+        "symbol": mt5_symbol,
         "volume": volume,
         "type": order_type_enum,
         "price": price,
