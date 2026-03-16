@@ -50,10 +50,11 @@ try:
         MarketStructureHandler, MarketStructureAnalysis,
         StructureBreakType, TrendState, PriceZone
     )
+    from mtf_coordinator import MTFCoordinator
     MTF_AVAILABLE = True
 except ImportError as e:
     MTF_AVAILABLE = False
-    print(f"WARNING: market_structure_handler not available: {e}")
+    print(f"WARNING: market_structure_handler or mtf_coordinator not available: {e}")
 
 import json
 import pandas as pd
