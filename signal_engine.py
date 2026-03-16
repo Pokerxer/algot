@@ -296,7 +296,7 @@ class ICTSignalEngine:
             if result["last_break"]:
                 result["retest_held"] = result["last_break"].retest_held
         except Exception as e:
-            print(f"[MS] Error: {e}")
+            if self._debug_mode: print(f"[MS] Error: {e}")
         return result
 
     def _run_liquidity(self, df: pd.DataFrame) -> Dict:
@@ -338,7 +338,7 @@ class ICTSignalEngine:
                 result["nearest_sell_liq"] = min(sell_pools,
                                                  key=lambda p: abs(p.price - current_price))
         except Exception as e:
-            print(f"[LIQ] Error: {e}")
+            if self._debug_mode: print(f"[LIQ] Error: {e}")
         return result
 
     def _run_order_blocks(self, df: pd.DataFrame) -> Optional[Dict]:
@@ -409,23 +409,133 @@ class ICTSignalEngine:
                 score=_score(best),
             )
         except Exception as e:
-            print(f"[OB] Error: {e}")
+            if self._debug_mode: print(f"[OB] Error: {e}")
             return None
 
     def _run_fvg(self, df: pd.DataFrame) -> Dict:
-        """Run FVGHandler and return a flat summary."""
-        result = dict(
-            best_bisi=None,
-            best_sibi=None,
-            high_prob_count=0,
-        )
+        """
+        Fast O(n) FVG scanner — avoids the O(n²) _update_fvg_status loop
+        inside FVGHandler.detect_all_fvgs which causes extreme slowness when
+        called bar-by-bar from the backtester.
+
+        Scans the last 50 bars for 3-candle BISI / SIBI patterns.
+        Filters to FVGs that are still ACTIVE (current price has not fully
+        traded through the gap's consequent encroachment).
+        Returns the highest-scoring unfilled FVG on each side.
+        """
+        result = dict(best_bisi=None, best_sibi=None, high_prob_count=0)
         try:
-            analysis = self.fvg_handler.analyze_fvgs(df)
-            result["best_bisi"]      = analysis.best_bisi_fvg
-            result["best_sibi"]      = analysis.best_sibi_fvg
-            result["high_prob_count"]= len(analysis.high_prob_fvgs)
+            h  = df['high'].values
+            l  = df['low'].values
+            o  = df['open'].values
+            c  = df['close'].values
+            n  = len(c)
+            current_price = float(c[-1])
+
+            # Scan last 50 bars only (enough for recent relevant FVGs)
+            scan_start = max(2, n - 50)
+
+            # 20-bar dealing range for premium/discount classification
+            dr_high = h[max(0, n - 20):n].max()
+            dr_low  = l[max(0, n - 20):n].min()
+            dr_eq   = (dr_high + dr_low) / 2
+
+            bisi_candidates = []
+            sibi_candidates = []
+
+            for i in range(scan_start, n):
+                c1_h = h[i - 2]; c1_l = l[i - 2]
+                c3_h = h[i];     c3_l = l[i]
+
+                # ── BISI (Bullish FVG): gap between C1 high and C3 low ────────
+                if c3_l > c1_h + 1e-8:
+                    gap_low  = c1_h
+                    gap_high = c3_l
+                    ce       = (gap_low + gap_high) / 2
+
+                    # Active = price hasn't traded back through CE
+                    if current_price > ce:
+                        score = 0
+                        size  = gap_high - gap_low
+
+                        # High probability: gap is in discount zone
+                        in_discount = ce < dr_eq
+                        if in_discount:
+                            score += 20
+
+                        # Recency bonus (more recent = more relevant)
+                        recency = (i - scan_start) / max(1, n - scan_start)
+                        score  += int(recency * 15)
+
+                        # Size relative to recent ATR (neither tiny nor huge)
+                        atr_proxy = (h[max(0,i-14):i+1] - l[max(0,i-14):i+1]).mean()
+                        if atr_proxy > 0:
+                            ratio = size / atr_proxy
+                            if 0.2 <= ratio <= 1.5:
+                                score += 10
+
+                        # First presented (most recent unfilled FVG gets bonus)
+                        if not bisi_candidates:
+                            score += 15
+
+                        bisi_candidates.append((score, ce, gap_high, gap_low, size, in_discount))
+
+                # ── SIBI (Bearish FVG): gap between C1 low and C3 high ────────
+                elif c3_h < c1_l - 1e-8:
+                    gap_high = c1_l
+                    gap_low  = c3_h
+                    ce       = (gap_low + gap_high) / 2
+
+                    # Active = price hasn't traded back through CE
+                    if current_price < ce:
+                        score = 0
+                        size  = gap_high - gap_low
+
+                        in_premium = ce > dr_eq
+                        if in_premium:
+                            score += 20
+
+                        recency = (i - scan_start) / max(1, n - scan_start)
+                        score  += int(recency * 15)
+
+                        atr_proxy = (h[max(0,i-14):i+1] - l[max(0,i-14):i+1]).mean()
+                        if atr_proxy > 0:
+                            ratio = size / atr_proxy
+                            if 0.2 <= ratio <= 1.5:
+                                score += 10
+
+                        if not sibi_candidates:
+                            score += 15
+
+                        sibi_candidates.append((score, ce, gap_high, gap_low, size, in_premium))
+
+            # Pick highest-scoring FVG per side and build a minimal object
+            # that the signal assembly code can use (duck-typed dict)
+            if bisi_candidates:
+                best = max(bisi_candidates, key=lambda x: x[0])
+                score, ce, gh, gl, sz, hp = best
+                result["best_bisi"] = type('FVG', (), {
+                    'consequent_encroachment': ce,
+                    'high': gh, 'low': gl, 'size': sz,
+                    'is_high_probability': hp,
+                    'gap_type': 'bisi',
+                })()
+                result["high_prob_count"] += int(hp)
+
+            if sibi_candidates:
+                best = max(sibi_candidates, key=lambda x: x[0])
+                score, ce, gh, gl, sz, hp = best
+                result["best_sibi"] = type('FVG', (), {
+                    'consequent_encroachment': ce,
+                    'high': gh, 'low': gl, 'size': sz,
+                    'is_high_probability': hp,
+                    'gap_type': 'sibi',
+                })()
+                result["high_prob_count"] += int(hp)
+
         except Exception as e:
-            print(f"[FVG] Error: {e}")
+            if self._debug_mode:
+                print(f"[FVG] Error: {e}")
         return result
 
     def _run_gap(self, df: pd.DataFrame, current_price: float) -> Dict:
@@ -441,7 +551,7 @@ class ICTSignalEngine:
             if analysis.current_gap:
                 result["gap_type"] = analysis.current_gap.gap_type.value
         except Exception as e:
-            print(f"[GAP] Error: {e}")
+            if self._debug_mode: print(f"[GAP] Error: {e}")
         return result
 
     def _run_model_2022(self, df: pd.DataFrame, ms: Dict) -> Optional[Dict]:
@@ -463,7 +573,7 @@ class ICTSignalEngine:
                 notes=setup.notes,
             )
         except Exception as e:
-            print(f"[M22] Error: {e}")
+            if self._debug_mode: print(f"[M22] Error: {e}")
             return None
 
     def _run_silver_bullet(self, df: pd.DataFrame, now: datetime,
@@ -485,14 +595,14 @@ class ICTSignalEngine:
                 target=setup.target,
             )
         except Exception as e:
-            print(f"[SB] Error: {e}")
+            if self._debug_mode: print(f"[SB] Error: {e}")
             return None
 
     def _run_ote(self, df: pd.DataFrame, ms: Dict,
                  current_price: float) -> Optional[Dict]:
         """Check if current price is inside the OTE 62–79% retracement zone."""
         try:
-            setup = self.model_handler.analyze_ote(df, "bullish"
+            setup = self.model_handler.analyze_optimal_trade_entry(df, "bullish"
                     if ms["htf_trend"] == TrendState.BULLISH else "bearish")
             if setup and setup.in_ote_zone:
                 return dict(
@@ -503,7 +613,7 @@ class ICTSignalEngine:
                     retracement_pct=setup.retracement_percent,
                 )
         except Exception as e:
-            print(f"[OTE] Error: {e}")
+            if self._debug_mode: print(f"[OTE] Error: {e}")
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -747,9 +857,17 @@ class ICTSignalEngine:
 
         stop = ob_stop or m22_stop or sb_stop
 
+        # Enforce minimum stop distance for indices (0.5% of price)
+        symbol = signal.get("symbol", "")
+        min_stop_pct = 0.005  # 0.5% minimum
+        if symbol in ("US30", "US500", "USTEC", "UK100", "GER40", "JAP40"):
+            min_stop_dist = entry * min_stop_pct
+        else:
+            min_stop_dist = 0
+
         if stop is None:
             # ATR fallback: 2× ATR from entry
-            stop_dist = atr_val * 2.0
+            stop_dist = max(atr_val * 2.0, min_stop_dist)
             stop = (entry - stop_dist) if direction == 1 else (entry + stop_dist)
 
         stop_distance = abs(entry - stop)
@@ -764,6 +882,11 @@ class ICTSignalEngine:
         if direction == -1 and stop <= entry:
             stop = entry + atr_val
             stop_distance = atr_val
+
+        # Enforce minimum stop distance for indices AFTER sanity checks
+        if min_stop_dist > 0 and stop_distance < min_stop_dist:
+            stop = (entry - min_stop_dist) if direction == 1 else (entry + min_stop_dist)
+            stop_distance = min_stop_dist
 
         signal["stop_loss"] = stop
 
