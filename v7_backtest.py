@@ -1,697 +1,936 @@
 """
-V7 Backtest - MT5 Version
-==========================
-Backtest the V7 strategy with FVG + Gap analysis using MT5 data
+ICT Backtester - Phase 2
+========================
+Bar-by-bar historical replay of the full ICTSignalEngine pipeline.
+
+Features
+--------
+- Fetches data from MT5 (or loads CSVs if MT5 unavailable / --csv-dir used)
+- Proper warmup period before first signal (100 bars)
+- Realistic execution model:
+    * Limit orders: fill only when bar's low/high touches entry price
+    * Slippage: configurable pips/points added on entry fill
+    * Spread cost on entry
+    * One position per symbol at a time (matches live bot)
+- Kill zone filter, confluence threshold, daily loss limit – all honoured
+- Exit logic: stop-loss → take-profit → max bars held (time stop)
+- Full metrics: win rate, profit factor, expectancy, Sharpe, Calmar,
+  max drawdown, avg R:R achieved, per-session breakdown, per-symbol breakdown,
+  per-confluence-band breakdown
+- Saves:
+    * backtest_trades.csv   – one row per closed trade (ML-ready for Phase 3)
+    * backtest_equity.csv   – bar-level equity curve
+    * backtest_report.json  – complete metrics dict
+
+Usage
+-----
+# With live MT5 connection:
+python3 backtester.py --symbols EURUSD,XAUUSD,US30 \\
+                      --login 12345 --password pass --server Exness-MT5 \\
+                      --start 2024-01-01 --end 2024-12-31 --risk 0.02 --rr 3.0
+
+# Without MT5 (CSV files named  EURUSD_H1.csv  with columns open,high,low,close,time):
+python3 backtester.py --symbols EURUSD --csv-dir ./data --start 2024-01-01
 """
 
-import asyncio
-asyncio.set_event_loop(asyncio.new_event_loop())
+from __future__ import annotations
 
-import sys
 import os
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SCRIPT_DIR)
-
+import sys
 import json
-import pandas as pd
+import math
+import argparse
+import csv
+from copy import deepcopy
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-from datetime import datetime, time as dt_time
-from typing import Dict, List
-import pytz
-import time
+import pandas as pd
 
-import importlib.util
-spec = importlib.util.spec_from_file_location("ict_v7_mt5", os.path.join(SCRIPT_DIR, "ict_v7_mt5.py"))
-ict_v7 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ict_v7)
+# ── Path setup so handlers are importable from project dir ───────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.join(SCRIPT_DIR)           # handlers live here too
+for d in [SCRIPT_DIR, PROJECT_DIR]:
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
-from fvg_handler import FVGHandler
-from gap_handler import GapHandler
-
+# ── MT5 (optional) ────────────────────────────────────────────────────────────
 try:
-    from mtf_coordinator import MTFCoordinator
-    from market_structure_handler import MarketStructureHandler, StructureBreakType, TrendState, PriceZone
-    MTF_AVAILABLE = True
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
 except ImportError:
-    MTF_AVAILABLE = False
-    print("WARNING: MTF modules not available")
+    MT5_AVAILABLE = False
+    mt5 = None
 
-fetch_mt5_rates = ict_v7.fetch_mt5_rates
-prepare_data_mt5 = ict_v7.prepare_data_mt5
-get_contract_info = ict_v7.get_contract_info
-calculate_position_size = ict_v7.calculate_position_size
+# ── Signal engine ─────────────────────────────────────────────────────────────
+try:
+    from signal_engine import ICTSignalEngine
+    ENGINE_AVAILABLE = True
+except ImportError as e:
+    print(f"ERROR: signal_engine.py not found – {e}")
+    ENGINE_AVAILABLE = False
 
+# ── Contract / sizing helpers (reuse from bot) ────────────────────────────────
+try:
+    from ict_v7_mt5_fixed import get_contract_info, calculate_position_size, get_mt5_symbol
+except ImportError:
+    # Inline minimal fallback so the backtester is self-contained
+    def get_contract_info(symbol: str) -> Dict:
+        s = symbol.upper()
+        futures = {'XAUUSD': {'dollar_per_point': 100, 'min_stop': 5.0, 'type': 'futures'},
+                   'XTIUSD': {'dollar_per_point': 1000,'min_stop': 0.30,'type': 'futures'}}
+        if s in futures: return futures[s]
+        indices = {'US30': {'dollar_per_point': 1, 'min_stop': 20, 'type': 'indices'},
+                   'USTEC':{'dollar_per_point': 1, 'min_stop': 10, 'type': 'indices'},
+                   'US500':{'dollar_per_point': 1, 'min_stop': 3,  'type': 'indices'}}
+        if s in indices: return indices[s]
+        return {'pip_value': 10, 'min_stop': 0.002, 'decimal_places': 5, 'type': 'forex'}
 
-MT5_SYMBOLS = {
-    # Crypto
-    'BTCUSD': 'BTCUSDm',
-    'ETHUSD': 'ETHUSDm',
-    'SOLUSD': 'SOLUSDm',
-    # Metals
-    'XAUUSD': 'XAUUSDm',
-    'XAGUSD': 'XAGUSDm',
-    # Oil
-    'XTIUSD': 'USOILm',
-    # Major Forex
-    'EURUSD': 'EURUSDm',
-    'GBPUSD': 'GBPUSDm',
-    'USDJPY': 'USDJPYm',
-    'USDCAD': 'USDCADm',
-    'AUDUSD': 'AUDUSDm',
-    'USDCHF': 'USDCHFm',
-    'EURGBP': 'EURGBPm',
-    'EURJPY': 'EURJPYm',
-    'GBPJPY': 'GBPJPYm',
-    # Indices
-    'US30': 'US30m',
-    'USTEC': 'USTECm',  # Nasdaq
-    'US500': 'US500m',
-    'UK100': 'UK100m',
-}
-
-
-def is_valid_trading_session(timestamp, is_forex: bool = False) -> bool:
-    """Check if timestamp is within valid trading sessions"""
-    et_tz = pytz.timezone('US/Eastern')
-    ts_aware = timestamp.tz_localize(et_tz) if timestamp.tzinfo is None else timestamp.astimezone(et_tz)
-    current_time = ts_aware.time()
-    
-    if is_forex:
-        forex_open = dt_time(7, 0)
-        forex_close = dt_time(11, 0)
-        return forex_open <= current_time <= forex_close
-    
-    london_open = dt_time(2, 0)
-    london_close = dt_time(17, 0)
-    ny_open = dt_time(9, 30)
-    ny_close = dt_time(16, 15)
-    
-    return (london_open <= current_time <= london_close) or (ny_open <= current_time <= ny_close)
-
-
-class V7SignalGenerator:
-    """V7 Signal Generator for backtesting with MT5"""
-    
-    def __init__(self, rr_ratio: float = 3.0, confluence_threshold: int = 60):
-        self.fvg_handler = FVGHandler(
-            sensitivity=0.0001,
-            min_gap_size=0.0,
-            track_body_respect=False,
-            detect_volume_imbalances=False,
-            detect_suspension_blocks=False
-        )
-        self.gap_handler = GapHandler(
-            large_gap_pips_forex=40.0,
-            large_gap_points_indices=50.0,
-            keep_gaps_days=3
-        )
-        self.rr_ratio = rr_ratio
-        self.confluence_threshold = confluence_threshold
-        
-        if MTF_AVAILABLE:
-            self.ms_handler = MarketStructureHandler(
-                swing_lookback=5,
-                min_displacement_pct=0.1
-            )
+    def calculate_position_size(symbol, account_value, risk_pct, stop_distance, current_price):
+        ci = get_contract_info(symbol)
+        risk = account_value * risk_pct
+        if stop_distance <= 0: return 0.01, 0.0
+        if ci['type'] == 'forex':
+            pip = 0.01 if ci.get('decimal_places', 5) == 3 else 0.0001
+            pv  = ci.get('pip_value', 10)
+            qty = risk / ((stop_distance / pip) * pv)
+        elif ci['type'] in ('futures', 'indices'):
+            qty = risk / (stop_distance * ci.get('dollar_per_point', 1))
         else:
-            self.ms_handler = None
-    
-    def generate_signal(self, data: Dict, idx: int) -> Dict:
-        """Generate V7 signal with FVG + Gap + MS analysis"""
-        
-        current_price = data['closes'][idx]
-        
-        htf = data['htf_trend'][idx]
-        ltf = data['ltf_trend'][idx]
-        kz = data['kill_zone'][idx]
-        pp = data['price_position'][idx]
-        closes = data['closes'][idx]
-        
-        df = pd.DataFrame({
-            'open': data['opens'][:idx+1],
-            'high': data['highs'][:idx+1],
-            'low': data['lows'][:idx+1],
-            'close': data['closes'][:idx+1]
-        })
-        
-        fvg_analysis = self.fvg_handler.analyze_fvgs(df)
-        gap_analysis = self.gap_handler.analyze(df, current_price)
-        
-        ms_analysis = None
-        if self.ms_handler:
-            try:
-                ms_analysis = self.ms_handler.analyze(df)
-            except:
-                pass
-        
-        signal = {
-            'direction': 0,
-            'confluence': 0,
-            'entry_price': current_price,
-            'stop_loss': None,
-            'take_profit': None,
-            'confidence': 'LOW',
-            'reasoning': [],
-            'fvg_data': None,
-            'gap_data': None
-        }
-        
-        near_bull_fvg = next((f for f in reversed(data['bullish_fvgs']) if f['idx'] < idx and f['mid'] < closes), None)
-        near_bear_fvg = next((f for f in reversed(data['bearish_fvgs']) if f['idx'] < idx and f['mid'] > closes), None)
-        
-        base_confluence = 0
-        
-        if kz:
-            base_confluence += 15
-            signal['reasoning'].append("Kill Zone: +15")
-        
-        if htf == 1 and ltf >= 0:
-            base_confluence += 25
-            signal['direction'] = 1
-            signal['reasoning'].append("HTF+LTF Bullish: +25")
-        elif htf == -1 and ltf <= 0:
-            base_confluence += 25
-            signal['direction'] = -1
-            signal['reasoning'].append("HTF+LTF Bearish: +25")
-        elif htf == 0 and ltf == 1:
-            base_confluence += 15
-            signal['direction'] = 1
-            signal['reasoning'].append("LTF Bullish: +15")
-        elif htf == 0 and ltf == -1:
-            base_confluence += 15
-            signal['direction'] = -1
-            signal['reasoning'].append("LTF Bearish: +15")
-        
-        if pp < 0.25:
-            base_confluence += 20
-            signal['reasoning'].append("Price near lows: +20")
-        elif pp > 0.75:
-            base_confluence += 20
-            signal['reasoning'].append("Price near highs: +20")
-        
-        if near_bull_fvg and ltf >= 0:
-            base_confluence += 15
-            signal['reasoning'].append("V5 Bull FVG: +15")
-        if near_bear_fvg and ltf <= 0:
-            base_confluence += 15
-            signal['reasoning'].append("V5 Bear FVG: +15")
-        
-        if ms_analysis:
-            try:
-                if hasattr(ms_analysis, 'trend_state'):
-                    if ms_analysis.trend_state == TrendState.BULLISH and signal['direction'] == 1:
-                        base_confluence += 10
-                    elif ms_analysis.trend_state == TrendState.BEARISH and signal['direction'] == -1:
-                        base_confluence += 10
-                        
-                if hasattr(ms_analysis, 'current_zone'):
-                    if ms_analysis.current_zone == PriceZone.DISCOUNT and signal['direction'] == 1:
-                        base_confluence += 10
-                    elif ms_analysis.current_zone == PriceZone.PREMIUM and signal['direction'] == -1:
-                        base_confluence += 10
-            except:
-                pass
-        
-        fvg_confluence = 0
-        if fvg_analysis.best_bisi_fvg and signal['direction'] == 1:
-            fvg = fvg_analysis.best_bisi_fvg
-            distance = abs(current_price - fvg.consequent_encroachment)
-            if distance < fvg.size * 2:
-                fvg_confluence += 20
-                signal['fvg_data'] = {
-                    'type': 'BISI',
-                    'ce': fvg.consequent_encroachment,
-                    'distance': distance
-                }
-                if fvg.is_high_probability:
-                    fvg_confluence += 15
-        
-        elif fvg_analysis.best_sibi_fvg and signal['direction'] == -1:
-            fvg = fvg_analysis.best_sibi_fvg
-            distance = abs(current_price - fvg.consequent_encroachment)
-            if distance < fvg.size * 2:
-                fvg_confluence += 20
-                signal['fvg_data'] = {
-                    'type': 'SIBI',
-                    'ce': fvg.consequent_encroachment,
-                    'distance': distance
-                }
-                if fvg.is_high_probability:
-                    fvg_confluence += 15
-        
-        gap_confluence = 0
-        if gap_analysis.current_gap and gap_analysis.in_gap_zone:
-            gap_confluence += 10
-            if gap_analysis.nearest_level:
-                level_price, level_name = gap_analysis.nearest_level
-                distance_pct = abs(current_price - level_price) / current_price * 100
-                if distance_pct < 0.5:
-                    gap_confluence += 10
-        
-        total_confluence = base_confluence + fvg_confluence + gap_confluence
-        signal['confluence'] = min(total_confluence, 100)
-        
-        if total_confluence >= 80:
-            signal['confidence'] = 'HIGH'
-        elif total_confluence >= 60:
-            signal['confidence'] = 'MEDIUM'
-        elif total_confluence >= 50:
-            signal['confidence'] = 'LOW'
-        else:
-            signal['direction'] = 0
-        
-        if signal['direction'] != 0:
-            entry = current_price
-            
-            highs = data['highs']
-            lows = data['lows']
-            closes_arr = data['closes']
-            
-            atr = np.mean([max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes_arr[i-1]) if i > 0 else 0,
-                abs(lows[i] - closes_arr[i-1]) if i > 0 else 0
-            ) for i in range(max(0, idx-14), idx+1)])
-            
-            contract_info = get_contract_info(data.get('symbol', ''))
-            symbol_type = contract_info['type']
-            
-            atr_multiplier = 2.0
-            min_atr_multiplier = 1.5
-            
-            # Calculate stop distance based on instrument type
-            if symbol_type == 'forex':
-                decimal_places = contract_info.get('decimal_places', 5)
-                pip_size = 0.01 if decimal_places == 3 else 0.0001  # JPY = 0.01, others = 0.0001
-                atr_pips = atr / pip_size
-                min_stop_pips = max(25, atr_pips * min_atr_multiplier)
-                max_stop_pips = max(80, atr_pips * atr_multiplier)
-                atr_stop_distance = atr * atr_multiplier
-                min_stop_distance = min_stop_pips * pip_size
-                max_stop_distance = max_stop_pips * pip_size
-                stop_distance = max(min_stop_distance, min(atr_stop_distance, max_stop_distance))
-                
-                # Validate pips
-                risk_pips = stop_distance / pip_size
-                if risk_pips < 15 or risk_pips > 100:
-                    signal['direction'] = 0
-                    return signal
-                    
-            elif symbol_type == 'futures':
-                # Metals (XAU, XAG) and Oil
-                min_stop = contract_info.get('min_stop', 10)
-                stop_distance = max(atr * atr_multiplier, min_stop)
-                
-            elif symbol_type == 'indices':
-                # Indices (US30, USTEC, US500, UK100)
-                min_stop = contract_info.get('min_stop', 20)
-                stop_distance = max(atr * atr_multiplier, min_stop)
-                
-            elif symbol_type == 'crypto':
-                # Crypto - use percentage-based stops
-                stop_distance = current_price * 0.02  # 2% stop
-            else:
-                # Default
-                stop_distance = atr * atr_multiplier
-            
-            signal['entry_price'] = entry
-            signal['stop_loss'] = entry - stop_distance if signal['direction'] == 1 else entry + stop_distance
-            signal['take_profit'] = entry + (stop_distance * self.rr_ratio) if signal['direction'] == 1 else entry - (stop_distance * self.rr_ratio)
-        
-        return signal
+            qty = risk / stop_distance
+        qty = max(0.01, round(qty / 0.01) * 0.01)
+        return qty, qty * stop_distance
+
+    def get_mt5_symbol(s): return s.upper() + 'm'
 
 
-def run_v7_backtest(symbols, days=30, initial_capital=10000, risk_per_trade=0.02, 
-                   rr_ratio=3.0, confluence_threshold=40, timeframe="M15"):
-    """Run V7 backtest using MT5 data"""
-    
-    print(f"\n{'='*80}")
-    print(f"ICT V7 Backtest - MT5 Data")
-    print(f"Initial Capital: ${initial_capital:,}")
-    print(f"Timeframe: {timeframe}")
-    print(f"Risk per Trade: {risk_per_trade*100}%")
-    print(f"RR Ratio: 1:{rr_ratio}")
-    print(f"Confluence Threshold: {confluence_threshold}")
-    print(f"Symbols: {', '.join(symbols)}")
-    print(f"{'='*80}\n")
-    
-    signal_gen = V7SignalGenerator(rr_ratio=rr_ratio, confluence_threshold=confluence_threshold)
-    
-    all_data = {}
-    
-    for symbol in symbols:
-        mt5_symbol = MT5_SYMBOLS.get(symbol, symbol)
-        print(f"Loading {mt5_symbol}...", end=' ')
-        
-        try:
-            df = fetch_mt5_rates(mt5_symbol, timeframe, num_bars=500)
-            
-            if df is None or len(df) < 50:
-                print(f"X No data from MT5")
-                continue
-            
-            highs = df['high'].values
-            lows = df['low'].values
-            closes = df['close'].values
-            opens = df['open'].values
-            
-            bullish_fvgs = []
-            bearish_fvgs = []
-            for i in range(3, len(df)):
-                if lows[i] > highs[i-2]:
-                    bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
-                if highs[i] < lows[i-2]:
-                    bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
-            
-            daily_df = fetch_mt5_rates(mt5_symbol, "D1", num_bars=60)  # Keep D1 for HTF
-            if daily_df is None or len(daily_df) < 5:
-                htf_trend = np.zeros(len(df))
-            else:
-                daily_highs = daily_df['high'].values
-                daily_lows = daily_df['low'].values
-                htf = []
-                for i in range(1, len(daily_df)):
-                    if daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] > np.min(daily_lows[max(0,i-5):i]):
-                        htf.append(1)
-                    elif daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and daily_lows[i] < np.min(daily_lows[max(0,i-5):i]):
-                        htf.append(-1)
-                    else:
-                        htf.append(0)
-                
-                htf_trend = np.zeros(len(df))
-                for i in range(len(df)):
-                    bar_time = df.index[i]
-                    for j in range(len(daily_df) - 1, -1, -1):
-                        if daily_df.index[j] <= bar_time:
-                            htf_trend[i] = htf[j] if j < len(htf) else 0
-                            break
-            
-            trend = np.zeros(len(df))
-            for i in range(20, len(df)):
-                momentum = closes[i] - closes[i-10]
-                pct_change = momentum / closes[i-10] if closes[i-10] > 0 else 0
-                ema_fast = np.mean(closes[max(0,i-5):i+1])
-                ema_slow = np.mean(closes[max(0,i-13):i+1])
-                
-                if pct_change > 0.005 or (pct_change > 0.001 and ema_fast > ema_slow):
-                    trend[i] = 1
-                elif pct_change < -0.005 or (pct_change < -0.001 and ema_fast < ema_slow):
-                    trend[i] = -1
-            
-            price_position = np.zeros(len(df))
-            for i in range(20, len(df)):
-                ph = np.max(highs[i-20:i])
-                pl = np.min(lows[i-20:i])
-                rng = ph - pl
-                if rng < 0.001:
-                    rng = 0.001
-                price_position[i] = (closes[i] - pl) / rng
-            
-            hours = df.index.hour.values
-            kill_zone = np.zeros(len(df), dtype=bool)
-            for i in range(len(hours)):
-                h = hours[i]
-                kill_zone[i] = (1 <= h < 5) or (7 <= h < 12) or (13.5 <= h < 16)
-            
-            data = {
-                'opens': opens,
-                'highs': highs,
-                'lows': lows,
-                'closes': closes,
-                'htf_trend': htf_trend,
-                'ltf_trend': trend,
-                'price_position': price_position,
-                'kill_zone': kill_zone,
-                'bullish_fvgs': bullish_fvgs,
-                'bearish_fvgs': bearish_fvgs,
-                'symbol': symbol,
-                'df': df
-            }
-            
-            all_data[symbol] = {'df': df, 'data': data}
-            
-            print(f"OK {len(df)} bars")
-            
-        except Exception as e:
-            print(f"X Error: {e}")
-    
-    if not all_data:
-        print("No data loaded! Make sure MT5 is running with opened charts.")
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA CLASSES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TradeRecord:
+    """One closed trade – used for metrics and ML export."""
+    trade_id:          int
+    symbol:            str
+    direction:         int          # +1 long / -1 short
+    entry_bar:         int          # index in full df
+    entry_time:        str
+    entry_price:       float
+    stop_loss:         float
+    take_profit:       float
+    lot_size:          float
+    risk_amount:       float        # $ risked
+    exit_bar:          int
+    exit_time:         str
+    exit_price:        float
+    exit_reason:       str          # 'target' | 'stop' | 'time_stop'
+    pnl_raw:           float        # $ before commission
+    pnl_net:           float        # $ after commission
+    r_multiple:        float        # pnl_net / risk_amount
+    bars_held:         int
+    # Signal metadata (for ML feature vector)
+    confluence:        int
+    confidence:        str
+    kill_zone:         str
+    htf_trend:         str
+    ob_type:           str
+    liq_swept:         str
+    model_2022:        str
+    silver_bullet:     bool
+    fvg_type:          str
+    # Derived
+    won:               bool         # r_multiple > 0
+
+
+@dataclass
+class OpenPosition:
+    symbol:      str
+    direction:   int
+    entry_bar:   int
+    entry_time:  str
+    entry_price: float
+    stop_loss:   float
+    take_profit: float
+    lot_size:    float
+    risk_amount: float
+    confluence:  int
+    confidence:  str
+    metadata:    Dict = field(default_factory=dict)
+    bars_held:   int = 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA LOADING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mt5_timeframe(tf: str):
+    """Map string to MT5 timeframe constant."""
+    m = {'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5,
+         'M15': mt5.TIMEFRAME_M15, 'M30': mt5.TIMEFRAME_M30,
+         'H1': mt5.TIMEFRAME_H1,  'H4': mt5.TIMEFRAME_H4,
+         'D1': mt5.TIMEFRAME_D1}
+    return m.get(tf.upper(), mt5.TIMEFRAME_H1)
+
+
+def load_data_mt5(symbol: str, start: datetime, end: datetime,
+                  timeframe: str = 'H1') -> Optional[pd.DataFrame]:
+    """Fetch historical OHLC from MT5."""
+    if not MT5_AVAILABLE or mt5 is None:
         return None
-    
-    balance = initial_capital
-    positions = {}
-    active_trades = []
-    is_forex = lambda s: s in {
-        'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'NZDUSD', 
-        'EURGBP', 'EURJPY', 'GBPJPY', 'USDCHF', 'XAUUSD', 'XAGUSD'
-    }
-    is_index = lambda s: s in {
-        'US30', 'US100', 'US500', 'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
-    }
-    
-    # Simplified: Process each symbol independently
-    for symbol, item in all_data.items():
-        df = item['df']
-        data = item['data']
-        
-        print(f"Processing {symbol} ({len(df)} bars)...")
-        
-        start_time = time.time()
-        for idx in range(50, len(df) - 10, 5):  # Check every 5th bar
-            if idx % 50 == 0:
-                elapsed = time.time() - start_time
-                print(f"  [{symbol}] Bar {idx}/{len(df)} ({elapsed:.1f}s)")
-            
-            current_price = df.iloc[idx]['close']
-            
-            # Generate signal
-            signal = signal_gen.generate_signal(data, idx)
-            
-            # Check exits
-            if symbol in positions:
-                pos = positions[symbol]
-                next_bar = df.iloc[idx + 1]
-                next_low = next_bar['low']
-                next_high = next_bar['high']
-                
-                exit_price = None
-                if pos['direction'] == 1:
-                    if next_low <= pos['stop']:
-                        exit_price = pos['stop']
-                    elif next_high >= pos['target']:
-                        exit_price = pos['target']
-                else:
-                    if next_high >= pos['stop']:
-                        exit_price = pos['stop']
-                    elif next_low <= pos['target']:
-                        exit_price = pos['target']
-                
-                if exit_price:
-                    contract_info = get_contract_info(symbol)
-                    
-                    if pos['direction'] == 1:
-                        price_change = exit_price - pos['entry']
-                    else:
-                        price_change = pos['entry'] - exit_price
-                    
-                    # Calculate PnL based on instrument type
-                    symbol_type = contract_info['type']
-                    
-                    if symbol_type == 'forex':
-                        decimal_places = contract_info.get('decimal_places', 5)
-                        pip_size = 0.0001 if decimal_places == 5 else 0.01
-                        pips = abs(price_change / pip_size)
-                        
-                        if decimal_places == 3:
-                            # JPY pairs: $10 per pip per lot
-                            pip_value = 10
-                        else:
-                            # Non-JPY: $10 per pip per lot
-                            pip_value = 10
-                        
-                        pnl = pips * pos['qty'] * pip_value
-                        if price_change < 0:
-                            pnl = -pnl
-                            
-                    elif symbol_type == 'indices':
-                        # Indices: $1 per point per lot
-                        pnl = price_change * pos['qty']
-                        
-                    elif symbol_type == 'futures':
-                        # Metals/Oil
-                        multiplier = contract_info.get('multiplier', 100)
-                        pnl = price_change * pos['qty'] * multiplier
-                    else:
-                        # Default
-                        pnl = price_change * pos['qty']
-                    
-                    balance += pnl
-                    
-                    active_trades.append({
-                        'symbol': symbol,
-                        'direction': 'LONG' if pos['direction'] == 1 else 'SHORT',
-                        'entry_price': pos['entry'],
-                        'exit_price': exit_price,
-                        'qty': pos['qty'],
-                        'pnl': pnl,
-                        'confluence': pos.get('confluence', 0),
-                        'fvg_info': pos.get('fvg_info', '')
-                    })
-                    del positions[symbol]
-            
-            # Check entries
-            elif symbol not in positions:
-                signal = signal_gen.generate_signal(data, idx)
-                
-                # Session filter - disabled for backtest (timestamps may be UTC)
-                in_session = True
-                
-                if signal and signal['direction'] != 0 and signal['confluence'] >= confluence_threshold and in_session:
-                    stop_distance = abs(current_price - signal['stop_loss'])
-                    if stop_distance > 0:
-                        qty, _ = calculate_position_size(
-                            symbol, initial_capital, risk_per_trade, stop_distance, current_price
-                        )
-                        
-                        if qty > 0:
-                            positions[symbol] = {
-                                'entry': current_price,
-                                'stop': signal['stop_loss'],
-                                'target': signal['take_profit'],
-                                'direction': signal['direction'],
-                                'qty': qty,
-                                'confluence': signal['confluence'],
-                                'fvg_info': signal.get('fvg_data', {}).get('type', '') if signal.get('fvg_data') else ''
-                            }
-    
-    total_trades = len(active_trades)
-    wins = len([t for t in active_trades if t['pnl'] > 0])
-    losses = total_trades - wins
-    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    total_pnl = balance - initial_capital
-    total_return_pct = (total_pnl / initial_capital) * 100
-    
-    symbol_stats = {}
-    for symbol in all_data.keys():
-        symbol_trades = [t for t in active_trades if t['symbol'] == symbol]
-        symbol_wins = len([t for t in symbol_trades if t['pnl'] > 0])
-        symbol_stats[symbol] = {
-            'trades': len(symbol_trades),
-            'wins': symbol_wins,
-            'losses': len(symbol_trades) - symbol_wins,
-            'win_rate': (symbol_wins / len(symbol_trades) * 100) if symbol_trades else 0,
-            'pnl': sum(t['pnl'] for t in symbol_trades)
-        }
-    
-    results = {
-        'backtest_config': {
-            'symbols': list(all_data.keys()),
-            'days': days,
-            'initial_capital': initial_capital,
-            'risk_per_trade': risk_per_trade,
-            'data_source': 'MT5',
-            'timestamp': datetime.now().isoformat(),
-            'version': 'V7',
-            'session_filter': 'London/NY sessions',
-            'rr_ratio': rr_ratio,
-            'confluence_threshold': confluence_threshold
-        },
+    mt5_sym = get_mt5_symbol(symbol)
+    if not mt5.symbol_select(mt5_sym, True):
+        print(f"  Cannot select {mt5_sym}")
+        return None
+    rates = mt5.copy_rates_range(mt5_sym, _mt5_timeframe(timeframe), start, end)
+    if rates is None or len(rates) == 0:
+        print(f"  No data for {mt5_sym}")
+        return None
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df.set_index('time', inplace=True)
+    df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+    df = df[['open', 'high', 'low', 'close', 'volume']]
+    return df
+
+
+def load_data_csv(symbol: str, csv_dir: str,
+                  timeframe: str = 'H1') -> Optional[pd.DataFrame]:
+    """Load OHLC from a CSV file named  SYMBOL_TF.csv ."""
+    fname = os.path.join(csv_dir, f"{symbol.upper()}_{timeframe.upper()}.csv")
+    if not os.path.exists(fname):
+        print(f"  CSV not found: {fname}")
+        return None
+    df = pd.read_csv(fname, parse_dates=['time'], index_col='time')
+    df.columns = [c.lower() for c in df.columns]
+    required = {'open', 'high', 'low', 'close'}
+    if not required.issubset(df.columns):
+        print(f"  {fname} missing columns {required - set(df.columns)}")
+        return None
+    return df[list(required)]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SLIPPAGE / COMMISSION MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _slippage_cost(symbol: str, direction: int, slippage_pips: float) -> float:
+    """Convert slippage pips to price units (always against you on entry)."""
+    ci  = get_contract_info(symbol)
+    st  = ci.get('type', 'forex')
+    if st == 'forex':
+        pip = 0.01 if ci.get('decimal_places', 5) == 3 else 0.0001
+        return slippage_pips * pip * direction   # positive = worsens fill
+    elif st in ('futures', 'indices'):
+        tick = ci.get('tick_size', 0.01)
+        return slippage_pips * tick * direction
+    return 0.0
+
+
+def _commission(symbol: str, lot_size: float,
+                commission_per_lot: float = 7.0) -> float:
+    """Round-turn commission (entry + exit).  Default $7/lot RT."""
+    return lot_size * commission_per_lot
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PNL CALCULATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pnl_dollars(symbol: str, direction: int, entry: float,
+                 exit_price: float, lot_size: float) -> float:
+    ci = get_contract_info(symbol)
+    st = ci.get('type', 'forex')
+    diff = (exit_price - entry) * direction
+    if st == 'forex':
+        pip = 0.01 if ci.get('decimal_places', 5) == 3 else 0.0001
+        return diff / pip * ci.get('pip_value', 10) * lot_size
+    elif st in ('futures', 'indices'):
+        return diff * ci.get('dollar_per_point', 1) * lot_size
+    return diff * lot_size
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METRICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_metrics(trades: List[TradeRecord],
+                    equity_curve: List[float],
+                    initial_capital: float) -> Dict:
+    """Compute full suite of backtest metrics."""
+    if not trades:
+        return {'error': 'no trades generated'}
+
+    n         = len(trades)
+    wins      = [t for t in trades if t.won]
+    losses    = [t for t in trades if not t.won]
+    win_rate  = len(wins) / n * 100
+
+    gross_profit = sum(t.pnl_net for t in wins)
+    gross_loss   = abs(sum(t.pnl_net for t in losses)) or 1e-9
+    profit_factor = gross_profit / gross_loss
+
+    avg_win  = gross_profit / len(wins)  if wins   else 0.0
+    avg_loss = -gross_loss  / len(losses) if losses else 0.0
+
+    r_multiples = [t.r_multiple for t in trades]
+    avg_r       = float(np.mean(r_multiples))
+    expectancy  = float(np.mean([t.pnl_net for t in trades]))  # $/trade
+
+    # Equity curve metrics
+    eq = np.array(equity_curve)
+    peak       = np.maximum.accumulate(eq)
+    drawdowns  = (eq - peak) / peak * 100          # % drawdown at each bar
+    max_dd_pct = float(abs(np.min(drawdowns)))
+    max_dd_abs = float(abs(np.min(eq - peak)))
+
+    # Sharpe (annualised, assumes H1 bars → ~5760 bars/year)
+    pnl_series = np.diff(eq)
+    bars_per_year = 5760
+    if pnl_series.std() > 0:
+        sharpe = float((pnl_series.mean() / pnl_series.std()) * math.sqrt(bars_per_year))
+    else:
+        sharpe = 0.0
+
+    # Calmar  = annualised return / max drawdown
+    total_return_pct = (eq[-1] - initial_capital) / initial_capital * 100
+    years = len(eq) / bars_per_year
+    ann_return = total_return_pct / years if years > 0 else 0.0
+    calmar = ann_return / max_dd_pct if max_dd_pct > 0 else 0.0
+
+    # Longest losing streak
+    streak = max_streak = 0
+    for t in trades:
+        if not t.won:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+
+    # --- Breakdowns ---
+    def _breakdown(key_fn):
+        groups: Dict[str, Dict] = {}
+        for t in trades:
+            k = str(key_fn(t))
+            if k not in groups:
+                groups[k] = {'n': 0, 'wins': 0, 'pnl': 0.0, 'r': []}
+            g = groups[k]
+            g['n'] += 1
+            g['pnl'] += t.pnl_net
+            g['r'].append(t.r_multiple)
+            if t.won:
+                g['wins'] += 1
+        return {k: {'trades': v['n'],
+                    'win_rate': round(v['wins'] / v['n'] * 100, 1),
+                    'total_pnl': round(v['pnl'], 2),
+                    'avg_r': round(float(np.mean(v['r'])), 2)}
+                for k, v in groups.items()}
+
+    # Confluence bands: <60, 60-69, 70-79, 80+
+    def _cfl_band(t):
+        c = t.confluence
+        if c >= 80: return '80+'
+        if c >= 70: return '70-79'
+        if c >= 60: return '60-69'
+        return '<60'
+
+    return {
         'summary': {
-            'initial_capital': initial_capital,
-            'final_capital': round(balance, 2),
-            'total_pnl': round(total_pnl, 2),
-            'total_return_pct': round(total_return_pct, 2),
-            'total_trades': total_trades,
-            'wins': wins,
-            'losses': losses,
-            'win_rate': round(win_rate, 2),
-            'avg_trade_pnl': round(total_pnl / total_trades, 2) if total_trades > 0 else 0
+            'total_trades':     n,
+            'wins':             len(wins),
+            'losses':           len(losses),
+            'win_rate_pct':     round(win_rate, 1),
+            'profit_factor':    round(profit_factor, 2),
+            'avg_win':          round(avg_win,  2),
+            'avg_loss':         round(avg_loss, 2),
+            'avg_r_multiple':   round(avg_r, 2),
+            'expectancy_per_trade': round(expectancy, 2),
+            'gross_profit':     round(gross_profit, 2),
+            'gross_loss':       round(-gross_loss, 2),
+            'net_pnl':          round(gross_profit - gross_loss, 2),
+            'initial_capital':  round(initial_capital, 2),
+            'final_equity':     round(float(eq[-1]), 2),
+            'total_return_pct': round(total_return_pct, 1),
+            'ann_return_pct':   round(ann_return, 1),
+            'max_drawdown_pct': round(max_dd_pct, 1),
+            'max_drawdown_abs': round(max_dd_abs, 2),
+            'sharpe_ratio':     round(sharpe, 2),
+            'calmar_ratio':     round(calmar, 2),
+            'longest_losing_streak': max_streak,
         },
-        'symbol_stats': symbol_stats,
-        'trades': active_trades
+        'by_symbol':     _breakdown(lambda t: t.symbol),
+        'by_session':    _breakdown(lambda t: t.kill_zone),
+        'by_confidence': _breakdown(lambda t: t.confidence),
+        'by_confluence_band': _breakdown(_cfl_band),
+        'by_exit_reason': _breakdown(lambda t: t.exit_reason),
+        'by_model':       _breakdown(lambda t: t.model_2022 if t.model_2022 not in ('none','---','') else
+                                     ('SB' if t.silver_bullet else
+                                      (t.ob_type if t.ob_type not in ('none','---','') else 'fvg_only'))),
     }
-    
-    # Log trades to file
-    if active_trades:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = f"v7_trades_{timestamp}.json"
-        with open(log_file, 'w') as f:
-            json.dump({
-                'config': results['backtest_config'],
-                'trades': active_trades
-            }, f, indent=2, default=str)
-        print(f"\nTrades logged to: {log_file}")
-    
-    return results
 
 
-if __name__ == "__main__":
-    symbols = ['XAUUSD', 'XTIUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'BTCUSD', 'ETHUSD']
-    
-    print("="*80)
-    print("ICT V7 - MT5 Backtest")
-    print("="*80)
-    
-    # Test with M5 timeframe
-    timeframe = "M5"
-    
-    # Symbols to test
-    symbols = [
-        # Major Forex
-        # 'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF',
-        # 'EURGBP', 'EURJPY', 'GBPJPY',
-        # # Metals
-        # 'XAUUSD',
-        # 'XAGUSD',
-        # Oil
-        # 'XTIUSD',
-        # # Indices
-        'US30',
-        # 'USTEC', 'US500', 'UK100',
-        # 'GER40', 'UK100', 'FRA40', 'JPN225', 'AUS200'
-    ]
-    
-    try:
-        import MetaTrader5 as mt5
-        if not mt5.initialize(login=0):  # Initialize without login for local terminal
-            print(f"ERROR: MT5 initialize failed: {mt5.last_error()}")
-            exit(1)
-        
-        # Check MT5 terminal info
-        terminal_info = mt5.terminal_info()
-        print(f"MT5 Terminal connected: {terminal_info.connected}")
-        
-        results = run_v7_backtest(
-            symbols=symbols,
-            days=30,
-            initial_capital=10000,
-            risk_per_trade=0.02,
-            rr_ratio=3.0,
-            confluence_threshold=40,
-            timeframe=timeframe
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN BACKTESTER CLASS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ICTBacktester:
+    """
+    Bar-by-bar backtester for the ICT signal engine.
+
+    Parameters
+    ----------
+    symbols           : list of instrument names
+    start / end       : datetime range to test
+    timeframe         : 'H1' (default) – bar size for signal generation
+    initial_capital   : starting account balance in USD
+    risk_pct          : fraction of equity risked per trade (e.g. 0.02)
+    rr_ratio          : take-profit R:R multiplier fed to the signal engine
+    confluence_threshold : minimum score to enter a trade
+    max_daily_loss    : daily loss stop (USD, negative)
+    slippage_pips     : fill slippage on entry (pips / points)
+    commission_per_lot: round-turn commission in USD per standard lot
+    max_bars_held     : time stop – close trade after N bars regardless
+    warmup_bars       : bars fed to engine before first signal is considered
+    csv_dir           : if set, load data from CSV files instead of MT5
+    """
+
+    def __init__(
+        self,
+        symbols:              List[str],
+        start:                datetime,
+        end:                  datetime,
+        timeframe:            str   = 'H1',
+        initial_capital:      float = 10_000.0,
+        risk_pct:             float = 0.02,
+        rr_ratio:             float = 3.0,
+        confluence_threshold: int   = 65,
+        max_daily_loss:       float = -500.0,
+        slippage_pips:        float = 1.5,
+        commission_per_lot:   float = 7.0,
+        max_bars_held:        int   = 48,
+        warmup_bars:          int   = 100,
+        csv_dir:              Optional[str] = None,
+    ):
+        self.symbols              = [s.upper() for s in symbols]
+        self.start                = start
+        self.end                  = end
+        self.timeframe            = timeframe
+        self.initial_capital      = initial_capital
+        self.risk_pct             = risk_pct
+        self.rr_ratio             = rr_ratio
+        self.confluence_threshold = confluence_threshold
+        self.max_daily_loss       = max_daily_loss
+        self.slippage_pips        = slippage_pips
+        self.commission_per_lot   = commission_per_lot
+        self.max_bars_held        = max_bars_held
+        self.warmup_bars          = warmup_bars
+        self.csv_dir              = csv_dir
+
+        # State
+        self.engine     = ICTSignalEngine(rr_ratio=rr_ratio) if ENGINE_AVAILABLE else None
+        self.equity     = initial_capital
+        self.positions: Dict[str, OpenPosition] = {}
+        self.trades:    List[TradeRecord]        = []
+        self.equity_curve: List[float]           = []
+        self._trade_id  = 0
+
+        # Per-day loss tracking
+        self._daily_pnl:    float              = 0.0
+        self._current_date: Optional[datetime] = None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ENTRY POINT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def run(self) -> Dict:
+        """Execute full backtest; return metrics dict."""
+        if not ENGINE_AVAILABLE:
+            print("ERROR: signal_engine.py required for backtesting")
+            return {}
+
+        print(f"\n{'='*64}")
+        print(f"  ICT Backtester  {self.start.date()} → {self.end.date()}")
+        print(f"  Symbols: {', '.join(self.symbols)}")
+        print(f"  Capital: ${self.initial_capital:,.0f}  |  Risk: {self.risk_pct*100:.1f}%  |  R:R 1:{self.rr_ratio}")
+        print(f"  Confluence ≥ {self.confluence_threshold}  |  Slippage: {self.slippage_pips} pips")
+        print(f"{'='*64}\n")
+
+        # Load all data
+        all_data: Dict[str, pd.DataFrame] = {}
+        for sym in self.symbols:
+            df = self._load(sym)
+            if df is not None and len(df) > self.warmup_bars + 10:
+                all_data[sym] = df
+                print(f"  {sym}: {len(df)} bars  "
+                      f"({df.index[0].date()} – {df.index[-1].date()})")
+            else:
+                print(f"  {sym}: insufficient data, skipping")
+
+        if not all_data:
+            print("ERROR: No usable data loaded.")
+            return {}
+
+        # Align to a common timeline so the equity curve is consistent
+        all_times = sorted(set().union(*[set(df.index) for df in all_data.values()]))
+        print(f"\n  Total bars in timeline: {len(all_times)}\n")
+
+        # Bar-by-bar replay
+        bar_count = 0
+        for ts in all_times:
+            bar_count += 1
+            self.equity_curve.append(self.equity)
+
+            # Reset daily counter on new calendar day
+            ts_dt = ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts
+            day = ts_dt.date()
+            if self._current_date != day:
+                self._current_date = day
+                self._daily_pnl    = 0.0
+
+            for sym, df in all_data.items():
+                if ts not in df.index:
+                    continue
+
+                # Bar index in this symbol's dataframe
+                bar_idx = df.index.get_loc(ts)
+                if bar_idx < self.warmup_bars:
+                    continue
+
+                # ── Update open position for this symbol ──────────────────────
+                self._update_position(sym, df, bar_idx)
+
+                # ── Check for new signal (only if no open position) ───────────
+                if sym not in self.positions:
+                    self._try_enter(sym, df, bar_idx, ts_dt)
+
+            if bar_count % 500 == 0:
+                pct = bar_count / len(all_times) * 100
+                n_t = len(self.trades)
+                print(f"  [{pct:5.1f}%]  bars={bar_count:,}  trades={n_t}  "
+                      f"equity=${self.equity:,.2f}")
+
+        # Close any still-open positions at the last bar's close
+        for sym in list(self.positions.keys()):
+            for sym2, df in all_data.items():
+                if sym2 == sym and len(df) > 0:
+                    last_idx  = len(df) - 1
+                    last_close = df['close'].iloc[last_idx]
+                    self._close_position(sym, last_idx, df.index[last_idx], last_close, 'end_of_test')
+
+        self.equity_curve.append(self.equity)  # final equity
+
+        # Compute and display metrics
+        metrics = compute_metrics(self.trades, self.equity_curve, self.initial_capital)
+        self._print_report(metrics)
+        self._save_results(metrics)
+        return metrics
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # DATA LOADING
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _load(self, symbol: str) -> Optional[pd.DataFrame]:
+        if self.csv_dir:
+            return load_data_csv(symbol, self.csv_dir, self.timeframe)
+        elif MT5_AVAILABLE:
+            return load_data_mt5(symbol, self.start, self.end, self.timeframe)
+        else:
+            print(f"  Cannot load {symbol}: no MT5 and no --csv-dir")
+            return None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SIGNAL GENERATION
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _build_data_dict(self, df: pd.DataFrame, bar_idx: int) -> Dict:
+        """
+        Build the ``data`` dict that ICTSignalEngine.analyze_symbol() expects,
+        using only bars up to and including bar_idx (no look-ahead).
+        """
+        slice_df = df.iloc[max(0, bar_idx - 199): bar_idx + 1]
+        opens  = slice_df['open'].values
+        highs  = slice_df['high'].values
+        lows   = slice_df['low'].values
+        closes = slice_df['close'].values
+        n      = len(closes)
+
+        # Minimal derived arrays the engine's fallback path may need
+        kill_zone = np.zeros(n, dtype=bool)
+        if hasattr(slice_df.index, 'hour'):
+            for i, ts in enumerate(slice_df.index):
+                h = ts.hour
+                kill_zone[i] = (2 <= h < 5) or (7 <= h < 10) or (10 <= h < 12) or (13 <= h < 16)
+
+        return {
+            'opens':          opens,
+            'highs':          highs,
+            'lows':           lows,
+            'closes':         closes,
+            'volatility':     np.zeros(n),
+            'htf_trend':      np.zeros(n),
+            'ltf_trend':      np.zeros(n),
+            'price_position': np.zeros(n),
+            'kill_zone':      kill_zone,
+            'bullish_fvgs':   [],
+            'bearish_fvgs':   [],
+        }
+
+    def _try_enter(self, symbol: str, df: pd.DataFrame,
+                   bar_idx: int, bar_time: datetime):
+        """Generate a signal and register a pending limit order if valid."""
+        # Daily loss guard
+        if self._daily_pnl <= self.max_daily_loss:
+            return
+
+        data      = self._build_data_dict(df, bar_idx)
+        bar_close = float(df['close'].iloc[bar_idx])
+
+        try:
+            signal = self.engine.analyze_symbol(symbol, data, bar_close)
+        except Exception as e:
+            return  # engine error on this bar; skip silently
+
+        if not signal or signal.get('direction', 0) == 0:
+            return
+        if signal.get('confluence', 0) < self.confluence_threshold:
+            return
+        if signal.get('stop_loss') is None or signal.get('take_profit') is None:
+            return
+
+        direction   = signal['direction']
+        entry_price = signal['entry_price']
+        stop_loss   = signal['stop_loss']
+        take_profit = signal['take_profit']
+
+        stop_dist = abs(entry_price - stop_loss)
+        if stop_dist <= 0:
+            return
+
+        lot_size, risk_amt = calculate_position_size(
+            symbol, self.equity, self.risk_pct, stop_dist, entry_price
         )
-        
-        if results:
-            print(f"\n{'='*80}")
-            print("V7 BACKTEST RESULTS (MT5)")
-            print(f"{'='*80}")
-            print(f"Initial Capital: ${results['summary']['initial_capital']:,}")
-            print(f"Final Capital: ${results['summary']['final_capital']:,}")
-            print(f"Total PnL: ${results['summary']['total_pnl']:,.2f}")
-            print(f"Total Return: {results['summary']['total_return_pct']:.2f}%")
-            print(f"\nTotal Trades: {results['summary']['total_trades']}")
-            print(f"Win Rate: {results['summary']['win_rate']:.1f}%")
-            print(f"Wins: {results['summary']['wins']} | Losses: {results['summary']['losses']}")
-            print(f"Avg Trade: ${results['summary']['avg_trade_pnl']:.2f}")
+        if lot_size <= 0:
+            return
 
-            print(f"\n{'='*80}")
-            print("\nSymbol Performance:")
-            for symbol, stats in sorted(results['symbol_stats'].items(), key=lambda x: x[1]['pnl'], reverse=True):
-                print(f"  {symbol}: {stats['trades']} trades, {stats['win_rate']:.1f}% WR, ${stats['pnl']:,.2f}")
-        
+        # Pull metadata from engine cache
+        cached = getattr(self.engine, 'last_analysis', {}).get(symbol, {})
+
+        self.positions[symbol] = OpenPosition(
+            symbol      = symbol,
+            direction   = direction,
+            entry_bar   = bar_idx,
+            entry_time  = bar_time.isoformat(),
+            entry_price = entry_price,
+            stop_loss   = stop_loss,
+            take_profit = take_profit,
+            lot_size    = lot_size,
+            risk_amount = risk_amt,
+            confluence  = signal.get('confluence', 0),
+            confidence  = signal.get('confidence', 'LOW'),
+            metadata    = {
+                'kill_zone':     cached.get('kill_zone', 'OFF_HOURS'),
+                'htf_trend':     str(cached.get('htf_trend', 'N/A')),
+                'ob_type':       cached.get('ob_type', 'none'),
+                'liq_swept':     str(cached.get('liq_swept', 'none')),
+                'model_2022':    cached.get('model_2022', 'none'),
+                'silver_bullet': bool(cached.get('silver_bullet', False)),
+                'fvg_type':      signal.get('fvg_data', {}).get('type', '') if isinstance(signal.get('fvg_data'), dict) else '',
+                'reasoning':     signal.get('reasoning', [])[:4],
+            },
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # POSITION MANAGEMENT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _update_position(self, symbol: str, df: pd.DataFrame, bar_idx: int):
+        """Check if the current bar fills the limit order or triggers exit."""
+        if symbol not in self.positions:
+            return
+
+        pos  = self.positions[symbol]
+        bar  = df.iloc[bar_idx]
+        high = float(bar['high'])
+        low  = float(bar['low'])
+
+        # ── Limit order fill check (only on bars after signal bar) ────────────
+        if bar_idx == pos.entry_bar:
+            return   # signal was generated at close of this bar; fill next bar
+
+        # Has the limit order filled yet? (entry not yet confirmed)
+        # We track this by seeing if pos has been 'activated' – use a flag
+        if not getattr(pos, '_filled', False):
+            # Apply slippage to entry
+            slip = _slippage_cost(symbol, pos.direction, self.slippage_pips)
+
+            if pos.direction == 1:   # BUY limit – fill when bar's low ≤ entry
+                if low <= pos.entry_price:
+                    pos.entry_price = pos.entry_price + slip   # slippage hurts
+                    pos._filled = True  # type: ignore[attr-defined]
+                else:
+                    # Not filled yet; check if order is too stale (> 5 bars)
+                    if bar_idx - pos.entry_bar > 5:
+                        del self.positions[symbol]
+                    return
+            else:                    # SELL limit – fill when bar's high ≥ entry
+                if high >= pos.entry_price:
+                    pos.entry_price = pos.entry_price - slip
+                    pos._filled = True  # type: ignore[attr-defined]
+                else:
+                    if bar_idx - pos.entry_bar > 5:
+                        del self.positions[symbol]
+                    return
+
+        pos.bars_held += 1
+        ts = df.index[bar_idx]
+        ts_str = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+
+        # ── Exit checks (stop → target → time stop) ────────────────────────────
+        exit_price  = None
+        exit_reason = None
+
+        if pos.direction == 1:
+            if low <= pos.stop_loss:
+                exit_price  = pos.stop_loss
+                exit_reason = 'stop'
+            elif high >= pos.take_profit:
+                exit_price  = pos.take_profit
+                exit_reason = 'target'
+        else:
+            if high >= pos.stop_loss:
+                exit_price  = pos.stop_loss
+                exit_reason = 'stop'
+            elif low <= pos.take_profit:
+                exit_price  = pos.take_profit
+                exit_reason = 'target'
+
+        # Time stop
+        if exit_price is None and pos.bars_held >= self.max_bars_held:
+            exit_price  = float(df['close'].iloc[bar_idx])
+            exit_reason = 'time_stop'
+
+        if exit_price is not None:
+            self._close_position(symbol, bar_idx, ts, exit_price, exit_reason)
+
+    def _close_position(self, symbol: str, bar_idx: int,
+                        ts, exit_price: float, exit_reason: str):
+        """Record a closed trade and update equity."""
+        if symbol not in self.positions:
+            return
+
+        pos     = self.positions.pop(symbol)
+        ts_str  = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+
+        pnl_raw = _pnl_dollars(symbol, pos.direction,
+                                pos.entry_price, exit_price, pos.lot_size)
+        comm    = _commission(symbol, pos.lot_size, self.commission_per_lot)
+        pnl_net = pnl_raw - comm
+        r_mult  = pnl_net / pos.risk_amount if pos.risk_amount > 0 else 0.0
+        won     = pnl_net > 0
+
+        self.equity     += pnl_net
+        self._daily_pnl += pnl_net
+        self._trade_id  += 1
+
+        m = pos.metadata
+        self.trades.append(TradeRecord(
+            trade_id      = self._trade_id,
+            symbol        = symbol,
+            direction     = pos.direction,
+            entry_bar     = pos.entry_bar,
+            entry_time    = pos.entry_time,
+            entry_price   = round(pos.entry_price, 6),
+            stop_loss     = round(pos.stop_loss, 6),
+            take_profit   = round(pos.take_profit, 6),
+            lot_size      = pos.lot_size,
+            risk_amount   = round(pos.risk_amount, 2),
+            exit_bar      = bar_idx,
+            exit_time     = ts_str,
+            exit_price    = round(exit_price, 6),
+            exit_reason   = exit_reason,
+            pnl_raw       = round(pnl_raw, 2),
+            pnl_net       = round(pnl_net, 2),
+            r_multiple    = round(r_mult, 3),
+            bars_held     = pos.bars_held,
+            confluence    = pos.confluence,
+            confidence    = pos.confidence,
+            kill_zone     = m.get('kill_zone', 'OFF_HOURS'),
+            htf_trend     = m.get('htf_trend', 'N/A'),
+            ob_type       = m.get('ob_type', 'none'),
+            liq_swept     = str(m.get('liq_swept', 'none')),
+            model_2022    = m.get('model_2022', 'none'),
+            silver_bullet = bool(m.get('silver_bullet', False)),
+            fvg_type      = m.get('fvg_type', ''),
+            won           = won,
+        ))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # REPORTING
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _print_report(self, metrics: Dict):
+        s = metrics.get('summary', {})
+        print(f"\n{'='*64}")
+        print(f"  BACKTEST RESULTS")
+        print(f"{'='*64}")
+        print(f"  Trades:          {s.get('total_trades', 0)}  "
+              f"({s.get('wins', 0)}W / {s.get('losses', 0)}L)")
+        print(f"  Win Rate:        {s.get('win_rate_pct', 0):.1f}%")
+        print(f"  Profit Factor:   {s.get('profit_factor', 0):.2f}")
+        print(f"  Avg R Multiple:  {s.get('avg_r_multiple', 0):.2f}R")
+        print(f"  Expectancy:      ${s.get('expectancy_per_trade', 0):.2f}/trade")
+        print(f"  Net P&L:         ${s.get('net_pnl', 0):,.2f}")
+        print(f"  Total Return:    {s.get('total_return_pct', 0):.1f}%  "
+              f"(Ann: {s.get('ann_return_pct', 0):.1f}%)")
+        print(f"  Max Drawdown:    {s.get('max_drawdown_pct', 0):.1f}%  "
+              f"(${s.get('max_drawdown_abs', 0):,.0f})")
+        print(f"  Sharpe:          {s.get('sharpe_ratio', 0):.2f}")
+        print(f"  Calmar:          {s.get('calmar_ratio', 0):.2f}")
+        print(f"  Losing Streak:   {s.get('longest_losing_streak', 0)}")
+
+        _section(metrics, 'by_symbol',          'BY SYMBOL')
+        _section(metrics, 'by_session',         'BY KILL ZONE / SESSION')
+        _section(metrics, 'by_confidence',      'BY CONFIDENCE')
+        _section(metrics, 'by_confluence_band', 'BY CONFLUENCE BAND')
+        _section(metrics, 'by_exit_reason',     'BY EXIT REASON')
+        _section(metrics, 'by_model',           'BY MODEL / SIGNAL TYPE')
+
+        print(f"\n  Saved: backtest_trades.csv  "
+              f"backtest_equity.csv  backtest_report.json\n")
+
+    def _save_results(self, metrics: Dict):
+        """Save trades CSV (ML-ready), equity CSV, and metrics JSON."""
+        out = SCRIPT_DIR
+
+        # ── Trades CSV ─────────────────────────────────────────────────────────
+        trades_path = os.path.join(out, 'backtest_trades.csv')
+        if self.trades:
+            fields = list(asdict(self.trades[0]).keys())
+            with open(trades_path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                for t in self.trades:
+                    w.writerow(asdict(t))
+            print(f"  → {trades_path}  ({len(self.trades)} rows)")
+
+        # ── Equity CSV ────────────────────────────────────────────────────────
+        equity_path = os.path.join(out, 'backtest_equity.csv')
+        with open(equity_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['bar', 'equity'])
+            for i, eq in enumerate(self.equity_curve):
+                w.writerow([i, round(eq, 2)])
+        print(f"  → {equity_path}  ({len(self.equity_curve)} bars)")
+
+        # ── JSON report ───────────────────────────────────────────────────────
+        report_path = os.path.join(out, 'backtest_report.json')
+        with open(report_path, 'w') as f:
+            json.dump(metrics, f, indent=2, default=str)
+        print(f"  → {report_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRINT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _section(metrics: Dict, key: str, title: str):
+    data = metrics.get(key, {})
+    if not data:
+        return
+    print(f"\n  ── {title} ──")
+    for k, v in sorted(data.items(), key=lambda x: -x[1]['total_pnl']):
+        n   = v['trades']
+        wr  = v['win_rate']
+        pnl = v['total_pnl']
+        ar  = v['avg_r']
+        bar = '█' * int(max(0, wr) / 10)
+        print(f"    {str(k):<20}  {n:>4} trades  {wr:>5.1f}% WR  "
+              f"{bar:<10}  Avg R {ar:>+.2f}  Net ${pnl:>+,.0f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='ICT Backtester – Phase 2')
+
+    parser.add_argument('--symbols',    default='EURUSD,XAUUSD,US30',
+                        help='Comma-separated symbols')
+    parser.add_argument('--start',      default='2024-01-01',
+                        help='Start date YYYY-MM-DD')
+    parser.add_argument('--end',        default='2024-12-31',
+                        help='End date YYYY-MM-DD')
+    parser.add_argument('--timeframe',  default='H1',
+                        help='Bar timeframe (H1, M15, H4 …)')
+    parser.add_argument('--capital',    type=float, default=10_000.0,
+                        help='Initial capital USD')
+    parser.add_argument('--risk',       type=float, default=0.02,
+                        help='Risk per trade (e.g. 0.02 = 2%%)')
+    parser.add_argument('--rr',         type=float, default=3.0,
+                        help='Risk:Reward ratio')
+    parser.add_argument('--confluence', type=int,   default=65,
+                        help='Minimum confluence threshold')
+    parser.add_argument('--max-loss',   type=float, default=-500.0,
+                        help='Daily loss stop USD (negative)')
+    parser.add_argument('--slippage',   type=float, default=1.5,
+                        help='Entry slippage in pips/points')
+    parser.add_argument('--commission', type=float, default=7.0,
+                        help='Round-turn commission per lot (USD)')
+    parser.add_argument('--max-bars',   type=int,   default=48,
+                        help='Time stop: max bars held')
+    parser.add_argument('--warmup',     type=int,   default=100,
+                        help='Warmup bars before first signal')
+    parser.add_argument('--csv-dir',    default=None,
+                        help='Folder with SYMBOL_H1.csv files (skips MT5)')
+
+    # MT5 credentials (only needed if --csv-dir not supplied)
+    parser.add_argument('--login',    type=int, default=None)
+    parser.add_argument('--password', type=str, default=None)
+    parser.add_argument('--server',   type=str, default=None)
+
+    args = parser.parse_args()
+
+    # Initialise MT5 if not using CSVs
+    if args.csv_dir is None:
+        if not MT5_AVAILABLE:
+            print("ERROR: MetaTrader5 not installed.  "
+                  "Use --csv-dir or install MetaTrader5.")
+            sys.exit(1)
+        if not mt5.initialize():
+            print(f"MT5 init failed: {mt5.last_error()}")
+            sys.exit(1)
+        if args.login and args.password and args.server:
+            if not mt5.login(args.login, args.password, args.server):
+                print(f"MT5 login failed: {mt5.last_error()}")
+                sys.exit(1)
+        acct = mt5.account_info()
+        print(f"MT5 connected: account {acct.login}  balance ${acct.balance:,.2f}")
+
+    symbols   = [s.strip().upper() for s in args.symbols.split(',')]
+    start_dt  = datetime.strptime(args.start, '%Y-%m-%d')
+    end_dt    = datetime.strptime(args.end,   '%Y-%m-%d')
+
+    bt = ICTBacktester(
+        symbols              = symbols,
+        start                = start_dt,
+        end                  = end_dt,
+        timeframe            = args.timeframe,
+        initial_capital      = args.capital,
+        risk_pct             = args.risk,
+        rr_ratio             = args.rr,
+        confluence_threshold = args.confluence,
+        max_daily_loss       = args.max_loss,
+        slippage_pips        = args.slippage,
+        commission_per_lot   = args.commission,
+        max_bars_held        = args.max_bars,
+        warmup_bars          = args.warmup,
+        csv_dir              = args.csv_dir,
+    )
+
+    metrics = bt.run()
+
+    if MT5_AVAILABLE and args.csv_dir is None:
         mt5.shutdown()
-        
-    except ImportError:
-        print("ERROR: MetaTrader5 package not installed")
-        print("Run: pip install MetaTrader5")

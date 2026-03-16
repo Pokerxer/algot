@@ -21,7 +21,7 @@ SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'LTCUSDT', 'LINKUSDT',
            'AVAXUSDT', 'MATICUSDT']
 
 RR_RATIO = 3.0
-CONF_THRESHOLD = 60
+CONF_THRESHOLD = 50  # Lower threshold to match V5 approach
 RISK_PCT = 0.02
 DAYS = 90
 
@@ -211,7 +211,7 @@ def run_backtest():
         
         closes = data['closes']
         
-        balance = 10000
+        balance = 100
         trades = 0
         wins = 0
         pnl = 0

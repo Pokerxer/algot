@@ -341,7 +341,7 @@ def run_v6_backtest(symbols, days=30, initial_capital=5000, risk_per_trade=0.02,
 
 if __name__ == "__main__":
     # Forex symbols for NY session backtest - reduced for speed
-    symbols = ['GBPUSD', 'GBPEUR', 'GBPJPY', 'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPNZD']
+    symbols = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'NZDUSD', 'EURJPY', 'GBPJPY']
     
     print("="*80)
     print("ICT V6 - FVG + Gap Backtest")

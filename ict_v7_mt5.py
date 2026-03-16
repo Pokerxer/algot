@@ -1,24 +1,27 @@
 """
-ICT V7 Trading Bot - MT5 Version  (R:R & Position-Sizing FIXED)
-===============================================================
-Fixes applied vs original:
-  1. V7SignalGenerator now accepts and stores rr_ratio so _combine_signals
-     uses the actual configured ratio instead of hard-coded 2.0.
-  2. _enter_trade no longer silently recalculates target_price; it relies on
-     the TP already stored in the signal, keeping logs and MT5 orders in sync.
-  3. calculate_position_size (futures / metals) formula corrected:
-       WRONG: qty = risk / (stop_distance / tick_size * multiplier)
-       RIGHT: qty = risk / (stop_distance * multiplier)
-     The old code was off by exactly 1/tick_size (×100 error for XAUUSD).
-  4. actual_risk for futures now uses the same corrected formula.
-  5. Indices position sizing uses a configurable point_value_per_lot instead
-     of the hardcoded 1, with sensible per-symbol defaults.
-  6. Forex pip validation bounds aligned: min 10 pips, max 150 pips
-     (was 15 / 100, which conflicted with the 80-pip soft ceiling).
+ICT V8 Trading Bot - MT5 Version  (Fully-Wired Handlers + R:R Fixed)
+=====================================================================
+Changes vs V7:
+  SIGNAL ENGINE (signal_engine.py — new file):
+  • MarketStructureHandler now drives HTF/LTF bias (replaces dead EMA stub)
+  • LiquidityHandler detects swept liquidity, stop hunts, draw on liquidity
+  • OrderBlockHandler finds propulsion/reclaimed/extreme OBs at entry
+  • TradingModelsHandler scores ICT 2022 Model + Silver Bullet windows
+  • FVG + Gap layers kept; kill-zone PM bug fixed (13.5→13 for hour 13)
+  • Entry priority: OB opening price > Silver Bullet FVG > standard FVG
+  • Stop priority: OB body boundary > Model 2022 stop > ATR fallback
+  • TP: whichever of Model 2022 target / Silver Bullet target / configured
+        R:R multiple is *farthest* from entry in the trade direction
+
+  POSITION SIZING / R:R (carried over from V7 fix):
+  • Futures/metals lot formula corrected (was off by ×100 for XAUUSD)
+  • rr_ratio correctly propagated from CLI → trader → signal engine
+  • _enter_trade uses signal['take_profit'] directly (no silent recalc)
+  • Forex pip validation bounds corrected to 10–150 pips
 
 Usage:
     python3 ict_v7_mt5_fixed.py --symbols "BTCUSD,ETHUSD,XAUUSD,XTIUSD" \
-                                 --login 12345 --password "yourpass"
+                                 --login 12345 --password "yourpass" --rr 3.0
 """
 
 import asyncio
@@ -31,11 +34,18 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
+# ── New fully-wired signal engine (replaces hollow V7SignalGenerator) ─────────
+try:
+    from signal_engine import ICTSignalEngine as V7SignalGenerator
+    print("ICT Signal Engine loaded (V8 – all handlers wired)")
+except ImportError as e:
+    print(f"WARNING: signal_engine.py not found, falling back to stub: {e}")
+    V7SignalGenerator = None          # handled below in V7MT5LiveTrader.__init__
+
 from fvg_handler import FVGHandler, FairValueGap, FVGStatus
 from gap_handler import GapHandler, Gap, GapType, GapDirection
 
 try:
-    from mtf_coordinator import MTFCoordinator, TimeframePurpose, TimeframeRelation
     from market_structure_handler import (
         MarketStructureHandler, MarketStructureAnalysis,
         StructureBreakType, TrendState, PriceZone
@@ -43,7 +53,7 @@ try:
     MTF_AVAILABLE = True
 except ImportError as e:
     MTF_AVAILABLE = False
-    print(f"WARNING: MTF modules not available: {e}")
+    print(f"WARNING: market_structure_handler not available: {e}")
 
 import json
 import pandas as pd
@@ -957,8 +967,18 @@ class V7MT5LiveTrader:
         self.confluence_threshold = confluence_threshold
         self.max_daily_loss       = max_daily_loss
 
-        # ── FIX 1 (cont.): pass rr_ratio into signal generator ────────────────
-        self.signal_generator = V7SignalGenerator(rr_ratio=rr_ratio)
+        # Use ICTSignalEngine (V8) if available, else fall back to stub
+        if V7SignalGenerator is not None:
+            self.signal_generator = V7SignalGenerator(rr_ratio=rr_ratio)
+        else:
+            class _StubGenerator:
+                def __init__(self, rr_ratio): self.rr_ratio = rr_ratio
+                def analyze_symbol(self, sym, data, price):
+                    return {"direction": 0, "confluence": 0, "confidence": "LOW",
+                            "entry_price": price, "stop_loss": None, "take_profit": None,
+                            "reasoning": [], "fvg_data": None, "gap_data": None}
+            self.signal_generator = _StubGenerator(rr_ratio=rr_ratio)
+            print("WARNING: signal_engine.py not found – running stub, no real signals")
 
         self.mode             = 'paper'
         self.positions        = {}
@@ -1270,25 +1290,39 @@ class V7MT5LiveTrader:
                 if signal and signal.get('direction', 0) != 0:
                     fvg_type = signal.get('fvg_data', {}).get('type', '') if isinstance(signal.get('fvg_data'), dict) else ''
                     gap_type = signal.get('gap_data', {}).get('type', '') if isinstance(signal.get('gap_data'), dict) else ''
+                    cached   = getattr(self.signal_generator, 'last_analysis', {}).get(symbol, {})
                     self.last_signals[symbol] = {
-                        'direction':  signal.get('direction', 0),
-                        'confluence': signal.get('confluence', 0),
-                        'confidence': signal.get('confidence', 'LOW'),
-                        'pd_zone':    fvg_type or gap_type,
-                        'entry':      signal.get('entry_price', current_price),
-                        'timestamp':  datetime.now().isoformat(),
+                        'direction':   signal.get('direction', 0),
+                        'confluence':  signal.get('confluence', 0),
+                        'confidence':  signal.get('confidence', 'LOW'),
+                        'pd_zone':     fvg_type or gap_type,
+                        'entry':       signal.get('entry_price', current_price),
+                        'stop':        signal.get('stop_loss'),
+                        'target':      signal.get('take_profit'),
+                        'htf_trend':   cached.get('htf_trend', 'N/A'),
+                        'kill_zone':   cached.get('kill_zone', 'OFF_HOURS'),
+                        'ob_type':     cached.get('ob_type', 'none'),
+                        'liq_swept':   cached.get('liq_swept'),
+                        'model_2022':  cached.get('model_2022', 'none'),
+                        'silver_bullet': cached.get('silver_bullet', False),
+                        'reasoning':   signal.get('reasoning', [])[:5],
+                        'timestamp':   datetime.now().isoformat(),
                     }
 
                 if tn and signal:
                     try:
-                        htf = data.get('htf_trend', np.zeros(len(data['closes'])))[idx]
-                        ltf = data.get('ltf_trend', np.zeros(len(data['closes'])))[idx]
+                        # Use engine cached analysis for richer Telegram updates
+                        cached = getattr(self.signal_generator, 'last_analysis', {}).get(symbol, {})
                         tn.update_market_data(symbol, {
                             'price':      current_price,
-                            'htf_trend':  htf,
-                            'ltf_trend':  ltf,
+                            'htf_trend':  cached.get('htf_trend', 'N/A'),
+                            'ltf_trend':  cached.get('ltf_trend', 'N/A'),
+                            'kill_zone':  cached.get('kill_zone', 'N/A'),
                             'confluence': signal.get('confluence', 0),
                             'confidence': signal.get('confidence', 'LOW'),
+                            'ob_type':    cached.get('ob_type', 'none'),
+                            'liq_swept':  cached.get('liq_swept'),
+                            'model_2022': cached.get('model_2022', 'none'),
                         })
                     except Exception:
                         pass
@@ -1335,6 +1369,36 @@ class V7MT5LiveTrader:
                     )
         except Exception as e:
             print(f"Error checking positions: {e}")
+
+
+    def print_status(self):
+        """Print a one-screen snapshot of every symbol's pipeline state."""
+        now = datetime.now().strftime('%H:%M:%S')
+        print(f"\n{'='*72}")
+        print(f"ICT V8  {now}  |  Acct: ${self.account_value:,.2f}  |  Daily P&L: ${self.daily_pnl:.2f}")
+        print(f"{'='*72}")
+        cached_all = getattr(self.signal_generator, 'last_analysis', {})
+        for sym in self.symbols:
+            sig   = self.last_signals.get(sym, {})
+            cache = cached_all.get(sym, {})
+            pos   = self.positions.get(sym)
+            dir_s = {1: 'LONG ▲', -1: 'SHORT ▼', 0: '  --  '}.get(sig.get('direction', 0), '  --  ')
+            cfl   = sig.get('confluence', 0)
+            conf  = sig.get('confidence', '---')
+            kz    = cache.get('kill_zone', '---')
+            htf   = cache.get('htf_trend', '---')
+            ob    = cache.get('ob_type',   '---')
+            m22   = cache.get('model_2022','---')
+            sb    = 'SB✓' if cache.get('silver_bullet') else '   '
+            liq   = cache.get('liq_swept') or '---'
+            pos_s = ''
+            if pos:
+                pnl   = pos.get('pnl', 0.0)
+                ps    = 'L' if pos['direction'] == 1 else 'S'
+                pos_s = f" | POS {ps} @ {pos['entry']:.4f}  P&L ${pnl:.2f}"
+            print(f"  {sym:<8}  {dir_s}  {conf:<6} {cfl:>3}/100  "
+                  f"KZ:{kz:<9} HTF:{htf:<12} OB:{ob:<8} M22:{m22:<4} {sb}  LIQ:{liq}{pos_s}")
+        print(f"{'='*72}\n")
 
     def start(self):
         self.running = True
@@ -1412,6 +1476,7 @@ def run_v7_trading(
             if iteration % 300 == 0:
                 trader._refresh_data()
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Data refreshed")
+                trader.print_status()   # ← V8: full pipeline snapshot every 5 min
             if iteration % 60 == 0:
                 trader.update_account()
                 trader.check_positions()
