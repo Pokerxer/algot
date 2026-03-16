@@ -958,7 +958,7 @@ class V7MT5LiveTrader:
     def __init__(
         self, symbols: List[str], risk_pct: float = 0.02,
         poll_interval: int = 30, rr_ratio: float = 3.0,
-        confluence_threshold: int = 60, max_daily_loss: float = -2000,
+        confluence_threshold: int = 65, max_daily_loss: float = -500,
     ):
         self.symbols              = symbols
         self.risk_pct             = risk_pct
@@ -1502,23 +1502,23 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='ICT V7 - MT5 Trading with FVG + Gap')
     parser.add_argument("--symbols",
-                        default="EURUSD,GBPUSD,USDJPY,USDCAD,AUDUSD,XAUUSD,XTIUSD,US30,USTEC,US500")
+                        default="GBPAUD,USDJPY,USDCHF,EURJPY,GBPJPY,NZDUSD")
     parser.add_argument("--interval",    type=int,   default=30)
-    parser.add_argument("--risk",        type=float, default=0.03)
+    parser.add_argument("--risk",        type=float, default=0.02)
     parser.add_argument("--login",       type=int,   default=None)
     parser.add_argument("--password",    type=str,   default=None)
     parser.add_argument("--server",      type=str,   default=None)
     parser.add_argument("--mode",        type=str,   default="paper",
                         choices=["shadow", "paper", "live"])
     parser.add_argument("--rr",          type=float, default=3.0)
-    parser.add_argument("--confluence",  type=int,   default=60)
-    parser.add_argument("--max-loss",    type=float, default=-2000)
+    parser.add_argument("--confluence",  type=int,   default=65)
+    parser.add_argument("--max-loss",    type=float, default=-500)
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(',')]
 
     print("=" * 60)
-    print("ICT V7 Trading Bot - MetaTrader 5  (R:R FIXED)")
+    print("ICT V7 Trading Bot - MetaTrader 5  (Best Performers)")
     print("=" * 60)
     print(f"Mode:       {args.mode.upper()}")
     print(f"Symbols:    {', '.join(symbols)}")
