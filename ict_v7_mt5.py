@@ -935,6 +935,9 @@ class V7MT5LiveTrader:
         self.magic   = 123456
 
         self._sync_positions()
+        # Auto-fix any inherited positions whose TP gives wrong R:R
+        # (handles positions opened by the previous broken V7 code)
+        self.fix_existing_tps()
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -969,6 +972,105 @@ class V7MT5LiveTrader:
                 print(f"  Total open: {len(self.positions)}")
         except Exception as e:
             print(f"  Error syncing: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def fix_existing_tps(self, min_improvement: float = 0.10) -> None:
+        """
+        Scan ALL open MT5 positions (not just bot-tracked ones) and correct
+        any TP whose reward/risk is worse than self.rr_ratio - min_improvement.
+
+        Called automatically on startup so that positions opened by the old
+        broken V7 code get their TPs fixed the moment the new bot starts.
+        Can also be called manually at any time: trader.fix_existing_tps()
+
+        Parameters
+        ----------
+        min_improvement : only fix positions whose R:R is more than this
+                          below the target.  Default 0.10 means any position
+                          with R:R < (rr_ratio - 0.10) will be corrected.
+                          Set to 0 to force-correct every position.
+        """
+        if not MT5_AVAILABLE:
+            return
+
+        try:
+            positions = mt5.positions_get()
+            if not positions:
+                return
+
+            print(f"\n── TP Audit (target R:R 1:{self.rr_ratio}) ───────────────────────")
+            fixed = 0
+
+            for pos in positions:
+                ticket     = pos.ticket
+                symbol     = pos.symbol
+                pos_type   = pos.type       # 0=BUY, 1=SELL
+                price_open = pos.price_open
+                sl         = pos.sl
+                tp         = pos.tp
+
+                if sl == 0.0:
+                    print(f"  {symbol} ticket={ticket}  SKIP (no SL set)")
+                    continue
+
+                stop_dist = abs(price_open - sl)
+                if stop_dist <= 1e-8:
+                    continue
+
+                # Existing R:R
+                reward_dist = abs(tp - price_open) if tp != 0.0 else 0.0
+                current_rr  = reward_dist / stop_dist if stop_dist > 0 else 0.0
+
+                # Correct TP
+                if pos_type == 0:   # BUY
+                    correct_tp = price_open + stop_dist * self.rr_ratio
+                else:               # SELL
+                    correct_tp = price_open - stop_dist * self.rr_ratio
+
+                sym_info = mt5.symbol_info(symbol)
+                if sym_info:
+                    digits     = sym_info.digits
+                    correct_tp = round(correct_tp, digits)
+                    sl_send    = round(sl, digits)
+                else:
+                    sl_send = sl
+
+                needs_fix = current_rr < (self.rr_ratio - min_improvement)
+
+                type_str = "BUY " if pos_type == 0 else "SELL"
+                if needs_fix:
+                    print(f"  {symbol:<12} {type_str} @ {price_open:.5f}  "
+                          f"SL={sl:.5f}  TP={tp:.5f}  R:R=1:{current_rr:.2f}  "
+                          f"→ fixing TP to {correct_tp:.5f} (1:{self.rr_ratio})", end="")
+
+                    request = {
+                        "action":   mt5.TRADE_ACTION_SLTP,
+                        "position": ticket,
+                        "symbol":   symbol,
+                        "sl":       sl_send,
+                        "tp":       correct_tp,
+                    }
+                    result = mt5.order_send(request)
+                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                        # Update internal tracker if we have this position
+                        for key, p in self.positions.items():
+                            if p.get('ticket') == ticket:
+                                p['target'] = correct_tp
+                                break
+                        print("  ✓")
+                        fixed += 1
+                    else:
+                        err = result.comment if result else mt5.last_error()
+                        print(f"  ✗ ({err})")
+                else:
+                    print(f"  {symbol:<12} {type_str} @ {price_open:.5f}  "
+                          f"R:R=1:{current_rr:.2f}  OK")
+
+            print(f"  ── {fixed} position(s) TP corrected ─────────────────────────\n")
+
+        except Exception as e:
+            print(f"fix_existing_tps error: {e}")
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         if not MT5_AVAILABLE:
