@@ -7,7 +7,12 @@ echo ICT V7 MT5 Trading Bot - Best Performers
 echo ============================================================
 echo.
 
-REM Fix any existing positions with wrong TP first
+REM Close any existing ICT V7 positions first (keep V8 orders)
+echo [%date% %time%] Closing ICT V7 positions, keeping V8 orders...
+py close_v7_positions.py --login 298797826 --password "Pokerx_007" --server "Exness-MT5Trial9"
+echo.
+
+REM Fix any existing positions with wrong TP
 echo [%date% %time%] Checking and fixing existing positions...
 py fix_existing_positions.py --login 298797826 --password "Pokerx_007" --server "Exness-MT5Trial9" --rr 3.0
 echo.
