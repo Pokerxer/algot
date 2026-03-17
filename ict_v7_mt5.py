@@ -1524,7 +1524,7 @@ if __name__ == "__main__":
     print(f"Mode:       {args.mode.upper()}")
     print(f"Symbols:    {', '.join(symbols)}")
     print(f"Risk:       {args.risk*100}%  |  R:R 1:{args.rr}")
-    print(f"Confluence: {args.confluence}+  |  Max Loss: ${args.max_loss}")
+    print(f"Confluence: {args.confluence}+  |  Max Loss: ${abs(args.max_loss)}")
     print(f"MT5 Login:  {args.login or 'Demo'}")
     print("=" * 60)
 
@@ -1532,5 +1532,5 @@ if __name__ == "__main__":
         symbols, args.interval, args.risk,
         args.login, args.password, args.server, args.mode,
         rr_ratio=args.rr, confluence_threshold=args.confluence,
-        max_daily_loss=args.max_loss,
+        max_daily_loss=-abs(args.max_loss),  # Ensure negative
     )
