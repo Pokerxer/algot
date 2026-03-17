@@ -156,6 +156,7 @@ class ICTSignalEngine:
 
     def __init__(self, rr_ratio: float = 3.0):
         self.rr_ratio = rr_ratio
+        self._debug_mode = False
 
         # ── Analytical layers ────────────────────────────────────────────────
         self.ms_handler = MarketStructureHandler(
@@ -663,6 +664,9 @@ class ICTSignalEngine:
 
         direction = 0   # +1 = long, -1 = short
 
+        # Determine direction: check FVG if HTF is ranging with no MSS
+        fvg_data = fvg
+        
         if htf == TrendState.BULLISH:
             direction = 1
             score += W["htf_bull_bear"]
@@ -677,6 +681,17 @@ class ICTSignalEngine:
                 direction = 1 if recent_mss.direction == "bullish" else -1
                 score += W["htf_neutral"]
                 r.append(f"HTF Ranging + MSS {recent_mss.direction}: +{W['htf_neutral']}")
+            # Also use FVG direction as bias when ranging
+            elif fvg_data and (fvg_data.get('best_bisi') or fvg_data.get('best_sibi')):
+                # BISI = bullish FVG (look for longs), SIBI = bearish FVG (look for shorts)
+                if fvg_data.get('best_sibi'):
+                    direction = -1
+                    score += W["htf_neutral"]
+                    r.append(f"HTF Ranging + SIBI FVG: +{W['htf_neutral']}")
+                elif fvg_data.get('best_bisi'):
+                    direction = 1
+                    score += W["htf_neutral"]
+                    r.append(f"HTF Ranging + BISI FVG: +{W['htf_neutral']}")
 
         if direction == 0:
             # No bias – no trade
@@ -892,19 +907,20 @@ class ICTSignalEngine:
 
         # ── Take profit: Model 2022 target > Silver Bullet > R:R multiple ─────
         target = m22_target or sb_target
-        if target is None or abs(target - entry) < stop_distance:
-            # Ensure at minimum the configured R:R
-            target = (entry + stop_distance * self.rr_ratio) if direction == 1 \
+        
+        # Always use at least the configured R:R - override if model target doesn't meet threshold
+        min_target = (entry + stop_distance * self.rr_ratio) if direction == 1 \
                      else (entry - stop_distance * self.rr_ratio)
-
-        # Verify TP is beyond configured R:R; extend if model target is farther
-        min_tp = (entry + stop_distance * self.rr_ratio) if direction == 1 \
-                 else (entry - stop_distance * self.rr_ratio)
-
-        if direction == 1:
-            signal["take_profit"] = max(target, min_tp)
+        
+        if target is None:
+            target = min_target
         else:
-            signal["take_profit"] = min(target, min_tp)
+            # Check if target meets minimum R:R requirement
+            target_distance = abs(target - entry)
+            if target_distance < stop_distance * self.rr_ratio:
+                target = min_target
+
+        signal["take_profit"] = target
 
         # Log effective R:R for transparency
         reward = abs(signal["take_profit"] - entry)

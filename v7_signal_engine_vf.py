@@ -907,19 +907,20 @@ class ICTSignalEngine:
 
         # ── Take profit: Model 2022 target > Silver Bullet > R:R multiple ─────
         target = m22_target or sb_target
-        if target is None or abs(target - entry) < stop_distance:
-            # Ensure at minimum the configured R:R
-            target = (entry + stop_distance * self.rr_ratio) if direction == 1 \
+        
+        # Always use at least the configured R:R - override if model target doesn't meet threshold
+        min_target = (entry + stop_distance * self.rr_ratio) if direction == 1 \
                      else (entry - stop_distance * self.rr_ratio)
-
-        # Verify TP is beyond configured R:R; extend if model target is farther
-        min_tp = (entry + stop_distance * self.rr_ratio) if direction == 1 \
-                 else (entry - stop_distance * self.rr_ratio)
-
-        if direction == 1:
-            signal["take_profit"] = max(target, min_tp)
+        
+        if target is None:
+            target = min_target
         else:
-            signal["take_profit"] = min(target, min_tp)
+            # Check if target meets minimum R:R requirement
+            target_distance = abs(target - entry)
+            if target_distance < stop_distance * self.rr_ratio:
+                target = min_target
+
+        signal["take_profit"] = target
 
         # Log effective R:R for transparency
         reward = abs(signal["take_profit"] - entry)
