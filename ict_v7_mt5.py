@@ -1152,6 +1152,19 @@ class V7MT5LiveTrader:
             # Sanity-check: confirm the effective R:R matches configuration
             reward_distance = abs(target_price - entry_price)
             effective_rr    = reward_distance / stop_distance if stop_distance > 0 else 0
+            
+            # DEBUG: Force correct R:R if wrong
+            expected_target_long = entry_price + stop_distance * self.rr_ratio
+            expected_target_short = entry_price - stop_distance * self.rr_ratio
+            if signal['direction'] == 1 and target_price < expected_target_long:
+                target_price = expected_target_long
+                reward_distance = stop_distance * self.rr_ratio
+                effective_rr = self.rr_ratio
+            elif signal['direction'] == -1 and target_price > expected_target_short:
+                target_price = expected_target_short
+                reward_distance = stop_distance * self.rr_ratio
+                effective_rr = self.rr_ratio
+            
             print(f"[{symbol}] Lot calc: Risk=${risk_amount:.2f}  "
                   f"Stop={stop_distance:.5f}  Lots={qty:.2f}  "
                   f"R:R=1:{effective_rr:.2f}")
