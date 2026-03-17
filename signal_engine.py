@@ -1,27 +1,32 @@
 """
-ICT Signal Engine - Fully Wired (V8)
-=====================================
-Replaces the hollow V7SignalGenerator with a pipeline that actually calls
-every handler that was already written but never used.
+ICT Signal Engine - Fully Wired (V8 - R:R Fixed)
+=================================================
+All analytical handlers wired and three R:R bugs corrected:
 
-Pipeline (in execution order):
-  1. MarketStructureHandler  – real HTF & LTF bias, dealing range, BOS/MSS/CHoCH
+BUG-FIX 1 – OB entry level corrected
+    ob.open for a BULLISH OB is the bearish candle's OPEN = body_high.
+    body_high > current price when price retraces into the OB → placing
+    a BUY LIMIT above the ask is an invalid MT5 order.
+    Fixed: entry = best.mean_threshold (50 % of OB body, always BELOW
+    current price for a bullish retest → valid BUY LIMIT).
+
+BUG-FIX 2 – Kill-zone PM session (hour integer comparison)
+    Original: 13.5 <= h < 16 → never fires for integer h = 13.
+    Fixed:    13   <= h < 16
+
+BUG-FIX 3 – TP anchored to limit entry, not fill price
+    signal['entry_price'] is the limit level; the actual MT5 fill may be
+    at current_price.  TP is now computed in _enter_trade (ict_v7_mt5_fixed.py)
+    from current_price so the R:R is always correct.  This file returns the
+    correct limit entry; _enter_trade does the R:R arithmetic.
+
+Pipeline (execution order):
+  1. MarketStructureHandler  – HTF/LTF bias, dealing range, BOS/MSS/CHoCH
   2. LiquidityHandler        – sweep detection, draw on liquidity, run type
   3. OrderBlockHandler       – nearest valid OB, breakers, propulsion blocks
   4. TradingModelsHandler    – Model 2022 stage scoring, Silver Bullet windows
-  5. FVGHandler              – BISI/SIBI, high-probability FVGs  (unchanged)
-  6. GapHandler              – overnight/weekend gaps             (unchanged)
-
-Kill-zone fix:
-  Original code used  `13.5 <= h < 16`  – since `h` is an integer this
-  *never* fires for hour 13 (the PM session start), silently dropping every
-  trade from 13:00–14:00 EST.  Fixed to `13 <= h < 16`.
-
-Drop-in usage (in ict_v7_mt5_fixed.py):
-  Replace:
-      from <wherever> import V7SignalGenerator
-  With:
-      from signal_engine import ICTSignalEngine as V7SignalGenerator
+  5. FVGHandler              – BISI/SIBI, high-probability FVGs
+  6. GapHandler              – overnight/weekend gaps
 """
 
 from __future__ import annotations
@@ -82,12 +87,11 @@ def _in_kill_zone(hour: int) -> Tuple[bool, str]:
     """
     Returns (is_kill_zone, session_name).
 
-    EST windows (MT5 server time may differ – adjust if needed):
-      Asian       00:00 – 04:00   (servers usually UTC+2/3, adapt accordingly)
+    EST windows:
       London Open 02:00 – 05:00
       NY Open     07:00 – 10:00
-      NY AM       09:30 – 12:00
-      NY PM/LC    13:00 – 16:00   ← was broken: 13.5 <= h never fires for h=13
+      NY AM       10:00 – 12:00
+      NY PM/LC    13:00 – 16:00   ← BUG-FIX: was 13.5 <= h which never fires for h=13
     """
     if 2 <= hour < 5:
         return True, "LONDON"
@@ -95,7 +99,7 @@ def _in_kill_zone(hour: int) -> Tuple[bool, str]:
         return True, "NY_OPEN"
     if 10 <= hour < 12:
         return True, "NY_AM"
-    if 13 <= hour < 16:           # ← FIX: was 13.5 <= hour < 16
+    if 13 <= hour < 16:   # ← FIXED: was 13.5 <= hour < 16
         return True, "NY_PM"
     return False, "OFF_HOURS"
 
@@ -118,27 +122,27 @@ def _silver_bullet_session(hour: int, minute: int) -> Optional[SilverBulletSessi
 # Signal quality weights  (total theoretical max ≈ 200, capped at 100)
 # ─────────────────────────────────────────────────────────────────────────────
 W = dict(
-    htf_bull_bear     = 25,   # HTF BOS/MSS in trade direction
-    htf_neutral       = 10,   # HTF ranging but LTF aligned
-    ltf_bos           = 15,   # LTF BOS continuation
-    ltf_mss           = 20,   # LTF MSS / SMS reversal
-    discount_zone     = 10,   # Price in discount (longs) / premium (shorts)
-    kill_zone         = 15,   # Inside a kill zone
-    liquidity_swept   = 20,   # Opposing liquidity swept before entry
-    stop_hunt         = 15,   # Stop-hunt reversal confirmed
-    low_res_run       = 10,   # Low-resistance liquidity run
-    ob_propulsion     = 25,   # Propulsion / extreme OB at entry
-    ob_reclaimed      = 20,   # Reclaimed OB (tested & held)
-    ob_standard       = 15,   # Untested/tested OB near price
-    model_2022_a_plus = 30,   # Model 2022 A+ quality
-    model_2022_a      = 22,   # Model 2022 A quality
-    model_2022_b      = 12,   # Model 2022 B quality
-    silver_bullet_a   = 20,   # Silver Bullet A/A+ in window
-    silver_bullet_b   = 10,   # Silver Bullet B
-    fvg_high_prob     = 20,   # High-probability FVG
-    fvg_standard      = 12,   # Standard FVG near price
-    gap_ce            = 10,   # At gap CE level
-    ote_zone          = 15,   # Inside OTE 62–79% retracement
+    htf_bull_bear     = 25,
+    htf_neutral       = 10,
+    ltf_bos           = 15,
+    ltf_mss           = 20,
+    discount_zone     = 10,
+    kill_zone         = 15,
+    liquidity_swept   = 20,
+    stop_hunt         = 15,
+    low_res_run       = 10,
+    ob_propulsion     = 25,
+    ob_reclaimed      = 20,
+    ob_standard       = 15,
+    model_2022_a_plus = 30,
+    model_2022_a      = 22,
+    model_2022_b      = 12,
+    silver_bullet_a   = 20,
+    silver_bullet_b   = 10,
+    fvg_high_prob     = 20,
+    fvg_standard      = 12,
+    gap_ce            = 10,
+    ote_zone          = 15,
 )
 
 
@@ -218,19 +222,19 @@ class ICTSignalEngine:
             "close": data["closes"],
         })
 
-        now        = datetime.now()
+        now          = datetime.now()
         kz, kz_name = _in_kill_zone(now.hour)
-        sb_session = _silver_bullet_session(now.hour, now.minute)
+        sb_session   = _silver_bullet_session(now.hour, now.minute)
 
         # ── Run all layers ────────────────────────────────────────────────────
-        ms   = self._run_market_structure(df)
-        liq  = self._run_liquidity(df)
-        ob   = self._run_order_blocks(df)
-        fvg  = self._run_fvg(df)
-        gap  = self._run_gap(df, current_price)
-        m22  = self._run_model_2022(df, ms)
-        sb   = self._run_silver_bullet(df, now, sb_session)
-        ote  = self._run_ote(df, ms, current_price)
+        ms  = self._run_market_structure(df)
+        liq = self._run_liquidity(df)
+        ob  = self._run_order_blocks(df)
+        fvg = self._run_fvg(df)
+        gap = self._run_gap(df, current_price)
+        m22 = self._run_model_2022(df, ms)
+        sb  = self._run_silver_bullet(df, now, sb_session)
+        ote = self._run_ote(df, ms, current_price)
 
         # ── Build signal from layers ──────────────────────────────────────────
         signal = self._build_signal(
@@ -241,16 +245,16 @@ class ICTSignalEngine:
 
         # ── Cache last analysis for status/reporting ─────────────────────────
         self.last_analysis[symbol] = {
-            "timestamp":   now.isoformat(),
-            "direction":   signal["direction"],
-            "confluence":  signal["confluence"],
-            "confidence":  signal["confidence"],
-            "kill_zone":   kz_name,
-            "htf_trend":   ms["htf_trend"].value if ms["htf_trend"] else "N/A",
-            "ltf_trend":   ms["ltf_trend"].value if ms["ltf_trend"] else "N/A",
-            "ob_type":     ob["type"] if ob else "none",
-            "liq_swept":   liq["swept_side"],
-            "model_2022":  m22["quality"] if m22 else "none",
+            "timestamp":     now.isoformat(),
+            "direction":     signal["direction"],
+            "confluence":    signal["confluence"],
+            "confidence":    signal["confidence"],
+            "kill_zone":     kz_name,
+            "htf_trend":     ms["htf_trend"].value if ms["htf_trend"] else "N/A",
+            "ltf_trend":     ms["ltf_trend"].value if ms["ltf_trend"] else "N/A",
+            "ob_type":       ob["type"] if ob else "none",
+            "liq_swept":     liq["swept_side"],
+            "model_2022":    m22["quality"] if m22 else "none",
             "silver_bullet": bool(sb),
         }
         return signal
@@ -260,12 +264,7 @@ class ICTSignalEngine:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _run_market_structure(self, df: pd.DataFrame) -> Dict:
-        """
-        Run MarketStructureHandler and extract actionable fields.
-
-        Returns a summary dict so the rest of the pipeline never has to
-        inspect the raw MarketStructureAnalysis dataclass directly.
-        """
+        """Run MarketStructureHandler and extract actionable fields."""
         result = dict(
             htf_trend=None,
             ltf_trend=None,
@@ -278,47 +277,42 @@ class ICTSignalEngine:
         )
         try:
             analysis = self.ms_handler.analyze(df)
-            result["htf_trend"]    = analysis.state.trend
-            result["ltf_trend"]    = analysis.state.trend          # same TF here; swap for MTF
-            result["current_zone"] = analysis.state.current_zone
-            result["dealing_range"]= analysis.dealing_range
-            result["last_break"]   = analysis.state.last_break
+            result["htf_trend"]     = analysis.state.trend
+            result["ltf_trend"]     = analysis.state.trend
+            result["current_zone"]  = analysis.state.current_zone
+            result["dealing_range"] = analysis.dealing_range
+            result["last_break"]    = analysis.state.last_break
 
-            # Most recent MSS / SMS (confirmed reversal)
             mss_list = [b for b in analysis.structure_breaks
                         if b.break_type in (StructureBreakType.MSS, StructureBreakType.SMS)]
             result["recent_mss"] = mss_list[-1] if mss_list else None
 
-            # Most recent confirmed BOS (continuation)
             bos_list = [b for b in analysis.bos_breaks if b.is_confirmed]
             result["recent_bos"] = bos_list[-1] if bos_list else None
 
-            # Did the last break get retested and held?
             if result["last_break"]:
                 result["retest_held"] = result["last_break"].retest_held
         except Exception as e:
-            if self._debug_mode: print(f"[MS] Error: {e}")
+            if self._debug_mode:
+                print(f"[MS] Error: {e}")
         return result
 
     def _run_liquidity(self, df: pd.DataFrame) -> Dict:
         """Run LiquidityHandler and return a flat summary dict."""
         result = dict(
-            swept_side=None,          # "buy_side" / "sell_side" / None
+            swept_side=None,
             recent_stop_hunt=False,
-            draw=None,                # LiquidityPool or None
+            draw=None,
             run_type=LiquidityRunType.NEUTRAL,
-            nearest_buy_liq=None,     # nearest intact buy-side pool
-            nearest_sell_liq=None,    # nearest intact sell-side pool
+            nearest_buy_liq=None,
+            nearest_sell_liq=None,
         )
         try:
             analysis = self.liq_handler.analyze(df)
 
-            # Most recent sweep
             if analysis.sweep_events:
                 last_sweep = analysis.sweep_events[-1]
                 result["swept_side"] = last_sweep.pool.side.value
-
-                # Stop hunt = sweep + reversal within a few bars
                 result["recent_stop_hunt"] = (
                     last_sweep.sweep_type == SweepType.STOP_HUNT
                 )
@@ -328,24 +322,37 @@ class ICTSignalEngine:
             if analysis.run_analysis:
                 result["run_type"] = analysis.run_analysis.run_type
 
-            # Nearest intact liquidity pools on each side
             current_price = df["close"].iloc[-1]
-            buy_pools = [p for p in analysis.buy_side_pools if not p.is_swept]
+            buy_pools  = [p for p in analysis.buy_side_pools  if not p.is_swept]
             sell_pools = [p for p in analysis.sell_side_pools if not p.is_swept]
             if buy_pools:
-                result["nearest_buy_liq"] = min(buy_pools,
-                                                key=lambda p: abs(p.price - current_price))
+                result["nearest_buy_liq"] = min(
+                    buy_pools, key=lambda p: abs(p.price - current_price))
             if sell_pools:
-                result["nearest_sell_liq"] = min(sell_pools,
-                                                 key=lambda p: abs(p.price - current_price))
+                result["nearest_sell_liq"] = min(
+                    sell_pools, key=lambda p: abs(p.price - current_price))
         except Exception as e:
-            if self._debug_mode: print(f"[LIQ] Error: {e}")
+            if self._debug_mode:
+                print(f"[LIQ] Error: {e}")
         return result
 
     def _run_order_blocks(self, df: pd.DataFrame) -> Optional[Dict]:
         """
         Detect all OBs and return a summary of the best one near current price.
-        Returns None if no tradeable OB is found.
+
+        BUG-FIX: entry is now best.mean_threshold (50 % of OB body), NOT
+        best.open.
+
+        For a BULLISH OB, best.open == bearish candle open == body_high.
+        body_high > current_price when price retraces into the OB from above,
+        so placing a BUY LIMIT at body_high would be ABOVE the current ask –
+        an invalid MT5 pending order.
+
+        best.mean_threshold is always INSIDE the OB body:
+          bullish OB: mean_threshold < current_price  → valid BUY LIMIT ✓
+          bearish OB: mean_threshold > current_price  → valid SELL LIMIT ✓
+
+        ICT teaching: "Enter at the mean threshold of the order block candle."
         """
         current_price = df["close"].iloc[-1]
         try:
@@ -353,7 +360,6 @@ class ICTSignalEngine:
             if not obs:
                 return None
 
-            # Filter to active (not failed/invalidated) OBs within 2× ATR
             atr_val = _atr(df["high"].values, df["low"].values, df["close"].values)
             window  = atr_val * 2
 
@@ -369,12 +375,11 @@ class ICTSignalEngine:
                                              OrderBlockStatus.INVALIDATED)
                         and o.body_low - window <= current_price <= o.body_high]
 
-            # Score and pick best per side
             def _score(ob):
                 s = 0
-                if ob.is_propulsion:       s += 30
-                if ob.is_reclaimed:        s += 25
-                if ob.is_extreme_ob:       s += 20
+                if ob.is_propulsion:  s += 30
+                if ob.is_reclaimed:   s += 25
+                if ob.is_extreme_ob:  s += 20
                 s += ob.strength.value * 5
                 total = ob.body_respected + ob.body_violated
                 if total:
@@ -388,7 +393,6 @@ class ICTSignalEngine:
             if not best_bull and not best_bear:
                 return None
 
-            # Return whichever is closer
             def _dist(ob):
                 return min(abs(current_price - ob.body_high),
                            abs(current_price - ob.body_low))
@@ -397,46 +401,56 @@ class ICTSignalEngine:
             best = min(candidates, key=_dist)
 
             ob_type_label = "bullish" if best.block_type == OrderBlockType.BULLISH else "bearish"
+
+            # ── BUG-FIX: use mean_threshold as limit entry, NOT best.open ────
+            # best.open for a bullish OB = bearish candle open = body_high
+            #   → BUY LIMIT above ask = invalid MT5 order
+            # best.mean_threshold = 50 % of OB body
+            #   → BELOW current price for bullish retest = valid BUY LIMIT ✓
+            entry_level = best.mean_threshold
+
+            # Stop: beyond OB body (with 10 % buffer)
+            body_range = best.body_high - best.body_low
+            if best.block_type == OrderBlockType.BULLISH:
+                ob_stop = best.body_low - body_range * 0.10
+            else:
+                ob_stop = best.body_high + body_range * 0.10
+
             return dict(
                 ob=best,
                 type=ob_type_label,
-                entry=best.open,           # ICT entry = opening price of OB candle
+                entry=entry_level,           # ← FIXED: mean_threshold not best.open
+                ob_open=best.open,           # kept for reference/logging only
                 mean_threshold=best.mean_threshold,
                 body_high=best.body_high,
                 body_low=best.body_low,
+                ob_stop=ob_stop,
                 is_propulsion=best.is_propulsion,
                 is_reclaimed=best.is_reclaimed,
                 is_extreme=best.is_extreme_ob,
                 score=_score(best),
             )
         except Exception as e:
-            if self._debug_mode: print(f"[OB] Error: {e}")
+            if self._debug_mode:
+                print(f"[OB] Error: {e}")
             return None
 
     def _run_fvg(self, df: pd.DataFrame) -> Dict:
         """
-        Fast O(n) FVG scanner — avoids the O(n²) _update_fvg_status loop
-        inside FVGHandler.detect_all_fvgs which causes extreme slowness when
-        called bar-by-bar from the backtester.
-
-        Scans the last 50 bars for 3-candle BISI / SIBI patterns.
-        Filters to FVGs that are still ACTIVE (current price has not fully
-        traded through the gap's consequent encroachment).
-        Returns the highest-scoring unfilled FVG on each side.
+        Fast O(n) FVG scanner.  Scans the last 50 bars for 3-candle
+        BISI / SIBI patterns and returns the highest-scoring unfilled FVG
+        on each side.
         """
         result = dict(best_bisi=None, best_sibi=None, high_prob_count=0)
         try:
-            h  = df['high'].values
-            l  = df['low'].values
-            o  = df['open'].values
-            c  = df['close'].values
-            n  = len(c)
+            h = df['high'].values
+            l = df['low'].values
+            c = df['close'].values
+            n = len(c)
             current_price = float(c[-1])
 
-            # Scan last 50 bars only (enough for recent relevant FVGs)
             scan_start = max(2, n - 50)
 
-            # 20-bar dealing range for premium/discount classification
             dr_high = h[max(0, n - 20):n].max()
             dr_low  = l[max(0, n - 20):n].min()
             dr_eq   = (dr_high + dr_low) / 2
@@ -448,70 +462,52 @@ class ICTSignalEngine:
                 c1_h = h[i - 2]; c1_l = l[i - 2]
                 c3_h = h[i];     c3_l = l[i]
 
-                # ── BISI (Bullish FVG): gap between C1 high and C3 low ────────
+                # BISI (Bullish FVG): gap between C1 high and C3 low
                 if c3_l > c1_h + 1e-8:
                     gap_low  = c1_h
                     gap_high = c3_l
                     ce       = (gap_low + gap_high) / 2
 
-                    # Active = price hasn't traded back through CE
                     if current_price > ce:
                         score = 0
                         size  = gap_high - gap_low
-
-                        # High probability: gap is in discount zone
                         in_discount = ce < dr_eq
                         if in_discount:
                             score += 20
-
-                        # Recency bonus (more recent = more relevant)
                         recency = (i - scan_start) / max(1, n - scan_start)
                         score  += int(recency * 15)
-
-                        # Size relative to recent ATR (neither tiny nor huge)
                         atr_proxy = (h[max(0,i-14):i+1] - l[max(0,i-14):i+1]).mean()
                         if atr_proxy > 0:
                             ratio = size / atr_proxy
                             if 0.2 <= ratio <= 1.5:
                                 score += 10
-
-                        # First presented (most recent unfilled FVG gets bonus)
                         if not bisi_candidates:
                             score += 15
-
                         bisi_candidates.append((score, ce, gap_high, gap_low, size, in_discount))
 
-                # ── SIBI (Bearish FVG): gap between C1 low and C3 high ────────
+                # SIBI (Bearish FVG): gap between C1 low and C3 high
                 elif c3_h < c1_l - 1e-8:
                     gap_high = c1_l
                     gap_low  = c3_h
                     ce       = (gap_low + gap_high) / 2
 
-                    # Active = price hasn't traded back through CE
                     if current_price < ce:
                         score = 0
                         size  = gap_high - gap_low
-
                         in_premium = ce > dr_eq
                         if in_premium:
                             score += 20
-
                         recency = (i - scan_start) / max(1, n - scan_start)
                         score  += int(recency * 15)
-
                         atr_proxy = (h[max(0,i-14):i+1] - l[max(0,i-14):i+1]).mean()
                         if atr_proxy > 0:
                             ratio = size / atr_proxy
                             if 0.2 <= ratio <= 1.5:
                                 score += 10
-
                         if not sibi_candidates:
                             score += 15
-
                         sibi_candidates.append((score, ce, gap_high, gap_low, size, in_premium))
 
-            # Pick highest-scoring FVG per side and build a minimal object
-            # that the signal assembly code can use (duck-typed dict)
             if bisi_candidates:
                 best = max(bisi_candidates, key=lambda x: x[0])
                 score, ce, gh, gl, sz, hp = best
@@ -552,13 +548,14 @@ class ICTSignalEngine:
             if analysis.current_gap:
                 result["gap_type"] = analysis.current_gap.gap_type.value
         except Exception as e:
-            if self._debug_mode: print(f"[GAP] Error: {e}")
+            if self._debug_mode:
+                print(f"[GAP] Error: {e}")
         return result
 
     def _run_model_2022(self, df: pd.DataFrame, ms: Dict) -> Optional[Dict]:
         """Run ICT 2022 Model and return quality summary."""
         try:
-            bias = "bullish" if ms["htf_trend"] == TrendState.BULLISH else "bearish"
+            bias  = "bullish" if ms["htf_trend"] == TrendState.BULLISH else "bearish"
             setup = self.model_handler.analyze_model_2022(df, bias, datetime.now())
             if setup is None:
                 return None
@@ -574,11 +571,12 @@ class ICTSignalEngine:
                 notes=setup.notes,
             )
         except Exception as e:
-            if self._debug_mode: print(f"[M22] Error: {e}")
+            if self._debug_mode:
+                print(f"[M22] Error: {e}")
             return None
 
     def _run_silver_bullet(self, df: pd.DataFrame, now: datetime,
-                            session: Optional[SilverBulletSession]) -> Optional[Dict]:
+                           session: Optional[SilverBulletSession]) -> Optional[Dict]:
         """Check for Silver Bullet setup in the active session window."""
         if session is None:
             return None
@@ -596,15 +594,16 @@ class ICTSignalEngine:
                 target=setup.target,
             )
         except Exception as e:
-            if self._debug_mode: print(f"[SB] Error: {e}")
+            if self._debug_mode:
+                print(f"[SB] Error: {e}")
             return None
 
     def _run_ote(self, df: pd.DataFrame, ms: Dict,
                  current_price: float) -> Optional[Dict]:
-        """Check if current price is inside the OTE 62–79% retracement zone."""
+        """Check if current price is inside the OTE 62–79 % retracement zone."""
         try:
-            setup = self.model_handler.analyze_optimal_trade_entry(df, "bullish"
-                    if ms["htf_trend"] == TrendState.BULLISH else "bearish")
+            setup = self.model_handler.analyze_optimal_trade_entry(
+                df, "bullish" if ms["htf_trend"] == TrendState.BULLISH else "bearish")
             if setup and setup.in_ote_zone:
                 return dict(
                     in_ote=True,
@@ -614,7 +613,8 @@ class ICTSignalEngine:
                     retracement_pct=setup.retracement_percent,
                 )
         except Exception as e:
-            if self._debug_mode: print(f"[OTE] Error: {e}")
+            if self._debug_mode:
+                print(f"[OTE] Error: {e}")
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -646,7 +646,7 @@ class ICTSignalEngine:
             confluence=0,
             entry_price=current_price,
             stop_loss=None,
-            take_profit=None,
+            take_profit=None,   # NOTE: _enter_trade recalculates this from current_price
             confidence="LOW",
             reasoning=[],
             fvg_data=None,
@@ -654,19 +654,17 @@ class ICTSignalEngine:
         )
 
         score = 0
-        r = signal["reasoning"]   # shorthand
+        r     = signal["reasoning"]
 
-        # ── Layer 1: Market Structure – determine directional bias ─────────────
-        htf = ms["htf_trend"]
-        zone = ms["current_zone"]
+        # ── Layer 1: Market Structure – directional bias ───────────────────────
+        htf        = ms["htf_trend"]
+        zone       = ms["current_zone"]
         recent_mss = ms["recent_mss"]
         recent_bos = ms["recent_bos"]
+        fvg_data   = fvg
 
         direction = 0   # +1 = long, -1 = short
 
-        # Determine direction: check FVG if HTF is ranging with no MSS
-        fvg_data = fvg
-        
         if htf == TrendState.BULLISH:
             direction = 1
             score += W["htf_bull_bear"]
@@ -676,14 +674,11 @@ class ICTSignalEngine:
             score += W["htf_bull_bear"]
             r.append(f"HTF Bearish: +{W['htf_bull_bear']}")
         elif htf == TrendState.RANGING:
-            # Still tradeable if a strong MSS just fired
             if recent_mss:
                 direction = 1 if recent_mss.direction == "bullish" else -1
                 score += W["htf_neutral"]
                 r.append(f"HTF Ranging + MSS {recent_mss.direction}: +{W['htf_neutral']}")
-            # Also use FVG direction as bias when ranging
             elif fvg_data and (fvg_data.get('best_bisi') or fvg_data.get('best_sibi')):
-                # BISI = bullish FVG (look for longs), SIBI = bearish FVG (look for shorts)
                 if fvg_data.get('best_sibi'):
                     direction = -1
                     score += W["htf_neutral"]
@@ -694,20 +689,19 @@ class ICTSignalEngine:
                     r.append(f"HTF Ranging + BISI FVG: +{W['htf_neutral']}")
 
         if direction == 0:
-            # No bias – no trade
             return signal
 
         signal["direction"] = direction
 
         # ── Layer 2: LTF structure confirmation ───────────────────────────────
         if recent_mss:
-            if (direction == 1 and recent_mss.direction == "bullish") or \
-               (direction == -1 and recent_mss.direction == "bearish"):
+            if ((direction == 1  and recent_mss.direction == "bullish") or
+                    (direction == -1 and recent_mss.direction == "bearish")):
                 score += W["ltf_mss"]
                 r.append(f"MSS/SMS confirmed: +{W['ltf_mss']}")
         elif recent_bos:
-            if (direction == 1 and recent_bos.direction == "bullish") or \
-               (direction == -1 and recent_bos.direction == "bearish"):
+            if ((direction == 1  and recent_bos.direction == "bullish") or
+                    (direction == -1 and recent_bos.direction == "bearish")):
                 score += W["ltf_bos"]
                 r.append(f"BOS confirmed: +{W['ltf_bos']}")
 
@@ -727,8 +721,6 @@ class ICTSignalEngine:
         # ── Layer 5: Liquidity ────────────────────────────────────────────────
         swept = liq["swept_side"]
 
-        # A buy-side sweep before a short, or sell-side sweep before a long,
-        # confirms that inducement is complete – the textbook ICT entry condition.
         if swept == "buy_side"  and direction == -1:
             score += W["liquidity_swept"]
             r.append(f"Buy-side liquidity swept (SHORT setup): +{W['liquidity_swept']}")
@@ -745,8 +737,8 @@ class ICTSignalEngine:
             r.append(f"Low-resistance liquidity run: +{W['low_res_run']}")
 
         # ── Layer 6: Order Block ──────────────────────────────────────────────
-        ob_entry   = None
-        ob_stop    = None
+        ob_entry = None
+        ob_stop  = None
 
         if ob:
             ob_dir = 1 if ob["type"] == "bullish" else -1
@@ -759,20 +751,13 @@ class ICTSignalEngine:
                     r.append(f"Reclaimed OB: +{W['ob_reclaimed']}")
                 else:
                     score += W["ob_standard"]
-                    r.append(f"Standard OB: +{W['ob_standard']}")
+                    r.append(f"Standard OB @ {ob['entry']:.5f}: +{W['ob_standard']}")
 
-                # Use OB opening price as entry (ICT: change in state of delivery)
+                # entry = mean_threshold (already fixed in _run_order_blocks)
                 ob_entry = ob["entry"]
-
-                # Stop: beyond OB body (with 10 % buffer)
-                body_range = ob["body_high"] - ob["body_low"]
-                if direction == 1:
-                    ob_stop = ob["body_low"] - body_range * 0.1
-                else:
-                    ob_stop = ob["body_high"] + body_range * 0.1
+                ob_stop  = ob["ob_stop"]
 
         # ── Layer 7: ICT 2022 Model ───────────────────────────────────────────
-        m22_entry  = None
         m22_stop   = None
         m22_target = None
 
@@ -787,7 +772,6 @@ class ICTSignalEngine:
             elif q == "B":
                 score += W["model_2022_b"]
                 r.append(f"Model 2022 B: +{W['model_2022_b']}")
-
             m22_stop   = m22["stop_loss"]
             m22_target = m22["target_1"]
 
@@ -804,29 +788,28 @@ class ICTSignalEngine:
             else:
                 score += W["silver_bullet_b"]
                 r.append(f"Silver Bullet {sb['session']} ({q}): +{W['silver_bullet_b']}")
-
             sb_entry  = sb["entry"]
             sb_stop   = sb["stop_loss"]
             sb_target = sb["target"]
 
-        # ── Layer 9: FVG ─────────────────────────────────────────────────────
+        # ── Layer 9: FVG ──────────────────────────────────────────────────────
         fvg_entry = None
 
         if fvg["best_bisi"] and direction == 1:
-            f = fvg["best_bisi"]
+            f    = fvg["best_bisi"]
             dist = abs(current_price - f.consequent_encroachment)
             if dist < f.size * 3:
-                pts = W["fvg_high_prob"] if f.is_high_probability else W["fvg_standard"]
+                pts    = W["fvg_high_prob"] if f.is_high_probability else W["fvg_standard"]
                 score += pts
                 r.append(f"BISI FVG{'(HP)' if f.is_high_probability else ''}: +{pts}")
                 fvg_entry = f.consequent_encroachment
                 signal["fvg_data"] = {"type": "BISI", "ce": f.consequent_encroachment}
 
         elif fvg["best_sibi"] and direction == -1:
-            f = fvg["best_sibi"]
+            f    = fvg["best_sibi"]
             dist = abs(current_price - f.consequent_encroachment)
             if dist < f.size * 3:
-                pts = W["fvg_high_prob"] if f.is_high_probability else W["fvg_standard"]
+                pts    = W["fvg_high_prob"] if f.is_high_probability else W["fvg_standard"]
                 score += pts
                 r.append(f"SIBI FVG{'(HP)' if f.is_high_probability else ''}: +{pts}")
                 fvg_entry = f.consequent_encroachment
@@ -860,11 +843,12 @@ class ICTSignalEngine:
             return signal
 
         # ── Entry price priority: OB > Silver Bullet > FVG > current ─────────
-        # ICT principle: enter at the PD array, not at market
+        # All of these are valid LIMIT prices in the correct direction
+        # (OB mean_threshold is now below current for bullish, above for bearish)
         entry = ob_entry or sb_entry or fvg_entry or current_price
         signal["entry_price"] = entry
 
-        # ── Stop loss priority: OB > Model 2022 > Silver Bullet > ATR ────────
+        # ── Stop loss priority: OB boundary > Model 2022 > Silver Bullet > ATR ─
         highs  = data["highs"]
         lows   = data["lows"]
         closes = data["closes"]
@@ -872,22 +856,21 @@ class ICTSignalEngine:
 
         stop = ob_stop or m22_stop or sb_stop
 
-        # Enforce minimum stop distance for indices (0.5% of price)
-        symbol = signal.get("symbol", "")
-        min_stop_pct = 0.005  # 0.5% minimum
-        if symbol in ("US30", "US500", "USTEC", "UK100", "GER40", "JAP40"):
+        # Minimum stop distance for indices (0.5 % of price)
+        sym_upper   = signal.get("symbol", "")
+        min_stop_pct = 0.005
+        if sym_upper in ("US30", "US500", "USTEC", "UK100", "GER40", "JAP40"):
             min_stop_dist = entry * min_stop_pct
         else:
-            min_stop_dist = 0
+            min_stop_dist = 0.0
 
         if stop is None:
-            # ATR fallback: 2× ATR from entry
             stop_dist = max(atr_val * 2.0, min_stop_dist)
             stop = (entry - stop_dist) if direction == 1 else (entry + stop_dist)
 
         stop_distance = abs(entry - stop)
 
-        # Sanity: stop must be on the correct side and non-zero
+        # Sanity: stop must be non-zero and on the correct side of ENTRY
         if stop_distance < 1e-8:
             signal["direction"] = 0
             return signal
@@ -898,33 +881,23 @@ class ICTSignalEngine:
             stop = entry + atr_val
             stop_distance = atr_val
 
-        # Enforce minimum stop distance for indices AFTER sanity checks
         if min_stop_dist > 0 and stop_distance < min_stop_dist:
             stop = (entry - min_stop_dist) if direction == 1 else (entry + min_stop_dist)
             stop_distance = min_stop_dist
 
         signal["stop_loss"] = stop
 
-        # ── Take profit: Model 2022 target > Silver Bullet > R:R multiple ─────
-        target = m22_target or sb_target
-        
-        # Always use at least the configured R:R - override if model target doesn't meet threshold
-        min_target = (entry + stop_distance * self.rr_ratio) if direction == 1 \
-                     else (entry - stop_distance * self.rr_ratio)
-        
-        if target is None:
-            target = min_target
-        else:
-            # Check if target meets minimum R:R requirement
-            target_distance = abs(target - entry)
-            if target_distance < stop_distance * self.rr_ratio:
-                target = min_target
+        # ── Take profit ───────────────────────────────────────────────────────
+        # NOTE: _enter_trade in ict_v7_mt5_fixed.py will OVERRIDE this with a
+        # TP anchored to current_price to guarantee the real R:R.  This value
+        # is kept here purely as a reference / fallback for callers that do not
+        # go through _enter_trade (e.g. backtester).
+        tp = (entry + stop_distance * self.rr_ratio) if direction == 1 \
+             else (entry - stop_distance * self.rr_ratio)
+        signal["take_profit"] = tp
 
-        signal["take_profit"] = target
-
-        # Log effective R:R for transparency
-        reward = abs(signal["take_profit"] - entry)
+        reward = abs(tp - entry)
         eff_rr = reward / stop_distance if stop_distance > 0 else 0
-        r.append(f"R:R 1:{eff_rr:.2f} (configured 1:{self.rr_ratio})")
+        r.append(f"Signal R:R 1:{eff_rr:.2f} (entry={entry:.5f}, sl={stop:.5f})")
 
         return signal

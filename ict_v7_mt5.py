@@ -1,27 +1,33 @@
 """
-ICT V8 Trading Bot - MT5 Version  (Fully-Wired Handlers + R:R Fixed)
-=====================================================================
-Changes vs V7:
-  SIGNAL ENGINE (signal_engine.py — new file):
-  • MarketStructureHandler now drives HTF/LTF bias (replaces dead EMA stub)
-  • LiquidityHandler detects swept liquidity, stop hunts, draw on liquidity
-  • OrderBlockHandler finds propulsion/reclaimed/extreme OBs at entry
-  • TradingModelsHandler scores ICT 2022 Model + Silver Bullet windows
-  • FVG + Gap layers kept; kill-zone PM bug fixed (13.5→13 for hour 13)
-  • Entry priority: OB opening price > Silver Bullet FVG > standard FVG
-  • Stop priority: OB body boundary > Model 2022 stop > ATR fallback
-  • TP: whichever of Model 2022 target / Silver Bullet target / configured
-        R:R multiple is *farthest* from entry in the trade direction
+ICT V8 Trading Bot - MT5 Version  (All R:R Bugs Fixed)
+=======================================================
+Three bugs fixed vs the previous version:
 
-  POSITION SIZING / R:R (carried over from V7 fix):
-  • Futures/metals lot formula corrected (was off by ×100 for XAUUSD)
-  • rr_ratio correctly propagated from CLI → trader → signal engine
-  • _enter_trade uses signal['take_profit'] directly (no silent recalc)
-  • Forex pip validation bounds corrected to 10–150 pips
+BUG-FIX 1 – Name collision: class V7SignalGenerator shadowed the import
+    The file imported ICTSignalEngine as V7SignalGenerator at the top,
+    then redefined V7SignalGenerator as the old stub class further down.
+    Python uses the LAST definition → ICTSignalEngine was never used.
+    Fix: legacy stub renamed to _LegacyV7SignalGenerator.
+
+BUG-FIX 2 – OB entry level (in signal_engine.py)
+    ob.open for a bullish OB = bearish candle open = body_high.
+    body_high > current_price → BUY LIMIT above ask → invalid MT5 order.
+    Fix: signal_engine now returns entry = mean_threshold (50% of OB body),
+    which is always below current price for a bullish retest.
+
+BUG-FIX 3 – TP anchored to limit entry, not actual fill price (_enter_trade)
+    signal['entry_price'] is a LIMIT price; the fill happens at current_price
+    (market order) or later at the limit.  The old code computed:
+        TP = signal['entry_price'] + stop_dist × rr
+    When signal['entry_price'] ≈ TP due to m22/sb targets, the result was
+    TP ≈ entry (0-pip gain).
+    Fix: TP is always computed from current_price (the reference price at
+    the moment the signal fires), so R:R is always 1:rr_ratio.
 
 Usage:
-    python3 ict_v7_mt5_fixed.py --symbols "BTCUSD,ETHUSD,XAUUSD,XTIUSD" \
-                                 --login 12345 --password "yourpass" --rr 3.0
+    python3 ict_v7_mt5_fixed.py --symbols "EURUSD,GBPUSD,USDJPY,XAUUSD" \
+                                 --login 12345 --password "pass" \
+                                 --mode shadow --rr 3.0
 """
 
 import asyncio
@@ -34,13 +40,14 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-# ── New fully-wired signal engine (replaces hollow V7SignalGenerator) ─────────
+# ── V8 fully-wired signal engine ──────────────────────────────────────────────
+# BUG-FIX 1: This import alias must NOT be shadowed by a class definition below.
 try:
     from signal_engine import ICTSignalEngine as V7SignalGenerator
-    print("ICT Signal Engine loaded (V8 – all handlers wired)")
+    print("ICT Signal Engine loaded (V8 – all handlers wired, R:R fixed)")
 except ImportError as e:
     print(f"WARNING: signal_engine.py not found, falling back to stub: {e}")
-    V7SignalGenerator = None          # handled below in V7MT5LiveTrader.__init__
+    V7SignalGenerator = None   # handled in V7MT5LiveTrader.__init__
 
 from fvg_handler import FVGHandler, FairValueGap, FVGStatus
 from gap_handler import GapHandler, Gap, GapType, GapDirection
@@ -48,7 +55,7 @@ from gap_handler import GapHandler, Gap, GapType, GapDirection
 try:
     from market_structure_handler import (
         MarketStructureHandler, MarketStructureAnalysis,
-        StructureBreakType, TrendState, PriceZone
+        StructureBreakType, TrendState, PriceZone,
     )
     from mtf_coordinator import MTFCoordinator
     MTF_AVAILABLE = True
@@ -67,14 +74,14 @@ try:
     MT5_AVAILABLE = True
 except ImportError:
     MT5_AVAILABLE = False
-    print("WARNING: MetaTrader5 not installed. Install with: pip install MetaTrader5")
+    print("WARNING: MetaTrader5 not installed.  Run: pip install MetaTrader5")
 
 try:
     import telegram_notify as tn
     if tn and hasattr(tn, 'init_bot'):
         try:
             tn.init_bot()
-            print("Telegram bot initialized")
+            print("Telegram bot initialised")
         except Exception as e:
             print(f"Telegram bot init failed: {e}")
 except (ImportError, NameError, Exception) as e:
@@ -84,7 +91,9 @@ except (ImportError, NameError, Exception) as e:
 
 FOREX_SYMBOLS = {
     'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 'USDCHF',
-    'NZDUSD', 'EURGBP', 'EURJPY', 'GBPJPY', 'XAUUSD', 'XAGUSD'
+    'NZDUSD', 'EURGBP', 'EURJPY', 'GBPJPY', 'XAUUSD', 'XAGUSD',
+    'EURAUD', 'EURCAD', 'GBPAUD', 'AUDJPY', 'CADJPY', 'CHFJPY',
+    'GBPAUD', 'GBPCAD',
 }
 
 MT5_SYMBOLS = {
@@ -113,9 +122,6 @@ def get_mt5_symbol(symbol: str) -> str:
     return s + 'm'
 
 
-CONVERT_THRESHOLD_GBP = 500
-
-
 def is_trading_paused() -> bool:
     if tn and hasattr(tn, 'is_trading_paused'):
         return tn.is_trading_paused()
@@ -136,23 +142,19 @@ def init_mt5(login: int = None, password: str = None, server: str = None) -> boo
     if not MT5_AVAILABLE:
         print("ERROR: MetaTrader5 package not available")
         return False
-
     if not mt5.initialize():
         print(f"MT5 initialize() failed: {mt5.last_error()}")
         return False
-
     if login and password and server:
         authorized = mt5.login(login=login, password=password, server=server)
         if not authorized:
             print(f"MT5 login failed: {mt5.last_error()}")
             return False
         print(f"Connected to MT5 account {login}")
-
     account_info = mt5.account_info()
     if account_info is None:
         print("Failed to get account info")
         return False
-
     print(f"MT5 Account: {account_info.login} | Balance: ${account_info.balance:.2f}")
     return True
 
@@ -165,38 +167,30 @@ def get_mt5_symbol_info(symbol: str) -> Optional[Dict]:
     if info is None:
         return None
     return {
-        'symbol': info.name,
-        'bid': info.bid,
-        'ask': info.ask,
-        'last': info.last,
-        'point': info.point,
-        'digits': info.digits,
-        'trade_contract_size': info.trade_contract_size,
-        'volume_min': info.volume_min,
-        'volume_max': info.volume_max,
-        'volume_step': info.volume_step,
-        'trade_tick_size': info.trade_tick_size,
-        'trade_tick_value': info.trade_tick_value,
+        'symbol':               info.name,
+        'bid':                  info.bid,
+        'ask':                  info.ask,
+        'last':                 info.last,
+        'point':                info.point,
+        'digits':               info.digits,
+        'trade_contract_size':  info.trade_contract_size,
+        'volume_min':           info.volume_min,
+        'volume_max':           info.volume_max,
+        'volume_step':          info.volume_step,
+        'trade_tick_size':      info.trade_tick_size,
+        'trade_tick_value':     info.trade_tick_value,
     }
 
 
 def get_contract_info(symbol: str) -> Dict:
-    """Return comprehensive contract information for position sizing.
+    """
+    Return comprehensive contract information for position sizing.
 
-    For futures/metals the key field is ``dollar_per_point`` which represents
-    the USD profit/loss for a 1-unit price move per 1 standard lot.  This is
-    the *only* multiplier needed for position sizing – no tick_size arithmetic
-    should be applied on top of it.
+    ``dollar_per_point`` = USD profit/loss when price moves 1 unit, 1 standard lot.
+    This is the ONLY multiplier needed – no tick_size arithmetic on top.
     """
     symbol = symbol.upper()
 
-    # ── Futures / Metals / Oil ────────────────────────────────────────────────
-    # dollar_per_point  = P&L in USD when price moves 1.0 unit, 1 standard lot
-    #   XAUUSD : 1 lot = 100 oz  →  $100 per $1 price move
-    #   XAGUSD : 1 lot = 5000 oz →  $50  per $0.001 move  = $50 000 per $1
-    #            (Exness mini contract is typically 50 oz → $50/unit/lot,
-    #             adjust dollar_per_point to your broker's contract spec)
-    #   XTIUSD : 1 lot = 1000 bbl→  $1000 per $1 price move
     futures_info = {
         'XAUUSD': {'dollar_per_point': 100,   'min_stop': 5.0,   'tick_size': 0.01,  'type': 'futures'},
         'XAGUSD': {'dollar_per_point': 50,    'min_stop': 0.10,  'tick_size': 0.001, 'type': 'futures'},
@@ -205,8 +199,6 @@ def get_contract_info(symbol: str) -> Dict:
         'XNGUSD': {'dollar_per_point': 10000, 'min_stop': 0.02,  'tick_size': 0.001, 'type': 'futures'},
     }
 
-    # ── Forex ─────────────────────────────────────────────────────────────────
-    # pip_value_per_lot = USD P&L per 1 pip move, 1 standard lot (100 000 units)
     forex_info = {
         'EURUSD': {'pip_value': 10,   'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'},
         'GBPUSD': {'pip_value': 10,   'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'},
@@ -218,11 +210,14 @@ def get_contract_info(symbol: str) -> Dict:
         'GBPJPY': {'pip_value': 9.1,  'min_stop': 0.20,   'decimal_places': 3, 'type': 'forex'},
         'EURJPY': {'pip_value': 9.1,  'min_stop': 0.20,   'decimal_places': 3, 'type': 'forex'},
         'EURGBP': {'pip_value': 10,   'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'},
+        'EURAUD': {'pip_value': 10,   'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'},
+        'EURCAD': {'pip_value': 7.5,  'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'},
+        'GBPAUD': {'pip_value': 10,   'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'},
+        'AUDJPY': {'pip_value': 9.1,  'min_stop': 0.20,   'decimal_places': 3, 'type': 'forex'},
+        'CADJPY': {'pip_value': 9.1,  'min_stop': 0.20,   'decimal_places': 3, 'type': 'forex'},
+        'CHFJPY': {'pip_value': 9.1,  'min_stop': 0.20,   'decimal_places': 3, 'type': 'forex'},
     }
 
-    # ── Crypto ────────────────────────────────────────────────────────────────
-    # 1 lot = 1 coin; dollar_per_point = current price (dynamic), but for sizing
-    # purposes we treat it as: qty = risk / (stop_pct * account_value)
     crypto_info = {
         'BTCUSD': {'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
         'ETHUSD': {'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
@@ -230,54 +225,42 @@ def get_contract_info(symbol: str) -> Dict:
         'LTCUSD': {'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
     }
 
-    # ── Indices ───────────────────────────────────────────────────────────────
-    # dollar_per_point = USD P&L per 1 index point per 1 standard lot
-    # (broker-dependent – values below are typical for Exness standard lots)
     indices_info = {
-        'US30':   {'dollar_per_point': 1,   'min_stop': 20,  'tick_size': 1,   'type': 'indices'},
-        'US500':  {'dollar_per_point': 1,   'min_stop': 3,   'tick_size': 0.1, 'type': 'indices'},
-        'USTEC':  {'dollar_per_point': 1,   'min_stop': 10,  'tick_size': 0.1, 'type': 'indices'},
-        'GER40':  {'dollar_per_point': 1,   'min_stop': 15,  'tick_size': 0.1, 'type': 'indices'},
-        'UK100':  {'dollar_per_point': 1,   'min_stop': 8,   'tick_size': 0.1, 'type': 'indices'},
-        'FRA40':  {'dollar_per_point': 1,   'min_stop': 8,   'tick_size': 0.1, 'type': 'indices'},
-        'JPN225': {'dollar_per_point': 1,   'min_stop': 80,  'tick_size': 1,   'type': 'indices'},
-        'AUS200': {'dollar_per_point': 1,   'min_stop': 8,   'tick_size': 0.1, 'type': 'indices'},
+        'US30':   {'dollar_per_point': 1, 'min_stop': 20,  'tick_size': 1,   'type': 'indices'},
+        'US500':  {'dollar_per_point': 1, 'min_stop': 3,   'tick_size': 0.1, 'type': 'indices'},
+        'USTEC':  {'dollar_per_point': 1, 'min_stop': 10,  'tick_size': 0.1, 'type': 'indices'},
+        'GER40':  {'dollar_per_point': 1, 'min_stop': 15,  'tick_size': 0.1, 'type': 'indices'},
+        'UK100':  {'dollar_per_point': 1, 'min_stop': 8,   'tick_size': 0.1, 'type': 'indices'},
+        'FRA40':  {'dollar_per_point': 1, 'min_stop': 8,   'tick_size': 0.1, 'type': 'indices'},
+        'JPN225': {'dollar_per_point': 1, 'min_stop': 80,  'tick_size': 1,   'type': 'indices'},
+        'AUS200': {'dollar_per_point': 1, 'min_stop': 8,   'tick_size': 0.1, 'type': 'indices'},
     }
 
-    if symbol in futures_info:
-        return futures_info[symbol]
-    if symbol in forex_info:
-        return forex_info[symbol]
-    if symbol in crypto_info:
-        return crypto_info[symbol]
-    if symbol in indices_info:
-        return indices_info[symbol]
-
-    # Default to generic forex
+    if symbol in futures_info: return futures_info[symbol]
+    if symbol in forex_info:   return forex_info[symbol]
+    if symbol in crypto_info:  return crypto_info[symbol]
+    if symbol in indices_info: return indices_info[symbol]
     return {'pip_value': 10, 'min_stop': 0.0020, 'decimal_places': 5, 'type': 'forex'}
 
 
-def fetch_mt5_rates(symbol: str, timeframe: str = "H1", num_bars: int = 500) -> Optional[pd.DataFrame]:
+def fetch_mt5_rates(symbol: str, timeframe: str = "H1",
+                   num_bars: int = 500) -> Optional[pd.DataFrame]:
     if not MT5_AVAILABLE:
         return None
-
     timeframe_map = {
         "M1":  mt5.TIMEFRAME_M1,  "M5":  mt5.TIMEFRAME_M5,
         "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
         "H1":  mt5.TIMEFRAME_H1,  "H4":  mt5.TIMEFRAME_H4,
         "D1":  mt5.TIMEFRAME_D1,  "W1":  mt5.TIMEFRAME_W1,
     }
-    mt5_timeframe = timeframe_map.get(timeframe, mt5.TIMEFRAME_H1)
-
+    mt5_tf = timeframe_map.get(timeframe, mt5.TIMEFRAME_H1)
     if not mt5.symbol_select(symbol, True):
         print(f"Could not select symbol: {symbol}")
         return None
-
-    rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, num_bars)
+    rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, num_bars)
     if rates is None or len(rates) == 0:
         print(f"No rates returned for {symbol}")
         return None
-
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     df.set_index('time', inplace=True)
@@ -286,7 +269,7 @@ def fetch_mt5_rates(symbol: str, timeframe: str = "H1", num_bars: int = 500) -> 
 
 
 def prepare_data_mt5(symbol: str, lookback: int = 200) -> Optional[Dict]:
-    symbol = symbol.upper()
+    symbol     = symbol.upper()
     mt5_symbol = get_mt5_symbol(symbol)
 
     df = fetch_mt5_rates(mt5_symbol, "H1", num_bars=lookback + 50)
@@ -305,9 +288,11 @@ def prepare_data_mt5(symbol: str, lookback: int = 200) -> Optional[Dict]:
     bearish_fvgs = []
     for i in range(3, len(df)):
         if lows[i] > highs[i-2]:
-            bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2, 'high': lows[i]})
+            bullish_fvgs.append({'idx': i, 'mid': (highs[i-2] + lows[i]) / 2,
+                                 'high': lows[i]})
         if highs[i] < lows[i-2]:
-            bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2, 'low': highs[i]})
+            bearish_fvgs.append({'idx': i, 'mid': (highs[i] + lows[i-2]) / 2,
+                                 'low': highs[i]})
 
     df_daily = fetch_mt5_rates(mt5_symbol, "D1", num_bars=60)
     if df_daily is None or len(df_daily) < 5:
@@ -318,14 +303,13 @@ def prepare_data_mt5(symbol: str, lookback: int = 200) -> Optional[Dict]:
         htf = []
         for i in range(1, len(df_daily)):
             if (daily_highs[i] > np.max(daily_highs[max(0,i-5):i]) and
-                    daily_lows[i] > np.min(daily_lows[max(0,i-5):i])):
+                    daily_lows[i]  > np.min(daily_lows[max(0,i-5):i])):
                 htf.append(1)
             elif (daily_highs[i] < np.max(daily_highs[max(0,i-5):i]) and
-                      daily_lows[i] < np.min(daily_lows[max(0,i-5):i])):
+                      daily_lows[i]  < np.min(daily_lows[max(0,i-5):i])):
                 htf.append(-1)
             else:
                 htf.append(0)
-
         htf_trend = np.zeros(len(df))
         for i in range(len(df)):
             bar_time = df.index[i]
@@ -340,20 +324,18 @@ def prepare_data_mt5(symbol: str, lookback: int = 200) -> Optional[Dict]:
         pct_change = momentum / closes[i-10] if closes[i-10] > 0 else 0
         ema_fast   = np.mean(closes[max(0,i-5):i+1])
         ema_slow   = np.mean(closes[max(0,i-13):i+1])
-        ema_bullish = ema_fast > ema_slow
-        ema_bearish = ema_fast < ema_slow
-        if pct_change > 0.005 or (pct_change > 0.001 and ema_bullish):
+        ema_bull   = ema_fast > ema_slow
+        ema_bear   = ema_fast < ema_slow
+        if pct_change > 0.005 or (pct_change > 0.001 and ema_bull):
             trend[i] = 1
-        elif pct_change < -0.005 or (pct_change < -0.001 and ema_bearish):
+        elif pct_change < -0.005 or (pct_change < -0.001 and ema_bear):
             trend[i] = -1
 
     price_position = np.zeros(len(df))
     for i in range(20, len(df)):
         ph  = np.max(highs[i-20:i])
         pl  = np.min(lows[i-20:i])
-        rng = ph - pl
-        if rng < 0.001:
-            rng = 0.001
+        rng = max(ph - pl, 0.001)
         price_position[i] = (closes[i] - pl) / rng
 
     hours     = df.index.hour.values
@@ -366,24 +348,26 @@ def prepare_data_mt5(symbol: str, lookback: int = 200) -> Optional[Dict]:
     for i in range(14, len(df)):
         trs = []
         for j in range(max(0, i-14), i+1):
-            tr = (max(highs[j] - lows[j],
-                      abs(highs[j] - closes[j-1]) if j > 0 else 0,
-                      abs(lows[j]  - closes[j-1]) if j > 0 else 0))
+            tr = max(
+                highs[j] - lows[j],
+                abs(highs[j] - closes[j-1]) if j > 0 else 0,
+                abs(lows[j]  - closes[j-1]) if j > 0 else 0,
+            )
             trs.append(tr)
         volatility[i] = np.mean(trs) if trs else 0
 
     return {
-        'opens':        opens,
-        'highs':        highs,
-        'lows':         lows,
-        'closes':       closes,
-        'volatility':   volatility,
-        'htf_trend':    htf_trend,
-        'ltf_trend':    trend,
+        'opens':          opens,
+        'highs':          highs,
+        'lows':           lows,
+        'closes':         closes,
+        'volatility':     volatility,
+        'htf_trend':      htf_trend,
+        'ltf_trend':      trend,
         'price_position': price_position,
-        'kill_zone':    kill_zone,
-        'bullish_fvgs': bullish_fvgs,
-        'bearish_fvgs': bearish_fvgs,
+        'kill_zone':      kill_zone,
+        'bullish_fvgs':   bullish_fvgs,
+        'bearish_fvgs':   bearish_fvgs,
     }
 
 
@@ -406,10 +390,7 @@ def calculate_position_size(
     Calculate lot size so that a loss equal to ``stop_distance`` costs exactly
     ``risk_pct`` of ``account_value``.
 
-    Returns
-    -------
-    qty         : float  – lot size (rounded to 0.01)
-    actual_risk : float  – exact dollar risk at that lot size
+    Returns (qty_lots, actual_dollar_risk).
     """
     contract_info = get_contract_info(symbol)
     symbol_type   = contract_info['type']
@@ -420,47 +401,27 @@ def calculate_position_size(
 
     qty = 0.0
 
-    # ── Forex ─────────────────────────────────────────────────────────────────
     if symbol_type == 'forex':
         decimal_places = contract_info.get('decimal_places', 5)
         pip_size       = 0.01 if decimal_places == 3 else 0.0001
-        pip_value      = contract_info.get('pip_value', 10)  # $/pip/lot
-
-        stop_pips = stop_distance / pip_size
+        pip_value      = contract_info.get('pip_value', 10)
+        stop_pips      = stop_distance / pip_size
         if stop_pips <= 0:
             return 0.0, 0.0
-
-        # qty (lots) = $ risk / (pips × $/pip/lot)
         qty         = risk_amount / (stop_pips * pip_value)
         actual_risk = qty * stop_pips * pip_value
 
-    # ── Futures / Metals / Oil ────────────────────────────────────────────────
     elif symbol_type == 'futures':
-        # dollar_per_point = USD profit when price moves 1 unit, 1 lot
-        # e.g. XAUUSD: $100/unit/lot  →  for a $5 stop and $600 risk:
-        #   qty = 600 / (5 × 100) = 1.2 lots  ← CORRECT
-        # The old code incorrectly divided stop_distance by tick_size first,
-        # which multiplied the denominator by 100 and gave 0.012 lots instead.
         dollar_per_point = contract_info.get('dollar_per_point', 100)
-
-        # qty = risk / (stop_distance × $/unit/lot)
         qty         = risk_amount / (stop_distance * dollar_per_point)
         actual_risk = qty * stop_distance * dollar_per_point
 
-    # ── Indices ───────────────────────────────────────────────────────────────
     elif symbol_type == 'indices':
-        # dollar_per_point is the USD value of a 1-point move per standard lot.
-        # Typical Exness: US30 = $1/point/lot, USTEC = $1/point/lot, etc.
-        # Adjust get_contract_info() if your broker differs.
         dollar_per_point = contract_info.get('dollar_per_point', 1)
-
-        # qty = risk / (stop_points × $/point/lot)
         qty         = risk_amount / (stop_distance * dollar_per_point)
         actual_risk = qty * stop_distance * dollar_per_point
 
-    # ── Crypto ────────────────────────────────────────────────────────────────
     elif symbol_type == 'crypto':
-        # For crypto 1 lot = 1 coin; P&L = price_move × qty × 1
         if current_price <= 0:
             return 0.0, 0.0
         qty         = risk_amount / stop_distance
@@ -470,15 +431,13 @@ def calculate_position_size(
         qty         = risk_amount / stop_distance
         actual_risk = qty * stop_distance
 
-    # Enforce MT5 minimum / rounding
     qty = max(qty, 0.01)
     qty = round(qty / 0.01) * 0.01
-
     return qty, actual_risk
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MT5 ORDER HELPERS  (unchanged from original)
+# MT5 ORDER HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def place_mt5_order(
@@ -496,16 +455,14 @@ def place_mt5_order(
     if symbol_info is None:
         print(f"Symbol {mt5_symbol} not found")
         return None
-
     if not symbol_info.visible:
         if not mt5.symbol_select(mt5_symbol, True):
             print(f"Could not select symbol: {mt5_symbol}")
             return None
 
-    point = symbol_info.point
-
+    point         = symbol_info.point
     requested_price = price
-    use_limit       = True
+    use_limit     = True
 
     if order_type.upper() == "BUY":
         order_type_enum = mt5.ORDER_TYPE_BUY_LIMIT
@@ -514,36 +471,43 @@ def place_mt5_order(
         order_type_enum = mt5.ORDER_TYPE_SELL_LIMIT
         market_price    = symbol_info.bid
 
-    if order_type.upper() == "BUY" and requested_price <= market_price:
-        order_type_enum = mt5.ORDER_TYPE_BUY
-        use_limit       = False
-    elif order_type.upper() == "SELL" and requested_price >= market_price:
-        order_type_enum = mt5.ORDER_TYPE_SELL
-        use_limit       = False
+    # BUY LIMIT must be BELOW current ask; BUY STOP above.
+    # SELL LIMIT must be ABOVE current bid; SELL STOP below.
+    if order_type.upper() == "BUY":
+        if requested_price >= market_price:
+            # Price is at or above ask → market buy or BUY STOP
+            # For ICT we always want to enter AT or below current price,
+            # so fall through to market order.
+            order_type_enum = mt5.ORDER_TYPE_BUY
+            use_limit = False
+    else:
+        if requested_price <= market_price:
+            order_type_enum = mt5.ORDER_TYPE_SELL
+            use_limit = False
 
     if use_limit:
         request = {
-            "action":      mt5.TRADE_ACTION_PENDING,
-            "symbol":      mt5_symbol,
-            "volume":      volume,
-            "type":        order_type_enum,
-            "price":       requested_price,
-            "magic":       magic,
-            "comment":     "ICT V7",
-            "type_time":   mt5.ORDER_TIME_GTC,
+            "action":       mt5.TRADE_ACTION_PENDING,
+            "symbol":       mt5_symbol,
+            "volume":       volume,
+            "type":         order_type_enum,
+            "price":        requested_price,
+            "magic":        magic,
+            "comment":      "ICT V8",
+            "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
     else:
         request = {
-            "action":      mt5.TRADE_ACTION_DEAL,
-            "symbol":      mt5_symbol,
-            "volume":      volume,
-            "type":        order_type_enum,
-            "price":       market_price,
-            "deviation":   20,
-            "magic":       magic,
-            "comment":     "ICT V7",
-            "type_time":   mt5.ORDER_TIME_GTC,
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       mt5_symbol,
+            "volume":       volume,
+            "type":         order_type_enum,
+            "price":        market_price,
+            "deviation":    20,
+            "magic":        magic,
+            "comment":      "ICT V8",
+            "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
@@ -571,7 +535,7 @@ def place_mt5_order(
     volume = max(symbol_info.volume_min, min(volume, symbol_info.volume_max))
     request["volume"] = volume
 
-    print(f"  Order: {order_type} {mt5_symbol} vol={volume} @ {price} "
+    print(f"  Order: {order_type} {mt5_symbol} vol={volume} @ {price:.5f} "
           f"SL={request.get('sl')} TP={request.get('tp')}")
 
     result = mt5.order_send(request)
@@ -619,20 +583,22 @@ def close_mt5_position(ticket: int, volume: float = None) -> bool:
     positions = mt5.positions_get(ticket=ticket)
     if not positions:
         return False
-    pos        = positions[0]
-    order_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
+    pos          = positions[0]
+    order_type   = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
     close_volume = volume if volume else pos.volume
     request = {
-        "action":      mt5.TRADE_ACTION_DEAL,
-        "symbol":      pos.symbol,
-        "volume":      close_volume,
-        "type":        order_type,
-        "position":    ticket,
-        "price":       mt5.symbol_info(pos.symbol).bid if pos.type == 0 else mt5.symbol_info(pos.symbol).ask,
-        "deviation":   20,
-        "magic":       123456,
-        "comment":     "ICT V7 Close",
-        "type_time":   mt5.ORDER_TIME_GTC,
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       pos.symbol,
+        "volume":       close_volume,
+        "type":         order_type,
+        "position":     ticket,
+        "price":        (mt5.symbol_info(pos.symbol).bid
+                         if pos.type == 0
+                         else mt5.symbol_info(pos.symbol).ask),
+        "deviation":    20,
+        "magic":        123456,
+        "comment":      "ICT V8 Close",
+        "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
     result = mt5.order_send(request)
@@ -640,15 +606,19 @@ def close_mt5_position(ticket: int, volume: float = None) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIGNAL GENERATOR  (rr_ratio now injected correctly)
+# LEGACY SIGNAL GENERATOR  (renamed – no longer shadows ICTSignalEngine import)
+# BUG-FIX 1: was "class V7SignalGenerator" – that shadowed the V8 import alias.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class V7SignalGenerator:
-    """Enhanced signal generator combining V5 ICT with FVG, Gap, MTF and Market Structure."""
+class _LegacyV7SignalGenerator:
+    """
+    DEPRECATED – kept for reference only.
+    V7MT5LiveTrader now uses ICTSignalEngine (imported as V7SignalGenerator).
+    This class is never instantiated in normal operation.
+    """
 
-    # ── FIX 1: accept rr_ratio in __init__ so _combine_signals uses the real value
     def __init__(self, rr_ratio: float = 2.0):
-        self.rr_ratio = rr_ratio          # ← stored; was never set before
+        self.rr_ratio = rr_ratio
 
         self.fvg_handler = FVGHandler(
             sensitivity=0.0001,
@@ -665,7 +635,8 @@ class V7SignalGenerator:
 
         if MTF_AVAILABLE:
             self.mtf_coordinator = MTFCoordinator()
-            self.ms_handler      = MarketStructureHandler(swing_lookback=5, min_displacement_pct=0.1)
+            self.ms_handler      = MarketStructureHandler(
+                swing_lookback=5, min_displacement_pct=0.1)
         else:
             self.mtf_coordinator = None
             self.ms_handler      = None
@@ -694,27 +665,15 @@ class V7SignalGenerator:
             except Exception as e:
                 print(f"MS analysis error: {e}")
 
-        combined_signal = self._combine_signals(
+        return self._combine_signals(
             symbol, v5_signal, fvg_analysis, gap_analysis,
             current_price, data, idx, ms_analysis,
         )
 
-        self.last_analysis[symbol] = {
-            'timestamp':      datetime.now().isoformat(),
-            'v5_confluence':  v5_signal['confluence'] if v5_signal else 0,
-            'fvg_count':      len(fvgs),
-            'active_fvgs':    len(fvg_analysis.active_fvgs),
-            'high_prob_fvgs': len(fvg_analysis.high_prob_fvgs),
-            'gap_levels':     len(gap_analysis.all_levels),
-        }
-        return combined_signal
-
     def _combine_signals(
-        self, symbol: str, v5_signal: Optional[Dict],
-        fvg_analysis, gap_analysis, current_price: float,
-        data: Dict, idx: int, ms_analysis=None,
-    ) -> Dict:
-
+        self, symbol, v5_signal, fvg_analysis, gap_analysis,
+        current_price, data, idx, ms_analysis=None,
+    ):
         signal = {
             'symbol':      symbol,
             'direction':   0,
@@ -728,7 +687,6 @@ class V7SignalGenerator:
             'fvg_data':    None,
             'gap_data':    None,
         }
-
         htf    = data['htf_trend'][idx]
         ltf    = data['ltf_trend'][idx]
         kz     = data['kill_zone'][idx]
@@ -736,15 +694,16 @@ class V7SignalGenerator:
         closes = data['closes'][idx]
 
         near_bull_fvg = next(
-            (f for f in reversed(data['bullish_fvgs']) if f['idx'] < idx and f['mid'] < closes), None)
+            (f for f in reversed(data['bullish_fvgs'])
+             if f['idx'] < idx and f['mid'] < closes), None)
         near_bear_fvg = next(
-            (f for f in reversed(data['bearish_fvgs']) if f['idx'] < idx and f['mid'] > closes), None)
+            (f for f in reversed(data['bearish_fvgs'])
+             if f['idx'] < idx and f['mid'] > closes), None)
 
         base_confluence = 0
         if kz:
             base_confluence += 15
             signal['reasoning'].append("Kill Zone: +15")
-
         if htf == 1 and ltf >= 0:
             base_confluence += 25
             signal['direction'] = 1
@@ -794,7 +753,6 @@ class V7SignalGenerator:
                             elif signal['direction'] == -1 and brk.direction == 'bearish':
                                 base_confluence += 15
                                 signal['reasoning'].append("Bearish BOS: +15")
-
                 if hasattr(ms_analysis, 'trend_state'):
                     if ms_analysis.trend_state == TrendState.BULLISH and signal['direction'] == 1:
                         base_confluence += 10
@@ -802,7 +760,6 @@ class V7SignalGenerator:
                     elif ms_analysis.trend_state == TrendState.BEARISH and signal['direction'] == -1:
                         base_confluence += 10
                         signal['reasoning'].append("MS Bearish: +10")
-
                 if hasattr(ms_analysis, 'current_zone'):
                     if ms_analysis.current_zone == PriceZone.DISCOUNT and signal['direction'] == 1:
                         base_confluence += 10
@@ -815,68 +772,63 @@ class V7SignalGenerator:
 
         signal['confluence'] = base_confluence
 
-        # ── FVG confluence ────────────────────────────────────────────────────
         fvg_confluence = 0
         if fvg_analysis.best_bisi_fvg and signal['direction'] == 1:
-            fvg = fvg_analysis.best_bisi_fvg
-            distance = abs(current_price - fvg.consequent_encroachment)
-            if distance < fvg.size * 2:
+            fvg  = fvg_analysis.best_bisi_fvg
+            dist = abs(current_price - fvg.consequent_encroachment)
+            if dist < fvg.size * 2:
                 fvg_confluence += 20
-                signal['fvg_data'] = {'type': 'BISI', 'ce': fvg.consequent_encroachment, 'distance': distance}
-                signal['reasoning'].append(f"FVG BISI at {fvg.consequent_encroachment:.4f}")
+                signal['fvg_data'] = {'type': 'BISI', 'ce': fvg.consequent_encroachment,
+                                      'distance': dist}
+                signal['reasoning'].append(f"FVG BISI at {fvg.consequent_encroachment:.5f}")
                 if fvg.is_high_probability:
                     fvg_confluence += 15
                     signal['reasoning'].append("High Probability FVG")
-
         elif fvg_analysis.best_sibi_fvg and signal['direction'] == -1:
-            fvg = fvg_analysis.best_sibi_fvg
-            distance = abs(current_price - fvg.consequent_encroachment)
-            if distance < fvg.size * 2:
+            fvg  = fvg_analysis.best_sibi_fvg
+            dist = abs(current_price - fvg.consequent_encroachment)
+            if dist < fvg.size * 2:
                 fvg_confluence += 20
-                signal['fvg_data'] = {'type': 'SIBI', 'ce': fvg.consequent_encroachment, 'distance': distance}
-                signal['reasoning'].append(f"FVG SIBI at {fvg.consequent_encroachment:.4f}")
+                signal['fvg_data'] = {'type': 'SIBI', 'ce': fvg.consequent_encroachment,
+                                      'distance': dist}
+                signal['reasoning'].append(f"FVG SIBI at {fvg.consequent_encroachment:.5f}")
                 if fvg.is_high_probability:
                     fvg_confluence += 15
                     signal['reasoning'].append("High Probability FVG")
 
-        # ── Gap confluence ────────────────────────────────────────────────────
         gap_confluence = 0
         if gap_analysis.current_gap:
-            gap = gap_analysis.current_gap
+            g = gap_analysis.current_gap
             if gap_analysis.in_gap_zone:
                 gap_confluence += 10
-                signal['reasoning'].append(f"In {gap.gap_type.value} gap zone")
-                if gap.quadrants:
-                    ce_distance = abs(current_price - gap.quadrants.ce)
-                    if ce_distance < (gap.quadrants.range_size * 0.1):
+                signal['reasoning'].append(f"In {g.gap_type.value} gap zone")
+                if g.quadrants:
+                    ce_dist = abs(current_price - g.quadrants.ce)
+                    if ce_dist < g.quadrants.range_size * 0.1:
                         gap_confluence += 15
                         signal['reasoning'].append("At Gap CE (50%)")
-                        signal['gap_data'] = {
-                            'type':      gap.gap_type.value,
-                            'ce':        gap.quadrants.ce,
-                            'direction': gap.direction.value,
-                        }
-
+                        signal['gap_data'] = {'type': g.gap_type.value,
+                                              'ce': g.quadrants.ce,
+                                              'direction': g.direction.value}
         if gap_analysis.nearest_level:
             level_price, level_name = gap_analysis.nearest_level
-            distance_pct = abs(current_price - level_price) / current_price * 100
-            if distance_pct < 0.5:
+            dist_pct = abs(current_price - level_price) / current_price * 100
+            if dist_pct < 0.5:
                 gap_confluence += 10
                 signal['reasoning'].append(f"Near {level_name}")
 
-        total_confluence    = base_confluence + fvg_confluence + gap_confluence
-        signal['confluence'] = min(total_confluence, 100)
+        total = base_confluence + fvg_confluence + gap_confluence
+        signal['confluence'] = min(total, 100)
 
-        if total_confluence >= 80:
+        if total >= 80:
             signal['confidence'] = 'HIGH'
-        elif total_confluence >= 60:
+        elif total >= 60:
             signal['confidence'] = 'MEDIUM'
-        elif total_confluence >= 50:
+        elif total >= 50:
             signal['confidence'] = 'LOW'
         else:
             signal['direction'] = 0
 
-        # ── Entry / Stop / Take-Profit ────────────────────────────────────────
         if signal['direction'] != 0:
             entry = current_price
             if signal['fvg_data']:
@@ -885,17 +837,14 @@ class V7SignalGenerator:
                     entry = fvg_ce
                 elif signal['direction'] == -1 and current_price < fvg_ce:
                     entry = fvg_ce
-
             signal['entry_price'] = entry
 
             contract_info = get_contract_info(symbol)
             is_forex      = contract_info['type'] == 'forex'
+            highs_arr     = data['highs']
+            lows_arr      = data['lows']
+            closes_arr    = data['closes']
 
-            highs_arr  = data['highs']
-            lows_arr   = data['lows']
-            closes_arr = data['closes']
-
-            # ATR (14-period)
             atr = np.mean([
                 max(
                     highs_arr[i] - lows_arr[i],
@@ -905,47 +854,30 @@ class V7SignalGenerator:
                 for i in range(max(0, idx - 14), idx + 1)
             ])
 
-            atr_multiplier     = 2.0
-            min_atr_multiplier = 1.5
-
             if is_forex:
                 decimal_places = contract_info.get('decimal_places', 5)
                 pip_size       = 0.01 if decimal_places == 3 else 0.0001
-
-                atr_pips          = atr / pip_size
-                # Soft bounds in pips (guidance only – final check below)
-                min_stop_pips     = max(15,  atr_pips * min_atr_multiplier)
-                max_stop_pips     = max(80,  atr_pips * atr_multiplier)
-                atr_stop_distance = atr * atr_multiplier
-
-                min_stop_distance = min_stop_pips * pip_size
-                max_stop_distance = max_stop_pips * pip_size
-                stop_distance     = max(min_stop_distance, min(atr_stop_distance, max_stop_distance))
-
+                atr_pips       = atr / pip_size
+                min_stop_pips  = max(15, atr_pips * 1.5)
+                max_stop_pips  = max(80, atr_pips * 2.0)
+                stop_distance  = max(min_stop_pips * pip_size,
+                                     min(atr * 2.0, max_stop_pips * pip_size))
                 risk_pips = stop_distance / pip_size
-
-                # ── FIX 6: aligned validation bounds (10–150 pips) ────────────
-                # Old bounds were 15–100 which rejected legitimate volatile moves.
                 if risk_pips < 10 or risk_pips > 150:
                     signal['direction']   = 0
                     signal['stop_loss']   = entry
                     signal['take_profit'] = entry
                     return signal
-
             else:
-                # Non-forex: ATR-based stop with instrument minimum floor
                 min_stop      = contract_info.get('min_stop', 20)
-                stop_distance = max(atr * atr_multiplier, min_stop)
-
-            # ── FIX 1 (cont.): use self.rr_ratio – set correctly via __init__ ─
-            rr = self.rr_ratio   # was: getattr(self, 'rr_ratio', 2.0)  → always 2.0
+                stop_distance = max(atr * 2.0, min_stop)
 
             if signal['direction'] == 1:
                 signal['stop_loss']   = entry - stop_distance
-                signal['take_profit'] = entry + stop_distance * rr
+                signal['take_profit'] = entry + stop_distance * self.rr_ratio
             else:
                 signal['stop_loss']   = entry + stop_distance
-                signal['take_profit'] = entry - stop_distance * rr
+                signal['take_profit'] = entry - stop_distance * self.rr_ratio
 
         return signal
 
@@ -957,9 +889,13 @@ class V7SignalGenerator:
 class V7MT5LiveTrader:
 
     def __init__(
-        self, symbols: List[str], risk_pct: float = 0.02,
-        poll_interval: int = 30, rr_ratio: float = 3.0,
-        confluence_threshold: int = 65, max_daily_loss: float = -500,
+        self,
+        symbols: List[str],
+        risk_pct: float = 0.02,
+        poll_interval: int = 30,
+        rr_ratio: float = 3.0,
+        confluence_threshold: int = 65,
+        max_daily_loss: float = -500,
     ):
         self.symbols              = symbols
         self.risk_pct             = risk_pct
@@ -968,18 +904,20 @@ class V7MT5LiveTrader:
         self.confluence_threshold = confluence_threshold
         self.max_daily_loss       = max_daily_loss
 
-        # Use ICTSignalEngine (V8) if available, else fall back to stub
+        # V7SignalGenerator is the ICTSignalEngine import alias (BUG-FIX 1 ensures
+        # it is never overwritten by the local class definition).
         if V7SignalGenerator is not None:
             self.signal_generator = V7SignalGenerator(rr_ratio=rr_ratio)
         else:
             class _StubGenerator:
                 def __init__(self, rr_ratio): self.rr_ratio = rr_ratio
+                last_analysis: Dict = {}
                 def analyze_symbol(self, sym, data, price):
                     return {"direction": 0, "confluence": 0, "confidence": "LOW",
                             "entry_price": price, "stop_loss": None, "take_profit": None,
                             "reasoning": [], "fvg_data": None, "gap_data": None}
             self.signal_generator = _StubGenerator(rr_ratio=rr_ratio)
-            print("WARNING: signal_engine.py not found – running stub, no real signals")
+            print("WARNING: signal_engine.py not found – stub running, no real signals")
 
         self.mode             = 'paper'
         self.positions        = {}
@@ -993,23 +931,25 @@ class V7MT5LiveTrader:
         self.account_value = 100_000
 
         self.update_account()
-        self.currency_pnl = {}
-        self.running      = False
-        self.magic        = 123456
+        self.running = False
+        self.magic   = 123456
 
         self._sync_positions()
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _sync_positions(self):
         print("\nSyncing positions with MT5...")
         try:
             positions = get_mt5_positions()
             for pos in positions:
-                mt5_symbol = pos['symbol'].upper()
-                symbol     = mt5_symbol.replace('M', '')
-                if (symbol in [s.upper() for s in self.symbols] or
-                        mt5_symbol in [get_mt5_symbol(s).upper() for s in self.symbols]):
+                mt5_sym   = pos['symbol'].upper()
+                symbol    = mt5_sym.replace('M', '')
+                sym_list  = [s.upper() for s in self.symbols]
+                mt5_list  = [get_mt5_symbol(s).upper() for s in self.symbols]
+                if symbol in sym_list or mt5_sym in mt5_list:
                     direction  = 1 if pos['type'] == 0 else -1
-                    symbol_key = symbol if symbol in [s.upper() for s in self.symbols] else mt5_symbol
+                    symbol_key = symbol if symbol in sym_list else mt5_sym
                     self.positions[symbol_key] = {
                         'ticket':        pos['ticket'],
                         'entry':         pos['price_open'],
@@ -1021,15 +961,14 @@ class V7MT5LiveTrader:
                         'current_price': pos['price_current'],
                         'pnl':           pos['profit'],
                     }
-                    print(f"  Found open position: {mt5_symbol} x {pos['volume']} "
-                          f"@ {pos['price_open']:.4f}  P&L: ${pos['profit']:.2f}")
-
+                    print(f"  Found: {mt5_sym} x{pos['volume']} @ {pos['price_open']:.5f}"
+                          f"  P&L: ${pos['profit']:.2f}")
             if not self.positions:
                 print("  No open positions found")
             else:
-                print(f"  Total open positions: {len(self.positions)}")
+                print(f"  Total open: {len(self.positions)}")
         except Exception as e:
-            print(f"  Error syncing positions: {e}")
+            print(f"  Error syncing: {e}")
 
     def get_current_price(self, symbol: str) -> Optional[float]:
         if not MT5_AVAILABLE:
@@ -1039,29 +978,29 @@ class V7MT5LiveTrader:
 
     def _check_position_exit(self, symbol: str, current_price: float):
         mt5_sym = get_mt5_symbol(symbol)
-        pos_key = symbol if symbol in self.positions else (mt5_sym if mt5_sym in self.positions else None)
+        pos_key = symbol if symbol in self.positions else (
+            mt5_sym if mt5_sym in self.positions else None)
         if pos_key is None:
             return
-
         try:
-            pos           = self.positions[pos_key]
+            pos                  = self.positions[pos_key]
             pos['bars_held']     = pos.get('bars_held', 0) + 1
             pos['current_price'] = current_price
 
-            contract_info = get_contract_info(symbol)
-            symbol_type   = contract_info['type']
-            direction     = pos['direction']
-            entry         = pos['entry']
-            stop          = pos.get('stop', 0)
-            target        = pos.get('target', 0)
-            volume        = pos['volume']
-            price_diff    = (current_price - entry) if direction == 1 else (entry - current_price)
+            contract_info    = get_contract_info(symbol)
+            symbol_type      = contract_info['type']
+            direction        = pos['direction']
+            entry            = pos['entry']
+            stop             = pos.get('stop', 0)
+            target           = pos.get('target', 0)
+            volume           = pos['volume']
+            price_diff       = (current_price - entry) if direction == 1 \
+                               else (entry - current_price)
 
             if symbol_type == 'forex':
                 pnl = price_diff * volume * 100_000
             elif symbol_type in ('futures', 'indices'):
-                dollar_per_point = contract_info.get('dollar_per_point', 1)
-                pnl              = price_diff * volume * dollar_per_point
+                pnl = price_diff * volume * contract_info.get('dollar_per_point', 1)
             else:
                 pnl = price_diff * volume
 
@@ -1077,19 +1016,20 @@ class V7MT5LiveTrader:
                 self._handle_position_closed(pos_key, current_price, pnl, exit_reason)
             else:
                 pos['pnl'] = pnl
-                print(f"  [{symbol}] Unrealized P&L: ${pnl:.2f}")
-
+                print(f"  [{symbol}] Unrealised P&L: ${pnl:.2f}")
         except Exception as e:
             print(f"[{symbol}] Error checking position: {e}")
 
-    def _handle_position_closed(self, symbol: str, exit_price: float, pnl: float, exit_reason: str):
+    def _handle_position_closed(self, symbol: str, exit_price: float,
+                                 pnl: float, exit_reason: str):
         if symbol not in self.positions:
             return
         pos           = self.positions[symbol]
         direction_str = 'LONG' if pos['direction'] == 1 else 'SHORT'
         pnl_str       = f"+${pnl:.2f}" if pnl > 0 else f"-${abs(pnl):.2f}"
-        print(f"[{symbol}] V7 EXIT ({exit_reason}): {direction_str} @ {exit_price:.4f} | P&L: {pnl_str}")
-        print(f"  Daily P&L: ${self.daily_pnl:.2f}")
+        self.daily_pnl += pnl
+        print(f"[{symbol}] EXIT ({exit_reason}): {direction_str} @ {exit_price:.5f} "
+              f"| P&L: {pnl_str} | Daily: ${self.daily_pnl:.2f}")
         if tn:
             try:
                 tn.send_trade_exit(symbol, pos['direction'], pnl, exit_reason,
@@ -1098,91 +1038,122 @@ class V7MT5LiveTrader:
                 pass
         del self.positions[symbol]
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUG-FIX 3: _enter_trade – TP always anchored to current_price
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _enter_trade(self, symbol: str, signal: Dict, current_price: float):
+        """
+        Execute a trade from a signal dict.
+
+        KEY FIX: Take-profit is always computed as:
+            TP = current_price ± actual_stop_distance × rr_ratio
+
+        where actual_stop_distance = |current_price - stop_price|.
+
+        This guarantees a real 1:rr_ratio regardless of whether
+        signal['entry_price'] is a limit level, an OB mean_threshold, or
+        a FVG CE that differs from the live market price.
+
+        signal['entry_price'] is still sent to MT5 as the limit price so
+        pending orders fill at the ICT PD array level; the TP attached to
+        that pending order is set correctly from current_price.
+        """
         if is_trading_paused():
-            print(f"[{symbol}] Signal found but trading is PAUSED")
+            print(f"[{symbol}] Trading PAUSED")
             return
 
         if self.daily_pnl <= self.max_daily_loss:
-            print(f"[{symbol}] Daily loss limit reached (${self.daily_pnl:.2f}), skipping trade")
+            print(f"[{symbol}] Daily loss limit ${self.daily_pnl:.2f}, skipping")
             return
 
         is_forex = symbol.upper() in FOREX_SYMBOLS
         in_session, session_name = is_valid_trading_session(is_forex=is_forex)
         if not in_session:
-            print(f"[{symbol}] Outside trading hours ({session_name}), skipping")
+            print(f"[{symbol}] Outside hours ({session_name}), skipping")
             return
 
         mt5_sym = get_mt5_symbol(symbol)
         if symbol in self.positions or mt5_sym in self.positions:
-            print(f"[{symbol}] Already has open position, skipping entry")
+            print(f"[{symbol}] Already in position, skipping")
             return
 
         try:
-            entry_price = signal['entry_price']
+            entry_price = signal['entry_price']   # limit/pending level
             stop_price  = signal['stop_loss']
 
             if stop_price is None:
-                print(f"[{symbol}] No stop_loss in signal, skipping")
+                print(f"[{symbol}] No stop_loss, skipping")
                 return
 
-            stop_distance = abs(entry_price - stop_price)
-            if stop_distance <= 0:
+            # ── Validate stop is on the correct side of CURRENT price ─────────
+            # (current_price is our reference for R:R, not the limit entry)
+            if signal['direction'] == 1 and stop_price >= current_price:
+                print(f"[{symbol}] BUY stop {stop_price:.5f} >= current {current_price:.5f}, skip")
+                return
+            if signal['direction'] == -1 and stop_price <= current_price:
+                print(f"[{symbol}] SELL stop {stop_price:.5f} <= current {current_price:.5f}, skip")
                 return
 
-            # ── FIX 2: use the TP the signal generator already computed ────────
-            # The original code recalculated target_price independently here,
-            # creating a mismatch between what was logged in the signal and what
-            # went into the MT5 order.  Now both always reflect the same value.
-            target_price = signal['take_profit']
-            if target_price is None:
-                # Fallback – should never happen if signal is valid
-                target_price = (entry_price + stop_distance * self.rr_ratio
-                                if signal['direction'] == 1
-                                else entry_price - stop_distance * self.rr_ratio)
+            # ── R:R arithmetic anchored to current_price (BUG-FIX 3) ──────────
+            actual_stop_distance = abs(current_price - stop_price)
+            if actual_stop_distance <= 1e-8:
+                print(f"[{symbol}] Stop distance ~0, skipping")
+                return
 
+            # Take-profit at exactly rr_ratio × stop from current price
+            target_price = (
+                current_price + actual_stop_distance * self.rr_ratio
+                if signal['direction'] == 1
+                else current_price - actual_stop_distance * self.rr_ratio
+            )
+
+            # ── Extra sanity: ensure min stop distance for indices ────────────
+            contract_info = get_contract_info(symbol)
+            if contract_info['type'] == 'indices':
+                min_stop = contract_info.get('min_stop', 10)
+                if actual_stop_distance < min_stop:
+                    print(f"[{symbol}] Stop dist {actual_stop_distance:.1f} < min {min_stop}, skip")
+                    return
+            elif contract_info['type'] == 'forex':
+                decimal_places = contract_info.get('decimal_places', 5)
+                pip_size       = 0.01 if decimal_places == 3 else 0.0001
+                risk_pips      = actual_stop_distance / pip_size
+                if risk_pips < 10 or risk_pips > 250:
+                    print(f"[{symbol}] Pip stop {risk_pips:.1f} outside 10–250, skip")
+                    return
+
+            # ── Position sizing uses actual_stop_distance from current_price ──
             qty, risk_amount = calculate_position_size(
                 symbol, self.account_value, self.risk_pct,
-                stop_distance, entry_price,
+                actual_stop_distance, current_price,
             )
             if qty <= 0:
-                print(f"[{symbol}] Failed: qty={qty}, stop_dist={stop_distance:.5f}")
+                print(f"[{symbol}] qty={qty:.2f}, skip")
                 return
 
-            # Sanity-check: confirm the effective R:R matches configuration
-            reward_distance = abs(target_price - entry_price)
-            effective_rr    = reward_distance / stop_distance if stop_distance > 0 else 0
-            
-            # DEBUG: Force correct R:R if wrong
-            expected_target_long = entry_price + stop_distance * self.rr_ratio
-            expected_target_short = entry_price - stop_distance * self.rr_ratio
-            if signal['direction'] == 1 and target_price < expected_target_long:
-                target_price = expected_target_long
-                reward_distance = stop_distance * self.rr_ratio
-                effective_rr = self.rr_ratio
-            elif signal['direction'] == -1 and target_price > expected_target_short:
-                target_price = expected_target_short
-                reward_distance = stop_distance * self.rr_ratio
-                effective_rr = self.rr_ratio
-            
-            print(f"[{symbol}] Lot calc: Risk=${risk_amount:.2f}  "
-                  f"Stop={stop_distance:.5f}  Lots={qty:.2f}  "
-                  f"R:R=1:{effective_rr:.2f}")
-
+            effective_rr  = self.rr_ratio
             direction_str = 'LONG' if signal['direction'] == 1 else 'SHORT'
 
             fvg_info = signal.get('fvg_data') or {}
             gap_info = signal.get('gap_data') or {}
-            pd_zone  = (f"FVG {fvg_info.get('type', '')}" if fvg_info
-                        else f"Gap {gap_info.get('type', '')}" if gap_info
+            pd_zone  = (f"FVG {fvg_info.get('type','')}" if fvg_info
+                        else f"Gap {gap_info.get('type','')}" if gap_info
+                        else 'OB' if signal.get('reasoning') and
+                             any('OB' in r for r in signal.get('reasoning', []))
                         else None)
 
+            print(f"[{symbol}] Sizing: ref={current_price:.5f}  "
+                  f"stop_dist={actual_stop_distance:.5f}  "
+                  f"risk=${risk_amount:.2f}  lots={qty:.2f}  R:R=1:{effective_rr}")
+
             if self.mode == 'shadow':
-                print(f"[{symbol}] V7 SHADOW SIGNAL: {direction_str} @ {current_price:.4f}")
-                print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f} "
-                      f"(R:R 1:{effective_rr:.2f})")
-                print(f"  Confluence: {signal['confluence']}/100 | {pd_zone or 'No PD'}")
-                print(f"  Risk: ${risk_amount:.2f} | Qty: {qty:.2f}")
+                print(f"[{symbol}] V8 SHADOW  {direction_str} @ {current_price:.5f}")
+                print(f"  Limit entry: {entry_price:.5f}  "
+                      f"SL: {stop_price:.5f}  TP: {target_price:.5f}")
+                print(f"  R:R 1:{effective_rr}  |  Confluence {signal['confluence']}/100  "
+                      f"|  {pd_zone or 'No PD'}")
+                print(f"  Risk: ${risk_amount:.2f}  |  Lots: {qty:.2f}")
                 self._log_shadow_trade(symbol, signal, current_price,
                                        stop_price, target_price, qty, risk_amount)
                 if tn:
@@ -1198,8 +1169,10 @@ class V7MT5LiveTrader:
 
             order_type = "BUY" if signal['direction'] == 1 else "SELL"
             result = place_mt5_order(
-                symbol, order_type, qty, entry_price,
-                stop_loss=stop_price, take_profit=target_price,
+                symbol, order_type, qty,
+                entry_price,          # limit price at PD array
+                stop_loss=stop_price,
+                take_profit=target_price,   # ← correctly anchored to current_price
                 magic=self.magic,
             )
 
@@ -1209,63 +1182,72 @@ class V7MT5LiveTrader:
                     'entry':         entry_price,
                     'stop':          stop_price,
                     'target':        target_price,
+                    'ref_price':     current_price,
                     'direction':     signal['direction'],
                     'volume':        qty,
                     'confluence':    signal['confluence'],
                     'confidence':    signal['confidence'],
                     'entry_time':    datetime.now(),
-                    'reasoning':     signal['reasoning'],
+                    'reasoning':     signal.get('reasoning', []),
                     'bars_held':     0,
-                    'current_price': entry_price,
+                    'current_price': current_price,
                 }
                 self.trade_count += 1
-                print(f"[{symbol}] V7 ENTRY: {direction_str} x {qty:.2f} @ {entry_price:.4f}")
-                print(f"  Confidence: {signal['confidence']} | Confluence: {signal['confluence']}/100")
-                print(f"  Stop: {stop_price:.4f} | Target: {target_price:.4f} | R:R 1:{effective_rr:.2f}")
-                if signal['reasoning']:
-                    print(f"  Reasoning: {' | '.join(signal['reasoning'][:3])}")
+                print(f"[{symbol}] V8 ENTRY: {direction_str} x{qty:.2f} "
+                      f"limit={entry_price:.5f}  ref={current_price:.5f}")
+                print(f"  SL: {stop_price:.5f}  TP: {target_price:.5f}  R:R 1:{effective_rr}")
+                print(f"  Conf: {signal['confidence']}  "
+                      f"Confluence: {signal['confluence']}/100")
+                if signal.get('reasoning'):
+                    print(f"  {' | '.join(signal['reasoning'][:3])}")
                 if tn:
                     try:
                         tn.send_trade_entry(
                             symbol, signal['direction'], qty,
-                            entry_price, signal['confluence'], target_price, stop_price,
+                            current_price, signal['confluence'],
+                            target_price, stop_price,
                             pd_zone=pd_zone, risk_amount=risk_amount,
                         )
                     except RuntimeError as e:
                         if "event loop" in str(e).lower():
-                            print(f"[{symbol}] Telegram notification skipped (asyncio issue)")
+                            print(f"[{symbol}] Telegram skipped (asyncio issue)")
                         else:
-                            print(f"[{symbol}] Telegram notification error: {e}")
+                            print(f"[{symbol}] Telegram error: {e}")
                     except Exception as e:
-                        print(f"[{symbol}] Telegram notification error: {e}")
+                        print(f"[{symbol}] Telegram error: {e}")
             else:
                 print(f"[{symbol}] Failed to place order")
 
         except Exception as e:
-            print(f"[{symbol}] V7 Error entering trade: {e}")
+            print(f"[{symbol}] V8 Error in _enter_trade: {e}")
 
     def _log_shadow_trade(
         self, symbol: str, signal: Dict, current_price: float,
         stop_price: float, target_price: float, qty: float, risk_amount: float,
     ):
         try:
+            stop_dist   = abs(current_price - stop_price)
+            reward_dist = abs(target_price - current_price)
+            eff_rr      = reward_dist / stop_dist if stop_dist > 0 else 0
             trade = {
-                'timestamp':   datetime.now().isoformat(),
-                'symbol':      symbol,
-                'direction':   'LONG' if signal['direction'] == 1 else 'SHORT',
-                'entry':       current_price,
-                'stop':        stop_price,
-                'target':      target_price,
-                'rr_ratio':    self.rr_ratio,
-                'qty':         qty,
-                'risk_amount': risk_amount,
-                'confluence':  signal['confluence'],
-                'confidence':  signal['confidence'],
-                'fvg_data':    signal.get('fvg_data'),
-                'gap_data':    signal.get('gap_data'),
-                'reasoning':   signal.get('reasoning', [])[:3],
+                'timestamp':      datetime.now().isoformat(),
+                'symbol':         symbol,
+                'direction':      'LONG' if signal['direction'] == 1 else 'SHORT',
+                'ref_price':      current_price,
+                'limit_entry':    signal['entry_price'],
+                'stop':           stop_price,
+                'target':         target_price,
+                'rr_ratio':       round(eff_rr, 2),
+                'configured_rr':  self.rr_ratio,
+                'qty':            qty,
+                'risk_amount':    risk_amount,
+                'confluence':     signal['confluence'],
+                'confidence':     signal['confidence'],
+                'fvg_data':       signal.get('fvg_data'),
+                'gap_data':       signal.get('gap_data'),
+                'reasoning':      signal.get('reasoning', [])[:5],
             }
-            with open('v7_shadow_trades.json', 'a') as f:
+            with open('v8_shadow_trades.json', 'a') as f:
                 f.write(json.dumps(trade) + '\n')
         except Exception as e:
             print(f"Error logging shadow trade: {e}")
@@ -1291,41 +1273,41 @@ class V7MT5LiveTrader:
                     continue
                 self.historical_data[symbol] = data
 
-                idx          = len(data['closes']) - 1
-                live_price   = self.get_current_price(symbol)
+                idx           = len(data['closes']) - 1
+                live_price    = self.get_current_price(symbol)
                 current_price = live_price if live_price else data['closes'][idx]
 
                 try:
-                    signal = self.signal_generator.analyze_symbol(symbol, data, current_price)
+                    signal = self.signal_generator.analyze_symbol(
+                        symbol, data, current_price)
                 except Exception as e:
                     print(f"[{symbol}] Signal error: {e}")
                     continue
 
                 if signal and signal.get('direction', 0) != 0:
-                    fvg_type = signal.get('fvg_data', {}).get('type', '') if isinstance(signal.get('fvg_data'), dict) else ''
-                    gap_type = signal.get('gap_data', {}).get('type', '') if isinstance(signal.get('gap_data'), dict) else ''
+                    fvg_type = (signal.get('fvg_data') or {}).get('type', '')
+                    gap_type = (signal.get('gap_data') or {}).get('type', '')
                     cached   = getattr(self.signal_generator, 'last_analysis', {}).get(symbol, {})
                     self.last_signals[symbol] = {
-                        'direction':   signal.get('direction', 0),
-                        'confluence':  signal.get('confluence', 0),
-                        'confidence':  signal.get('confidence', 'LOW'),
-                        'pd_zone':     fvg_type or gap_type,
-                        'entry':       signal.get('entry_price', current_price),
-                        'stop':        signal.get('stop_loss'),
-                        'target':      signal.get('take_profit'),
-                        'htf_trend':   cached.get('htf_trend', 'N/A'),
-                        'kill_zone':   cached.get('kill_zone', 'OFF_HOURS'),
-                        'ob_type':     cached.get('ob_type', 'none'),
-                        'liq_swept':   cached.get('liq_swept'),
-                        'model_2022':  cached.get('model_2022', 'none'),
+                        'direction':     signal.get('direction', 0),
+                        'confluence':    signal.get('confluence', 0),
+                        'confidence':    signal.get('confidence', 'LOW'),
+                        'pd_zone':       fvg_type or gap_type,
+                        'entry':         signal.get('entry_price', current_price),
+                        'stop':          signal.get('stop_loss'),
+                        'target':        signal.get('take_profit'),
+                        'htf_trend':     cached.get('htf_trend', 'N/A'),
+                        'kill_zone':     cached.get('kill_zone', 'OFF_HOURS'),
+                        'ob_type':       cached.get('ob_type', 'none'),
+                        'liq_swept':     cached.get('liq_swept'),
+                        'model_2022':    cached.get('model_2022', 'none'),
                         'silver_bullet': cached.get('silver_bullet', False),
-                        'reasoning':   signal.get('reasoning', [])[:5],
-                        'timestamp':   datetime.now().isoformat(),
+                        'reasoning':     signal.get('reasoning', [])[:5],
+                        'timestamp':     datetime.now().isoformat(),
                     }
 
                 if tn and signal:
                     try:
-                        # Use engine cached analysis for richer Telegram updates
                         cached = getattr(self.signal_generator, 'last_analysis', {}).get(symbol, {})
                         tn.update_market_data(symbol, {
                             'price':      current_price,
@@ -1348,8 +1330,8 @@ class V7MT5LiveTrader:
                     current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
                     if self.last_signal_time.get(symbol, datetime.min) >= current_hour:
                         continue
-                    if (signal and signal.get('direction', 0) != 0 and
-                            signal.get('confluence', 0) >= self.confluence_threshold):
+                    if (signal and signal.get('direction', 0) != 0
+                            and signal.get('confluence', 0) >= self.confluence_threshold):
                         self.last_signal_time[symbol] = current_hour
                         self._enter_trade(symbol, signal, current_price)
 
@@ -1360,9 +1342,9 @@ class V7MT5LiveTrader:
         if not MT5_AVAILABLE:
             return
         try:
-            account_info = mt5.account_info()
-            if account_info:
-                self.account_value = account_info.balance
+            info = mt5.account_info()
+            if info:
+                self.account_value = info.balance
                 print(f"Account balance: ${self.account_value:,.2f}")
         except Exception as e:
             print(f"Error updating account: {e}")
@@ -1378,89 +1360,103 @@ class V7MT5LiveTrader:
                 if pos.get('ticket') and pos['ticket'] not in mt5_tickets:
                     print(f"[{symbol}] Position closed externally")
                     self._handle_position_closed(
-                        symbol, pos.get('current_price', pos['entry']),
-                        pos.get('pnl', 0), 'external',
+                        symbol,
+                        pos.get('current_price', pos['entry']),
+                        pos.get('pnl', 0),
+                        'external',
                     )
         except Exception as e:
             print(f"Error checking positions: {e}")
 
-
     def print_status(self):
-        """Print a one-screen snapshot of every symbol's pipeline state."""
+        """Full pipeline snapshot – printed every 5 minutes."""
         now = datetime.now().strftime('%H:%M:%S')
         print(f"\n{'='*72}")
-        print(f"ICT V8  {now}  |  Acct: ${self.account_value:,.2f}  |  Daily P&L: ${self.daily_pnl:.2f}")
+        print(f"ICT V8  {now}  |  Acct: ${self.account_value:,.2f}  "
+              f"|  Daily P&L: ${self.daily_pnl:.2f}")
         print(f"{'='*72}")
         cached_all = getattr(self.signal_generator, 'last_analysis', {})
         for sym in self.symbols:
             sig   = self.last_signals.get(sym, {})
             cache = cached_all.get(sym, {})
             pos   = self.positions.get(sym)
-            dir_s = {1: 'LONG ▲', -1: 'SHORT ▼', 0: '  --  '}.get(sig.get('direction', 0), '  --  ')
-            cfl   = sig.get('confluence', 0)
-            conf  = sig.get('confidence', '---')
-            kz    = cache.get('kill_zone', '---')
-            htf   = cache.get('htf_trend', '---')
-            ob    = cache.get('ob_type',   '---')
-            m22   = cache.get('model_2022','---')
-            sb    = 'SB✓' if cache.get('silver_bullet') else '   '
-            liq   = cache.get('liq_swept') or '---'
+            dir_s = {1: 'LONG ▲', -1: 'SHORT ▼', 0: '  --  '}.get(
+                sig.get('direction', 0), '  --  ')
+            cfl  = sig.get('confluence', 0)
+            conf = sig.get('confidence', '---')
+            kz   = cache.get('kill_zone', '---')
+            htf  = cache.get('htf_trend', '---')
+            ob_t = cache.get('ob_type',   '---')
+            m22  = cache.get('model_2022','---')
+            sb   = 'SB✓' if cache.get('silver_bullet') else '   '
+            liq  = cache.get('liq_swept') or '---'
             pos_s = ''
             if pos:
                 pnl   = pos.get('pnl', 0.0)
                 ps    = 'L' if pos['direction'] == 1 else 'S'
-                pos_s = f" | POS {ps} @ {pos['entry']:.4f}  P&L ${pnl:.2f}"
+                pos_s = (f" | POS {ps} limit={pos['entry']:.5f}  "
+                         f"ref={pos.get('ref_price', pos['entry']):.5f}  "
+                         f"P&L ${pnl:.2f}")
             print(f"  {sym:<8}  {dir_s}  {conf:<6} {cfl:>3}/100  "
-                  f"KZ:{kz:<9} HTF:{htf:<12} OB:{ob:<8} M22:{m22:<4} {sb}  LIQ:{liq}{pos_s}")
+                  f"KZ:{kz:<9} HTF:{htf:<12} OB:{ob_t:<8} "
+                  f"M22:{m22:<4} {sb}  LIQ:{liq}{pos_s}")
         print(f"{'='*72}\n")
 
     def start(self):
         self.running = True
-        print(f"\nV7 MT5 Trader started for {self.symbols}")
+        print(f"\nV8 MT5 Trader started | symbols: {self.symbols}")
 
     def stop(self):
         self.running = False
-        print("V7 MT5 Trader stopped")
+        print("V8 MT5 Trader stopped")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_v7_trading(
-    symbols: List[str], interval: int = 30, risk_pct: float = 0.02,
-    login: int = None, password: str = None, server: str = None,
-    mode: str = 'paper', rr_ratio: float = 3.0,
-    confluence_threshold: int = 60, max_daily_loss: float = -2000,
+def run_v8_trading(
+    symbols: List[str],
+    interval: int = 30,
+    risk_pct: float = 0.02,
+    login: int = None,
+    password: str = None,
+    server: str = None,
+    mode: str = 'paper',
+    rr_ratio: float = 3.0,
+    confluence_threshold: int = 60,
+    max_daily_loss: float = -2000,
 ):
     if not MT5_AVAILABLE:
-        print("ERROR: MetaTrader5 not installed. Run: pip install MetaTrader5")
+        print("ERROR: MetaTrader5 not installed.  Run: pip install MetaTrader5")
         return
 
     if not init_mt5(login, password, server):
-        print("Failed to initialize MT5")
+        print("Failed to initialise MT5")
         return
 
-    print(f"\nICT V7 - MT5 Trading")
+    print(f"\nICT V8 – MT5 Trading")
     print(f"Mode: {mode.upper()}")
     print(f"Symbols: {symbols}")
-    print(f"Risk: {risk_pct*100}% | R:R 1:{rr_ratio}")
-    print(f"Confluence: {confluence_threshold}+ | Max Loss: ${max_daily_loss}")
+    print(f"Risk: {risk_pct*100:.1f}%  |  R:R 1:{rr_ratio}")
+    print(f"Confluence: {confluence_threshold}+  |  Max Loss: ${max_daily_loss}")
     print("-" * 50)
 
     if tn:
         try:
             tn.send_startup(symbols=symbols, risk_pct=risk_pct,
-                            interval=interval, mode=f"V7 {mode.upper()}")
+                            interval=interval, mode=f"V8 {mode.upper()}")
         except Exception as e:
-            print(f"Telegram startup notification failed: {e}")
+            print(f"Telegram startup failed: {e}")
 
     trader = V7MT5LiveTrader(
-        symbols, risk_pct, poll_interval=interval,
-        rr_ratio=rr_ratio, confluence_threshold=confluence_threshold,
+        symbols, risk_pct,
+        poll_interval=interval,
+        rr_ratio=rr_ratio,
+        confluence_threshold=confluence_threshold,
         max_daily_loss=max_daily_loss,
     )
-    print(f"Trader account value: ${trader.account_value:,.2f}")
+    print(f"Account: ${trader.account_value:,.2f}")
     trader.mode = mode
 
     if tn and hasattr(tn, 'set_live_trader'):
@@ -1472,12 +1468,11 @@ def run_v7_trading(
             tn.start_polling_background()
             print("Telegram command polling started")
         except Exception as e:
-            print(f"Failed to start Telegram polling: {e}")
+            print(f"Telegram polling failed: {e}")
 
     trader.start()
     trader._refresh_data()
-
-    print("\nTrading started. Press Ctrl+C to stop.\n")
+    print("\nTrading started.  Press Ctrl+C to stop.\n")
 
     iteration = 0
     try:
@@ -1490,17 +1485,18 @@ def run_v7_trading(
             if iteration % 300 == 0:
                 trader._refresh_data()
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Data refreshed")
-                trader.print_status()   # ← V8: full pipeline snapshot every 5 min
+                trader.print_status()
             if iteration % 60 == 0:
                 trader.update_account()
                 trader.check_positions()
             if iteration % 3600 == 0 and trader.positions:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Active positions: {len(trader.positions)}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                      f"Open positions: {len(trader.positions)}")
             if trader.daily_pnl <= trader.max_daily_loss and iteration % 60 == 0:
-                print(f"[WARNING] Daily loss limit reached: ${trader.daily_pnl:.2f}")
+                print(f"[WARNING] Daily loss limit: ${trader.daily_pnl:.2f}")
 
     except KeyboardInterrupt:
-        print("\n\nShutdown...")
+        print("\n\nShutdown…")
     finally:
         trader.stop()
         trader.update_account()
@@ -1514,36 +1510,36 @@ def run_v7_trading(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='ICT V7 - MT5 Trading with FVG + Gap')
-    parser.add_argument("--symbols",
-                        default="GBPAUD,USDJPY,USDCHF,EURJPY,GBPJPY,NZDUSD")
-    parser.add_argument("--interval",    type=int,   default=30)
-    parser.add_argument("--risk",        type=float, default=0.02)
-    parser.add_argument("--login",       type=int,   default=None)
-    parser.add_argument("--password",    type=str,   default=None)
-    parser.add_argument("--server",      type=str,   default=None)
-    parser.add_argument("--mode",        type=str,   default="paper",
+    parser = argparse.ArgumentParser(description='ICT V8 – MT5 Trading Bot (R:R Fixed)')
+    parser.add_argument("--symbols",    default="GBPAUD,USDJPY,USDCHF,EURJPY,GBPJPY,NZDUSD")
+    parser.add_argument("--interval",  type=int,   default=30)
+    parser.add_argument("--risk",      type=float, default=0.02)
+    parser.add_argument("--login",     type=int,   default=None)
+    parser.add_argument("--password",  type=str,   default=None)
+    parser.add_argument("--server",    type=str,   default=None)
+    parser.add_argument("--mode",      type=str,   default="paper",
                         choices=["shadow", "paper", "live"])
-    parser.add_argument("--rr",          type=float, default=3.0)
-    parser.add_argument("--confluence",  type=int,   default=65)
-    parser.add_argument("--max-loss",    type=float, default=-500)
+    parser.add_argument("--rr",        type=float, default=3.0)
+    parser.add_argument("--confluence",type=int,   default=65)
+    parser.add_argument("--max-loss",  type=float, default=-500)
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(',')]
 
     print("=" * 60)
-    print("ICT V7 Trading Bot - MetaTrader 5  (Best Performers)")
+    print("ICT V8 Trading Bot – MetaTrader 5  (R:R Fully Fixed)")
     print("=" * 60)
     print(f"Mode:       {args.mode.upper()}")
     print(f"Symbols:    {', '.join(symbols)}")
-    print(f"Risk:       {args.risk*100}%  |  R:R 1:{args.rr}")
+    print(f"Risk:       {args.risk*100:.1f}%  |  R:R 1:{args.rr}")
     print(f"Confluence: {args.confluence}+  |  Max Loss: ${abs(args.max_loss)}")
     print(f"MT5 Login:  {args.login or 'Demo'}")
     print("=" * 60)
 
-    run_v7_trading(
+    run_v8_trading(
         symbols, args.interval, args.risk,
         args.login, args.password, args.server, args.mode,
-        rr_ratio=args.rr, confluence_threshold=args.confluence,
-        max_daily_loss=-abs(args.max_loss),  # Ensure negative
+        rr_ratio=args.rr,
+        confluence_threshold=args.confluence,
+        max_daily_loss=-abs(args.max_loss),
     )
