@@ -1182,17 +1182,37 @@ class V7MT5LiveTrader:
             print(f"[{symbol}] Already in position, skipping")
             return
 
-        # REVERSE MODE: flip direction and swap SL/TP
+        # REVERSE MODE: flip direction and recalculate SL/TP from current price
         if self.reverse_signals and signal.get('direction', 0) != 0:
-            old_dir = signal['direction']
-            signal['direction'] = -old_dir  # BUY->SELL, SELL->BUY
-            old_sl = signal.get('stop_loss')
-            old_tp = signal.get('take_profit')
-            if old_sl is not None and old_tp is not None:
-                signal['stop_loss'] = old_tp
-                signal['take_profit'] = old_sl
+            orig_dir = signal['direction']
+            orig_sl = signal.get('stop_loss')
+            orig_tp = signal.get('take_profit')
+            
+            # Calculate stop distance from original signal
+            entry = signal.get('entry_price', current_price)
+            if orig_sl:
+                orig_stop_dist = abs(entry - orig_sl)
+            elif orig_tp:
+                orig_stop_dist = abs(orig_tp - entry)
+            else:
+                orig_stop_dist = 0.001  # default 10 pips for forex
+            
+            # New direction (BUY->SELL or SELL->BUY)
+            signal['direction'] = -orig_dir
+            
+            # New SL/TP calculated from current price with same R:R distance
+            # For BUY: TP = current + stop_dist, SL = current - stop_dist
+            # For SELL: TP = current - stop_dist, SL = current + stop_dist
+            if signal['direction'] == 1:  # BUY
+                signal['stop_loss'] = current_price - orig_stop_dist
+                signal['take_profit'] = current_price + orig_stop_dist * self.rr_ratio
+            else:  # SELL
+                signal['stop_loss'] = current_price + orig_stop_dist
+                signal['take_profit'] = current_price - orig_stop_dist * self.rr_ratio
+            
             signal['reasoning'] = ['REVERSED'] + (signal.get('reasoning', []) or [])
-            print(f"[{symbol}] REVERSE: was {old_dir} -> now {signal['direction']}")
+            print(f"[{symbol}] REVERSE: was {orig_dir} -> now {signal['direction']}, "
+                  f"dist={orig_stop_dist:.5f}")
 
         try:
             entry_price = signal['entry_price']   # limit/pending level
