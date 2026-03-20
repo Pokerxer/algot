@@ -1183,7 +1183,9 @@ class V7MT5LiveTrader:
             return
 
         # REVERSE MODE: flip direction and swap SL/TP directly
+        reversed_mode = False
         if self.reverse_signals and signal.get('direction', 0) != 0:
+            reversed_mode = True
             orig_dir = signal['direction']
             orig_sl = signal.get('stop_loss')
             orig_tp = signal.get('take_profit')
@@ -1222,12 +1224,15 @@ class V7MT5LiveTrader:
                 print(f"[{symbol}] Stop distance ~0, skipping")
                 return
 
-            # Take-profit at exactly rr_ratio × stop from current price
-            target_price = (
-                current_price + actual_stop_distance * self.rr_ratio
-                if signal['direction'] == 1
-                else current_price - actual_stop_distance * self.rr_ratio
-            )
+            # Take-profit: use swapped TP in reverse mode, otherwise calculate normally
+            if reversed_mode:
+                target_price = signal['take_profit']  # Use the swapped TP
+            else:
+                target_price = (
+                    current_price + actual_stop_distance * self.rr_ratio
+                    if signal['direction'] == 1
+                    else current_price - actual_stop_distance * self.rr_ratio
+                )
 
             # ── Extra sanity: ensure min stop distance for indices ────────────
             contract_info = get_contract_info(symbol)
