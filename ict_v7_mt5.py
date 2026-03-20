@@ -896,6 +896,7 @@ class V7MT5LiveTrader:
         rr_ratio: float = 3.0,
         confluence_threshold: int = 65,
         max_daily_loss: float = -500,
+        reverse_signals: bool = False,
     ):
         self.symbols              = symbols
         self.risk_pct             = risk_pct
@@ -903,6 +904,7 @@ class V7MT5LiveTrader:
         self.rr_ratio             = rr_ratio
         self.confluence_threshold = confluence_threshold
         self.max_daily_loss       = max_daily_loss
+        self.reverse_signals      = reverse_signals
 
         # V7SignalGenerator is the ICTSignalEngine import alias (BUG-FIX 1 ensures
         # it is never overwritten by the local class definition).
@@ -1179,6 +1181,18 @@ class V7MT5LiveTrader:
         if symbol in self.positions or mt5_sym in self.positions:
             print(f"[{symbol}] Already in position, skipping")
             return
+
+        # REVERSE MODE: flip direction and swap SL/TP
+        if self.reverse_signals and signal.get('direction', 0) != 0:
+            old_dir = signal['direction']
+            signal['direction'] = -old_dir  # BUY->SELL, SELL->BUY
+            old_sl = signal.get('stop_loss')
+            old_tp = signal.get('take_profit')
+            if old_sl is not None and old_tp is not None:
+                signal['stop_loss'] = old_tp
+                signal['take_profit'] = old_sl
+            signal['reasoning'] = ['REVERSED'] + (signal.get('reasoning', []) or [])
+            print(f"[{symbol}] REVERSE: was {old_dir} -> now {signal['direction']}")
 
         try:
             entry_price = signal['entry_price']   # limit/pending level
@@ -1528,6 +1542,7 @@ def run_v8_trading(
     rr_ratio: float = 3.0,
     confluence_threshold: int = 60,
     max_daily_loss: float = -2000,
+    reverse_signals: bool = False,
 ):
     if not MT5_AVAILABLE:
         print("ERROR: MetaTrader5 not installed.  Run: pip install MetaTrader5")
@@ -1557,6 +1572,7 @@ def run_v8_trading(
         rr_ratio=rr_ratio,
         confluence_threshold=confluence_threshold,
         max_daily_loss=max_daily_loss,
+        reverse_signals=reverse_signals,
     )
     print(f"Account: ${trader.account_value:,.2f}")
     trader.mode = mode
@@ -1624,6 +1640,8 @@ if __name__ == "__main__":
     parser.add_argument("--rr",        type=float, default=3.0)
     parser.add_argument("--confluence",type=int,   default=65)
     parser.add_argument("--max-loss",  type=float, default=-500)
+    parser.add_argument("--reverse",   action="store_true",
+                        help="Reverse all signals (BUY->SELL, SL->TP)")
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(',')]
@@ -1635,6 +1653,8 @@ if __name__ == "__main__":
     print(f"Symbols:    {', '.join(symbols)}")
     print(f"Risk:       {args.risk*100:.1f}%  |  R:R 1:{args.rr}")
     print(f"Confluence: {args.confluence}+  |  Max Loss: ${abs(args.max_loss)}")
+    if args.reverse:
+        print("REVERSE MODE: All signals flipped!")
     print(f"MT5 Login:  {args.login or 'Demo'}")
     print("=" * 60)
 
@@ -1644,4 +1664,5 @@ if __name__ == "__main__":
         rr_ratio=args.rr,
         confluence_threshold=args.confluence,
         max_daily_loss=-abs(args.max_loss),
+        reverse_signals=args.reverse,
     )

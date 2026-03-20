@@ -19,7 +19,7 @@ echo.
 
 :start
 echo [%date% %time%] Starting bot...
-py ict_v7_mt5.py --symbols "GBPAUD,USDJPY,USDCHF,EURJPY,GBPJPY,NZDUSD" --mode live --login 298797826 --password "Pokerx_007" --server "Exness-MT5Trial9" --risk 0.02 --rr 3.0 --confluence 65 --max-loss 500
+py ict_v7_mt5.py --symbols "GBPAUD,USDJPY,USDCHF,EURJPY,GBPJPY,NZDUSD" --mode live --login 298797826 --password "Pokerx_007" --server "Exness-MT5Trial9" --risk 0.02 --rr 3.0 --confluence 65 --max-loss 500 --reverse
 
 echo.
 echo [%date% %time%] Bot stopped. Restarting in 10 seconds...
