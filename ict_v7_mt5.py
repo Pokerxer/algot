@@ -97,7 +97,7 @@ FOREX_SYMBOLS = {
 }
 
 MT5_SYMBOLS = {
-    'BTCUSD': 'BTCUSDm', 'ETHUSD': 'ETHUSDm', 'SOLUSD': 'SOLUSDm',
+    'BTCUSD': 'BTCUSDm', 'ETHUSD': 'ETHUSDm', 'SOLUSD': 'SOLUSDm', 'XRPUSD': 'XRPUSDm',
     'XAUUSD': 'XAUUSDm', 'XAGUSD': 'XAGUSDm',
     'XTIUSD': 'USOILm',  'XBRUSD': 'UKOILm', 'XNGUSD': 'XNGUSDm',
     'EURUSD': 'EURUSDm', 'GBPUSD': 'GBPUSDm', 'USDJPY': 'USDJPYm',
@@ -222,6 +222,7 @@ def get_contract_info(symbol: str) -> Dict:
         'BTCUSD': {'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
         'ETHUSD': {'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
         'SOLUSD': {'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
+        'XRPUSD': {'min_stop_pct': 0.020, 'tick_size': 0.0001, 'type': 'crypto'},
         'LTCUSD': {'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
     }
 
