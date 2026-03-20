@@ -3,7 +3,7 @@ REM ICT V7 MT5 Trading Bot - Auto-restart script
 REM Run this in a separate command window or with nssm/pm2
 
 echo ============================================================
-echo ICT V7 MT5 Trading Bot - Best Performers
+echo ICT V7 MT5 Trading Bot - Best Performers (REVERSED)
 echo ============================================================
 echo.
 
