@@ -219,11 +219,11 @@ def get_contract_info(symbol: str) -> Dict:
     }
 
     crypto_info = {
-        'BTCUSD': {'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
-        'ETHUSD': {'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
-        'SOLUSD': {'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
-        'XRPUSD': {'min_stop_pct': 0.020, 'tick_size': 0.0001, 'type': 'crypto'},
-        'LTCUSD': {'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
+        'BTCUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
+        'ETHUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
+        'SOLUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
+        'XRPUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.020, 'tick_size': 0.0001, 'type': 'crypto'},
+        'LTCUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
     }
 
     indices_info = {
@@ -423,10 +423,11 @@ def calculate_position_size(
         actual_risk = qty * stop_distance * dollar_per_point
 
     elif symbol_type == 'crypto':
+        dollar_per_point = contract_info.get('dollar_per_point', 1)
         if current_price <= 0:
             return 0.0, 0.0
-        qty         = risk_amount / stop_distance
-        actual_risk = qty * stop_distance
+        qty = risk_amount / (stop_distance * dollar_per_point)
+        actual_risk = qty * stop_distance * dollar_per_point
 
     else:
         qty         = risk_amount / stop_distance
