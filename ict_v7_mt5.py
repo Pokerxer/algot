@@ -219,11 +219,11 @@ def get_contract_info(symbol: str) -> Dict:
     }
 
     crypto_info = {
-        'BTCUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
-        'ETHUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.015, 'tick_size': 0.01, 'type': 'crypto'},
-        'SOLUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
-        'XRPUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.020, 'tick_size': 0.0001, 'type': 'crypto'},
-        'LTCUSD': {'dollar_per_point': 1, 'min_stop_pct': 0.020, 'tick_size': 0.01, 'type': 'crypto'},
+        'BTCUSD': {'dollar_per_point': 2, 'min_stop_pct': 1.5, 'tick_size': 0.5, 'type': 'crypto'},
+        'ETHUSD': {'dollar_per_point': 20, 'min_stop_pct': 1.5, 'tick_size': 0.05, 'type': 'crypto'},
+        'SOLUSD': {'dollar_per_point': 200, 'min_stop_pct': 2.0, 'tick_size': 0.005, 'type': 'crypto'},
+        'XRPUSD': {'dollar_per_point': 100000, 'min_stop_pct': 2.0, 'tick_size': 0.00001, 'type': 'crypto'},
+        'LTCUSD': {'dollar_per_point': 100, 'min_stop_pct': 2.0, 'tick_size': 0.01, 'type': 'crypto'},
     }
 
     indices_info = {
