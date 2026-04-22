@@ -967,9 +967,7 @@ class V7MT5LiveTrader:
 
     def _is_daily_loss_limit_hit(self) -> bool:
         """Check if daily loss limit exceeded (either absolute or percentage)."""
-        abs_limit_hit = self.daily_pnl <= self.max_daily_loss
-        pct_limit_hit = self.daily_pnl_pct <= -self.max_daily_loss_pct
-        return abs_limit_hit or pct_limit_hit
+        return False  # Daily loss limit disabled
 
     # ─────────────────────────────────────────────────────────────────────────
 
