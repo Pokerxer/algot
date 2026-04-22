@@ -1688,7 +1688,7 @@ if __name__ == "__main__":
     parser.add_argument("--confluence",type=int,   default=65)
     parser.add_argument("--max-loss",  type=float, default=-500)
     parser.add_argument("--max-loss-pct", type=float, default=3.0,
-                        help="Max daily loss as percentage of account (default: 3.0%)")
+                        help="Max daily loss as percentage of account")
     parser.add_argument("--reverse",   action="store_true",
                         help="Reverse all signals (BUY->SELL, SL->TP)")
     args = parser.parse_args()
