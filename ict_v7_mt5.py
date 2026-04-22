@@ -1132,7 +1132,10 @@ class V7MT5LiveTrader:
                                else (entry - current_price)
 
             if symbol_type == 'forex':
-                pnl = price_diff * volume * 100_000
+                decimal_places = contract_info.get('decimal_places', 5)
+                pip_size = 0.01 if decimal_places == 3 else 0.0001
+                pip_value = contract_info.get('pip_value', 10)
+                pnl = (price_diff / pip_size) * pip_value * volume
             elif symbol_type in ('futures', 'indices'):
                 pnl = price_diff * volume * contract_info.get('dollar_per_point', 1)
             else:
