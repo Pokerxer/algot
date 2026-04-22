@@ -898,14 +898,16 @@ class V7MT5LiveTrader:
         rr_ratio: float = 3.0,
         confluence_threshold: int = 65,
         max_daily_loss: float = -500,
+        max_daily_loss_pct: float = 3.0,
         reverse_signals: bool = False,
     ):
         self.symbols              = symbols
         self.risk_pct             = risk_pct
         self.poll_interval        = poll_interval
         self.rr_ratio             = rr_ratio
-        self.confluence_threshold = confluence_threshold
+        self.confluence_threshold  = confluence_threshold
         self.max_daily_loss       = max_daily_loss
+        self.max_daily_loss_pct   = max_daily_loss_pct
         self.reverse_signals      = reverse_signals
 
         # V7SignalGenerator is the ICTSignalEngine import alias (BUG-FIX 1 ensures
@@ -931,6 +933,8 @@ class V7MT5LiveTrader:
         self.last_signals     = {}
 
         self.daily_pnl    = 0.0
+        self.daily_pnl_pct = 0.0  # percentage of account
+        self.last_reset_date = datetime.now().date()
         self.trade_count  = 0
         self.account_value = 100_000
 
@@ -942,6 +946,30 @@ class V7MT5LiveTrader:
         # Auto-fix any inherited positions whose TP gives wrong R:R
         # (handles positions opened by the previous broken V7 code)
         self.fix_existing_tps()
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _check_daily_reset(self):
+        """Reset daily P&L at start of new trading day (NY midnight)."""
+        today = datetime.now().date()
+        if self.last_reset_date != today:
+            print(f"\n[NEW DAY] Resetting daily P&L: ${self.daily_pnl:.2f} -> $0.00")
+            self.daily_pnl = 0.0
+            self.daily_pnl_pct = 0.0
+            self.last_reset_date = today
+
+    def _update_daily_pnl(self):
+        """Update daily P&L percentage and check loss limit."""
+        if self.account_value > 0:
+            self.daily_pnl_pct = (self.daily_pnl / self.account_value) * 100
+        else:
+            self.daily_pnl_pct = 0.0
+
+    def _is_daily_loss_limit_hit(self) -> bool:
+        """Check if daily loss limit exceeded (either absolute or percentage)."""
+        abs_limit_hit = self.daily_pnl <= self.max_daily_loss
+        pct_limit_hit = self.daily_pnl_pct <= -self.max_daily_loss_pct
+        return abs_limit_hit or pct_limit_hit
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1169,8 +1197,9 @@ class V7MT5LiveTrader:
             print(f"[{symbol}] Trading PAUSED")
             return
 
-        if self.daily_pnl <= self.max_daily_loss:
-            print(f"[{symbol}] Daily loss limit ${self.daily_pnl:.2f}, skipping")
+        if self._is_daily_loss_limit_hit():
+            pct = self.daily_pnl_pct
+            print(f"[{symbol}] Daily loss limit ${self.daily_pnl:.2f} ({pct:.1f}%), skipping")
             return
 
         is_forex = symbol.upper() in FOREX_SYMBOLS
@@ -1473,6 +1502,7 @@ class V7MT5LiveTrader:
             info = mt5.account_info()
             if info:
                 self.account_value = info.balance
+                self._update_daily_pnl()
                 print(f"Account balance: ${self.account_value:,.2f}")
         except Exception as e:
             print(f"Error updating account: {e}")
@@ -1501,7 +1531,7 @@ class V7MT5LiveTrader:
         now = datetime.now().strftime('%H:%M:%S')
         print(f"\n{'='*72}")
         print(f"ICT V8  {now}  |  Acct: ${self.account_value:,.2f}  "
-              f"|  Daily P&L: ${self.daily_pnl:.2f}")
+              f"|  Daily P&L: ${self.daily_pnl:.2f} ({self.daily_pnl_pct:.1f}%)")
         print(f"{'='*72}")
         cached_all = getattr(self.signal_generator, 'last_analysis', {})
         for sym in self.symbols:
@@ -1554,6 +1584,7 @@ def run_v8_trading(
     rr_ratio: float = 3.0,
     confluence_threshold: int = 60,
     max_daily_loss: float = -2000,
+    max_daily_loss_pct: float = 3.0,
     reverse_signals: bool = False,
 ):
     if not MT5_AVAILABLE:
@@ -1584,6 +1615,7 @@ def run_v8_trading(
         rr_ratio=rr_ratio,
         confluence_threshold=confluence_threshold,
         max_daily_loss=max_daily_loss,
+        max_daily_loss_pct=max_daily_loss_pct,
         reverse_signals=reverse_signals,
     )
     print(f"Account: ${trader.account_value:,.2f}")
@@ -1622,8 +1654,11 @@ def run_v8_trading(
             if iteration % 3600 == 0 and trader.positions:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] "
                       f"Open positions: {len(trader.positions)}")
-            if trader.daily_pnl <= trader.max_daily_loss and iteration % 60 == 0:
-                print(f"[WARNING] Daily loss limit: ${trader.daily_pnl:.2f}")
+            if iteration % 60 == 0:
+                trader._check_daily_reset()
+                trader._update_daily_pnl()
+            if trader._is_daily_loss_limit_hit() and iteration % 60 == 0:
+                print(f"[WARNING] Daily loss limit: ${trader.daily_pnl:.2f} ({trader.daily_pnl_pct:.1f}%)")
 
     except KeyboardInterrupt:
         print("\n\nShutdown…")
@@ -1652,6 +1687,8 @@ if __name__ == "__main__":
     parser.add_argument("--rr",        type=float, default=3.0)
     parser.add_argument("--confluence",type=int,   default=65)
     parser.add_argument("--max-loss",  type=float, default=-500)
+    parser.add_argument("--max-loss-pct", type=float, default=3.0,
+                        help="Max daily loss as percentage of account (default: 3.0%)")
     parser.add_argument("--reverse",   action="store_true",
                         help="Reverse all signals (BUY->SELL, SL->TP)")
     args = parser.parse_args()
@@ -1664,7 +1701,7 @@ if __name__ == "__main__":
     print(f"Mode:       {args.mode.upper()}")
     print(f"Symbols:    {', '.join(symbols)}")
     print(f"Risk:       {args.risk*100:.1f}%  |  R:R 1:{args.rr}")
-    print(f"Confluence: {args.confluence}+  |  Max Loss: ${abs(args.max_loss)}")
+    print(f"Confluence: {args.confluence}+  |  Max Loss: ${abs(args.max_loss)} ({args.max_loss_pct}%)")
     if args.reverse:
         print("REVERSE MODE: All signals flipped!")
     print(f"MT5 Login:  {args.login or 'Demo'}")
@@ -1676,5 +1713,6 @@ if __name__ == "__main__":
         rr_ratio=args.rr,
         confluence_threshold=args.confluence,
         max_daily_loss=-abs(args.max_loss),
+        max_daily_loss_pct=args.max_loss_pct,
         reverse_signals=args.reverse,
     )
