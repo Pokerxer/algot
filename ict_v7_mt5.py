@@ -900,6 +900,8 @@ class V7MT5LiveTrader:
         max_daily_loss: float = -500,
         max_daily_loss_pct: float = 3.0,
         reverse_signals: bool = False,
+        reverse_symbols: List[str] = None,
+        max_positions_per_symbol: int = 1,
     ):
         self.symbols              = symbols
         self.risk_pct             = risk_pct
@@ -909,6 +911,8 @@ class V7MT5LiveTrader:
         self.max_daily_loss       = max_daily_loss
         self.max_daily_loss_pct   = max_daily_loss_pct
         self.reverse_signals      = reverse_signals
+        self.reverse_symbols      = set(s.upper() for s in (reverse_symbols or []))
+        self.max_positions_per_symbol = max_positions_per_symbol
 
         # V7SignalGenerator is the ICTSignalEngine import alias (BUG-FIX 1 ensures
         # it is never overwritten by the local class definition).
@@ -937,6 +941,10 @@ class V7MT5LiveTrader:
         self.last_reset_date = datetime.now().date()
         self.trade_count  = 0
         self.account_value = 100_000
+
+        self.consecutive_losses = {}  # Track consecutive losses per symbol
+        self.cooldown_until = {}      # Cooldown end time per symbol
+        self.cooldown_hours = 5       # 5 hour cooldown after 3 consecutive losses
 
         self.update_account()
         self.running = False
@@ -1163,6 +1171,16 @@ class V7MT5LiveTrader:
         direction_str = 'LONG' if pos['direction'] == 1 else 'SHORT'
         pnl_str       = f"+${pnl:.2f}" if pnl > 0 else f"-${abs(pnl):.2f}"
         self.daily_pnl += pnl
+
+        if pnl < 0:
+            self.consecutive_losses[symbol] = self.consecutive_losses.get(symbol, 0) + 1
+            loss_count = self.consecutive_losses[symbol]
+            if loss_count >= 3:
+                self.cooldown_until[symbol] = datetime.now() + timedelta(hours=self.cooldown_hours)
+                print(f"[{symbol}] ⚠️ 3 CONSECUTIVE LOSSES - Cooldown for {self.cooldown_hours} hours")
+        else:
+            self.consecutive_losses[symbol] = 0
+
         print(f"[{symbol}] EXIT ({exit_reason}): {direction_str} @ {exit_price:.5f} "
               f"| P&L: {pnl_str} | Daily: ${self.daily_pnl:.2f}")
         if tn:
@@ -1203,6 +1221,17 @@ class V7MT5LiveTrader:
             print(f"[{symbol}] Daily loss limit ${self.daily_pnl:.2f} ({pct:.1f}%), skipping")
             return
 
+        # Check if symbol is in cooldown after 3 consecutive losses
+        if symbol in self.cooldown_until:
+            if datetime.now() < self.cooldown_until[symbol]:
+                remaining = (self.cooldown_until[symbol] - datetime.now()).total_seconds() / 3600
+                print(f"[{symbol}] In cooldown ({remaining:.1f}h remaining), skipping")
+                return
+            else:
+                del self.cooldown_until[symbol]
+                print(f"[{symbol}] Cooldown ended, resuming trading")
+                self.consecutive_losses[symbol] = 0
+
         is_forex = symbol.upper() in FOREX_SYMBOLS
         in_session, session_name = is_valid_trading_session(is_forex=is_forex)
         if not in_session:
@@ -1214,9 +1243,16 @@ class V7MT5LiveTrader:
             print(f"[{symbol}] Already in position, skipping")
             return
 
+        # Check max positions per symbol
+        current_pos_count = sum(1 for k in self.positions.keys() if k == symbol or k == mt5_sym)
+        if current_pos_count >= self.max_positions_per_symbol:
+            print(f"[{symbol}] Max positions ({self.max_positions_per_symbol}) reached, skipping")
+            return
+
         # REVERSE MODE: flip direction and swap SL/TP directly
         reversed_mode = False
-        if self.reverse_signals and signal.get('direction', 0) != 0:
+        symbol_upper = symbol.upper()
+        if self.reverse_signals and symbol_upper in self.reverse_symbols and signal.get('direction', 0) != 0:
             reversed_mode = True
             orig_dir = signal['direction']
             orig_sl = signal.get('stop_loss')
@@ -1587,6 +1623,8 @@ def run_v8_trading(
     max_daily_loss: float = -2000,
     max_daily_loss_pct: float = 3.0,
     reverse_signals: bool = False,
+    reverse_symbols: List[str] = None,
+    max_positions_per_symbol: int = 1,
 ):
     if not MT5_AVAILABLE:
         print("ERROR: MetaTrader5 not installed.  Run: pip install MetaTrader5")
@@ -1618,6 +1656,8 @@ def run_v8_trading(
         max_daily_loss=max_daily_loss,
         max_daily_loss_pct=max_daily_loss_pct,
         reverse_signals=reverse_signals,
+        reverse_symbols=reverse_symbols,
+        max_positions_per_symbol=max_positions_per_symbol,
     )
     print(f"Account: ${trader.account_value:,.2f}")
     trader.mode = mode
@@ -1690,11 +1730,17 @@ if __name__ == "__main__":
     parser.add_argument("--max-loss",  type=float, default=-500)
     parser.add_argument("--max-loss-pct", type=float, default=3.0,
                         help="Max daily loss as percentage of account")
-    parser.add_argument("--reverse",   action="store_true",
-                        help="Reverse all signals (BUY->SELL, SL->TP)")
+    parser.add_argument("--reverse",   type=str, default=None,
+                        help="Comma-separated symbols to reverse (e.g. 'GBPAUD,USDJPY'). Others trade normal")
+    parser.add_argument("--max-positions", type=int, default=1,
+                        help="Max positions per symbol (default 1)")
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(',')]
+
+    reverse_symbols = None
+    if args.reverse:
+        reverse_symbols = [s.strip().upper() for s in args.reverse.split(',')]
 
     print("=" * 60)
     print("ICT V8 Trading Bot – MetaTrader 5  (R:R Fully Fixed)")
@@ -1703,8 +1749,11 @@ if __name__ == "__main__":
     print(f"Symbols:    {', '.join(symbols)}")
     print(f"Risk:       {args.risk*100:.1f}%  |  R:R 1:{args.rr}")
     print(f"Confluence: {args.confluence}+  |  Max Loss: ${abs(args.max_loss)} ({args.max_loss_pct}%)")
-    if args.reverse:
-        print("REVERSE MODE: All signals flipped!")
+    if reverse_symbols:
+        print(f"Reverse:    {', '.join(reverse_symbols)}")
+        normal_symbols = [s for s in symbols if s not in reverse_symbols]
+        print(f"Normal:     {', '.join(normal_symbols)}")
+    print(f"Max Positions: {args.max_positions} per symbol")
     print(f"MT5 Login:  {args.login or 'Demo'}")
     print("=" * 60)
 
@@ -1715,5 +1764,7 @@ if __name__ == "__main__":
         confluence_threshold=args.confluence,
         max_daily_loss=-abs(args.max_loss),
         max_daily_loss_pct=args.max_loss_pct,
-        reverse_signals=args.reverse,
+        reverse_signals=bool(reverse_symbols),
+        reverse_symbols=reverse_symbols,
+        max_positions_per_symbol=args.max_positions,
     )
