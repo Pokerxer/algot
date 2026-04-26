@@ -1239,9 +1239,20 @@ class V7MT5LiveTrader:
             return
 
         mt5_sym = get_mt5_symbol(symbol)
-        if symbol in self.positions or mt5_sym in self.positions:
-            print(f"[{symbol}] Already in position, skipping")
+        existing_pos = self.positions.get(symbol) or self.positions.get(mt5_sym)
+        if existing_pos:
+            direction_str = "LONG" if existing_pos['direction'] == 1 else "SHORT"
+            print(f"[{symbol}] Already in {direction_str} position, skipping")
             return
+        
+        # Also check MT5 directly for any open position we might have missed
+        try:
+            mt5_pos = mt5.positions_get(symbol=get_mt5_symbol(symbol))
+            if mt5_pos and len(mt5_pos) > 0:
+                print(f"[{symbol}] Open in MT5, skipping")
+                return
+        except:
+            pass
 
         # Check max positions per symbol
         current_pos_count = sum(1 for k in self.positions.keys() if k == symbol or k == mt5_sym)
