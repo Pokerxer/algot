@@ -1263,7 +1263,14 @@ class V7MT5LiveTrader:
         # REVERSE MODE: flip direction and swap SL/TP directly
         reversed_mode = False
         symbol_upper = symbol.upper()
-        if self.reverse_signals and symbol_upper in self.reverse_symbols and signal.get('direction', 0) != 0:
+        utc_hour = datetime.utcnow().hour
+        _reverse_blocked = (
+            (19 <= utc_hour < 22) or   # NY close – reverse off
+            (utc_hour == 8)             # London open – reverse off
+        )
+        if _reverse_blocked and self.reverse_signals and symbol_upper in self.reverse_symbols:
+            print(f"[{symbol}] REVERSE SKIPPED (UTC {utc_hour:02d}:xx blocked window) – trading normal direction")
+        if self.reverse_signals and symbol_upper in self.reverse_symbols and signal.get('direction', 0) != 0 and not _reverse_blocked:
             reversed_mode = True
             orig_dir = signal['direction']
             orig_sl = signal.get('stop_loss')
